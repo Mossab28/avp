@@ -1,0 +1,6 @@
+{
+  "total_count": 1,
+  "jobs": [
+    { "id": 121, "run_id": 12, "run_attempt": 1, "name": "deploy", "status": "completed", "conclusion": "cancelled", "started_at": "2026-10-22T11:02:10Z", "completed_at": "2026-10-22T11:04:10Z" }
+  ]
+}

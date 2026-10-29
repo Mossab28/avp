@@ -1,0 +1,19 @@
+name: Deploy production
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker build -t shop .
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://shop.example.com
+    steps:
+      - run: ./scripts/deploy.sh production

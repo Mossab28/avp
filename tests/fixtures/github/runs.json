@@ -1,0 +1,9 @@
+{
+  "total_count": 4,
+  "workflow_runs": [
+    { "id": 14, "name": "CI", "path": ".github/workflows/ci.yml", "event": "push", "status": "in_progress", "conclusion": null, "run_attempt": 1, "created_at": "2026-10-24T00:00:00Z", "run_started_at": "2026-10-24T00:00:00Z", "updated_at": "2026-10-24T00:01:00Z", "html_url": "https://github.com/acme/shop/actions/runs/14" },
+    { "id": 13, "name": "Deploy staging", "path": ".github/workflows/deploy-staging.yml", "event": "push", "status": "completed", "conclusion": "success", "run_attempt": 1, "created_at": "2026-10-23T09:27:00Z", "run_started_at": "2026-10-23T09:27:00Z", "updated_at": "2026-10-23T09:33:20Z", "html_url": "https://github.com/acme/shop/actions/runs/13" },
+    { "id": 12, "name": "Deploy staging", "path": ".github/workflows/deploy-staging.yml", "event": "push", "status": "completed", "conclusion": "cancelled", "run_attempt": 1, "created_at": "2026-10-22T11:02:00Z", "run_started_at": "2026-10-22T11:02:00Z", "updated_at": "2026-10-22T11:04:20Z", "html_url": "https://github.com/acme/shop/actions/runs/12" },
+    { "id": 11, "name": "CI", "path": ".github/workflows/ci.yml", "event": "pull_request", "status": "completed", "conclusion": "success", "run_attempt": 1, "created_at": "2026-10-22T10:01:00Z", "run_started_at": "2026-10-22T10:01:00Z", "updated_at": "2026-10-22T10:21:20Z", "html_url": "https://github.com/acme/shop/actions/runs/11" }
+  ]
+}

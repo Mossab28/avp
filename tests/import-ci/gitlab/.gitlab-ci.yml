@@ -1,0 +1,53 @@
+include:
+  - template: Security/SAST.gitlab-ci.yml
+stages: [test, deploy]
+variables:
+  NODE_ENV: test
+  POSTGRES_DB: billing
+  POSTGRES_PASSWORD: secret
+  DATABASE_URL: postgres://postgres:secret@postgres:5432/billing
+default:
+  image: node:20
+  before_script:
+    - npm ci
+.with-db: &with-db
+  stage: test
+  services:
+    - postgres:16
+lint:
+  stage: test
+  script:
+    - npm run lint
+    - npx tsc --noEmit
+test:
+  <<: *with-db
+  parallel:
+    matrix:
+      - SUITE: [unit, api]
+  script:
+    - npm test -- --selectProjects $SUITE
+audit:
+  extends: .with-db
+  script:
+    - npm audit --audit-level=high --registry "$PRIVATE_REGISTRY"
+nightly:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - npm run e2e
+deploy_staging:
+  stage: deploy
+  environment: staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - ./scripts/deploy.sh staging $CI_COMMIT_SHA
+    - curl -fsS -X POST "$SLACK_WEBHOOK"
+deploy_production:
+  stage: deploy
+  environment:
+    name: production
+  when: manual
+  script:
+    - ./scripts/deploy.sh production $CI_COMMIT_SHA

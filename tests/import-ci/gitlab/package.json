@@ -1,0 +1,5 @@
+{
+  "name": "billing",
+  "scripts": { "lint": "eslint .", "test": "jest" },
+  "devDependencies": { "eslint": "^9.0.0", "jest": "^29.7.0", "typescript": "^5.6.0" }
+}

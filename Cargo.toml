@@ -1,0 +1,44 @@
+[package]
+name = "avp"
+version = "0.5.1"
+edition = "2021"
+description = "AVP, agent versioning protocol: version control for agents. A server that holds the truth, tasks instead of branches, proofs instead of CI."
+license = "Elastic-2.0"
+
+[[bin]]
+name = "avp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+diffy = "0.4"
+ignore = "0.4"
+libc = "0.2"
+notify = "8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+toml = "0.8"
+ulid = "1"
+yaml-rust2 = { version = "0.13", default-features = false }
+chacha20poly1305 = "0.11.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# What a proof builds (avp.toml): release optimizations without the link-time ones, so a change
+# compiles in seconds instead of minutes. The binary we ship keeps the release profile.
+[profile.proof]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

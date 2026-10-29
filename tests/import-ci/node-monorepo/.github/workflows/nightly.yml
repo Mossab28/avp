@@ -1,0 +1,9 @@
+name: Nightly
+on:
+  schedule:
+    - cron: "0 3 * * *"
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pnpm test:e2e

@@ -1,0 +1,6 @@
+[
+  { "number": 101, "title": "Price: thin space before the euro sign", "state": "closed", "user": { "login": "ada" }, "html_url": "https://github.com/acme/shop/pull/101", "created_at": "2026-10-23T09:00:00Z", "updated_at": "2026-10-23T09:26:00Z", "closed_at": "2026-10-23T09:25:00Z", "merged_at": "2026-10-23T09:25:00Z" },
+  { "number": 100, "title": "Checkout accepts Apple Pay", "state": "closed", "user": { "login": "bob" }, "html_url": "https://github.com/acme/shop/pull/100", "created_at": "2026-10-22T10:00:00Z", "updated_at": "2026-10-22T11:01:00Z", "closed_at": "2026-10-22T11:00:00Z", "merged_at": "2026-10-22T11:00:00Z" },
+  { "number": 99, "title": "Try another font", "state": "closed", "user": { "login": "ada" }, "html_url": "https://github.com/acme/shop/pull/99", "created_at": "2026-10-22T08:00:00Z", "updated_at": "2026-10-22T09:00:00Z", "closed_at": "2026-10-22T09:00:00Z", "merged_at": null },
+  { "number": 98, "title": "Cart badge counts items", "state": "closed", "user": { "login": "bob" }, "html_url": "https://github.com/acme/shop/pull/98", "created_at": "2026-10-21T08:00:00Z", "updated_at": "2026-10-21T20:00:00Z", "closed_at": "2026-10-21T20:00:00Z", "merged_at": "2026-10-21T20:00:00Z" }
+]

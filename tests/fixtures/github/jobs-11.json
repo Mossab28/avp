@@ -1,0 +1,8 @@
+{
+  "total_count": 3,
+  "jobs": [
+    { "id": 111, "run_id": 11, "run_attempt": 1, "name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-10-22T10:01:10Z", "completed_at": "2026-10-22T10:11:10Z" },
+    { "id": 112, "run_id": 11, "run_attempt": 1, "name": "test", "status": "completed", "conclusion": "success", "started_at": "2026-10-22T10:01:10Z", "completed_at": "2026-10-22T10:21:10Z" },
+    { "id": 113, "run_id": 11, "run_attempt": 1, "name": "e2e", "status": "completed", "conclusion": "skipped", "started_at": "2026-10-22T10:21:10Z", "completed_at": "2026-10-22T10:21:10Z" }
+  ]
+}

@@ -1,0 +1,1 @@
+{ "name": "@shop/web", "scripts": { "typecheck": "tsc --noEmit" } }
