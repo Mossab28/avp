@@ -1,6 +1,6 @@
 [package]
 name = "avp"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "AVP, agent versioning protocol: version control for agents. A server that holds the truth, tasks instead of branches, proofs instead of CI."
 license = "Elastic-2.0"
@@ -8,6 +8,11 @@ license = "Elastic-2.0"
 [[bin]]
 name = "avp"
 path = "src/main.rs"
+
+[features]
+# AVP Cloud (src/cloud/): what a team's hosted server adds. Off, `cargo build` and the release
+# binaries give the free AVP; the server image builds with it (deploy/Dockerfile).
+cloud = ["dep:chacha20poly1305"]
 
 [dependencies]
 anyhow = "1"
@@ -29,7 +34,7 @@ futures-util = "0.3"
 toml = "0.8"
 ulid = "1"
 yaml-rust2 = { version = "0.13", default-features = false }
-chacha20poly1305 = "0.11.0"
+chacha20poly1305 = { version = "0.11.0", optional = true }
 
 [profile.release]
 lto = true

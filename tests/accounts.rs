@@ -1,6 +1,7 @@
 //! People, tokens and rights on a team server, through its HTTP surface: a server without users as
 //! before, then each person's role on the repo deciding what they may do, and the person on what
 //! they do coming from their token.
+#![cfg(feature = "cloud")]
 
 use avp::engine::Engine;
 use avp::model::*;

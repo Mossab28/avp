@@ -1,4 +1,5 @@
 //! Deploys AVP runs itself: `run = "<command>"` under [envs.<name>.deploy], on a toy repo.
+#![cfg(feature = "cloud")]
 
 use avp::check::{AvpConfig, Deploy};
 use avp::engine::{Engine, LandOutcome};

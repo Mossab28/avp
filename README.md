@@ -20,7 +20,7 @@ macOS and Linux, x86_64 and arm64; on Windows, inside WSL. Then ask your coding 
 in that folder: `avp up` wires each one it finds (Claude Code, Codex, Cursor, Gemini CLI, GitHub
 Copilot, OpenCode, Qwen Code, Kiro, Zed, Amp, Windsurf, Cline, Aider), `avp agents` says which.
 Nothing to tell the agent: it finds AVP through the MCP server and one rule in `AGENTS.md` (or the
-file it reads). A team shares one server: see [docs/GUIDE.md](docs/GUIDE.md#a-team-server).
+file it reads). A team shares one server, AVP Cloud's: see [AVP and AVP Cloud](#avp-and-avp-cloud).
 
 New to AVP? [Your first 15 minutes](docs/QUICKSTART.md) goes from install to two agents on one
 file, with the output of each command. [The concepts](docs/CONCEPTS.md) say the words (line,
@@ -59,8 +59,8 @@ pass 1 task in 10 through Git and 8 in 10 through AVP.
   the proof runs (typecheck and the tests related to the task), and only green lands. If the line
   moved, the task is replayed on the new head first.
 - The proof starts while the agent is still running its own tests, so landing rarely waits.
-- The whole suite runs once per batch of landings. Staging can follow a green suite, and
-  production is `avp promote production`.
+- On AVP Cloud, the whole suite runs once per batch of landings. Staging can follow a green suite,
+  and production is `avp promote production`.
 - For people, the history stays readable: every position is a Git commit on `avp/line` (goal, author,
   agent, proof), `avp show <position>` prints what it changed and why, `avp why <file>:<line>` which
   task wrote that line, its goal, its agent, its proof and the agent's conversation, and
@@ -74,6 +74,23 @@ does not look right: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 Already on a merge queue? [AVP and a merge queue](docs/GUIDE.md#avp-and-a-merge-queue) says what
 each does best. Releases, hotfixes and long-lived branches:
 [Releases, hotfixes and long work](docs/GUIDE.md#releases-hotfixes-and-long-work).
+
+## AVP and AVP Cloud
+
+AVP is the free tool anyone runs on their machine, as Git is: a local server (`avp up`), tasks,
+proofs, the line and its history (`log`, `show`, `why`, `blame`, `revert`, `bisect`), the mirror to
+Git, the MCP server for every agent, the import from Git and from a CI. `cargo build` and the
+release binaries are this AVP; its server answers its own machine, on 127.0.0.1.
+
+AVP Cloud is the hosted server a team pays for, as GitHub is: what only makes sense on a team's
+server. Proof workers; the full suite after each landing, its flaky reruns, the reverts it makes
+and the scheduled suites; a person in the loop (approvals, the landing rule, guarded paths);
+secrets for tests; environments, with promotions, rollbacks and the GitHub deploy bridge; stats and
+the before and after; AVP Live; a team's accounts and tokens.
+
+The CLI keeps every verb, as `gh` speaks to GitHub: on a free server, `avp promote` or `avp approve`
+answers that it is part of AVP Cloud, and what to do. In this repository AVP Cloud's code sits in
+`src/cloud/`, behind one seam (`src/seam.rs`), and builds with `cargo build --features cloud`.
 
 ## Limits
 

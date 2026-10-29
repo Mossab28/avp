@@ -1,6 +1,7 @@
 //! A flake in the full suite: a red shard runs again once on the same tree. Green the second time,
 //! the position is flaky, green for promotions and `follow`, never red; red twice is red. A task's
 //! proof never runs again.
+#![cfg(feature = "cloud")]
 
 use avp::engine::{Engine, LandOutcome};
 use avp::model::*;

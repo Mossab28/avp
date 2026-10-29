@@ -1,8 +1,9 @@
 //! AVP's bridge to GitHub (`avp serve` with AVP_GITHUB_BRIDGE=1), against a fake GitHub on a port
 //! of its own: no network.
+#![cfg(feature = "cloud")]
 
 use avp::engine::{Engine, LandOutcome};
-use avp::github::{Bridge, GitHub};
+use avp::cloud::github::{Bridge, GitHub};
 use avp::model::*;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};

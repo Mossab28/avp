@@ -1,8 +1,8 @@
 //! The verbs. Everything the server does lives here so the CLI, the HTTP layer and tests call
 //! the same functions.
 
-use crate::check::{failed_files, failing_tests, import_neighbors, read_config, Deploy, Part, Schedule, Shard, Workspace};
-use crate::db::{Db, DeployRun, Tag};
+use crate::check::{failed_files, import_neighbors, read_config, Part, Workspace};
+use crate::db::{Db, Tag};
 use crate::model::*;
 use crate::objects::Objects;
 use anyhow::{anyhow, Result};
@@ -12,23 +12,17 @@ use std::sync::{Arc, Condvar, Mutex};
 
 pub const LEASE_TTL_MS: i64 = 10 * 60 * 1000;
 
-/// The files that say how a task is proven. Changing them waits for a person's word (25/10, a
-/// Product Hunt question: "can a task edit the checks that validate it?"). A task is proven by its
-/// own, as a pull request runs its own CI: proven by the line's (25/10 to 28/10), a change that
-/// broke the steps landed green once approved, and every task after it was red under them, the
-/// one that fixed it and AVP's revert of it too. What a proof's steps get of the secrets stays the
-/// line's (`line_secrets`): a task does not hand itself one before a person reads it.
+/// The files that say how a task is proven. On AVP Cloud, changing them waits for a person's word
+/// (25/10, a Product Hunt question: "can a task edit the checks that validate it?"). A task is
+/// proven by its own, as a pull request runs its own CI: proven by the line's (25/10 to 28/10), a
+/// change that broke the steps landed green once approved, and every task after it was red under
+/// them, the one that fixed it and AVP's revert of it too. What a proof's steps get of the secrets
+/// stays the line's (`line_secrets`): a task does not hand itself one before a person reads it.
 pub const CHECK_FILES: [&str; 2] = ["avp.toml", "trame.toml"];
-
-/// Full suites share one laid-out dir per repo: one at a time.
-static LINE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The approvals asked for that the webhooks were told of, by task and proof: an agent that lands
 /// again while it waits asks nothing new.
 static TOLD: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-/// When each scheduled suite last started, by repo and schedule (its `at` and shards), in ms.
-static SCHEDULED: Mutex<BTreeMap<(String, String), i64>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone)]
 pub struct Engine {
@@ -38,21 +32,10 @@ pub struct Engine {
     /// One proof at a time per task: they share its folder, and the one that waits takes the
     /// verdict of the one before when it proved the same tree.
     task_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// The step each environment's deploy is at, kept in memory: as the bridge last read it (it
-    /// sends it again every half minute), or the last line a deploy AVP runs printed. A deploy AVP
-    /// runs keeps its state in the database too (`deploys`), its step written at most once a second.
-    progress: Arc<Mutex<HashMap<(String, String), DeployProgress>>>,
-    /// The deploys AVP runs itself (`run`): one at a time per environment.
-    deploy_locks: Arc<Mutex<HashMap<(String, String), Arc<Mutex<()>>>>>,
+    /// What AVP Cloud keeps in memory beside (`seam::State`): nothing in the free AVP.
+    pub cloud: Arc<crate::seam::State>,
     /// Each repo's landing queue.
     land_queues: Arc<Mutex<HashMap<String, Arc<LandQueue>>>>,
-}
-
-/// Where AVP's own revert went: landed, or proven green and waiting for a person's approval, with
-/// the guarded paths it changes (none when the repo's every landing waits for one).
-enum Reverting {
-    Landed(Landed),
-    Waits(Vec<String>),
 }
 
 /// A repo's landing queue: landings append to the line in turn, first come, first served.
@@ -71,30 +54,6 @@ impl Drop for Turn {
         self.0.tickets.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
         self.0.turn.notify_all();
     }
-}
-
-/// `GET /work`. Proofs count wherever they run: on workers, and in the server's own slots.
-#[derive(Debug, serde::Serialize)]
-pub struct Work {
-    /// "off": the server proves everything itself (no AVP_WORKERS=1).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workers: Option<String>,
-    /// Proofs not started: in the workers' queue, or waiting for a slot here (or for the drain).
-    pub waiting: usize,
-    /// Proofs running: claimed by workers, or in the server's slots.
-    pub running: usize,
-    /// Workers wanted right now: the queue and what they run (what an autoscaler follows).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub demand: Option<usize>,
-    /// Deploys AVP runs that are not over, running or waiting for their turn.
-    pub deploys: usize,
-    /// Those running: a restart cuts them. One that waits, the server that starts runs it.
-    pub deploying: usize,
-    /// The server starts no new work (`POST /drain`).
-    pub draining: bool,
-    /// When it drains, the seconds before the drain lifts by itself.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drain_left_s: Option<u64>,
 }
 
 pub enum LandOutcome {
@@ -178,14 +137,12 @@ impl Engine {
         std::fs::create_dir_all(data)?;
         // trame.sqlite: a server started before AVP was named AVP keeps its database.
         let db = if !data.join("avp.sqlite").exists() && data.join("trame.sqlite").exists() { data.join("trame.sqlite") } else { data.join("avp.sqlite") };
-        let engine = Self { db: Arc::new(Mutex::new(Db::open(&db)?)), objects: Objects::open(&data.join("objects"))?, data: data.to_path_buf(), task_locks: Arc::default(), progress: Arc::default(), deploy_locks: Arc::default(), land_queues: Arc::default() };
-        if let Err(e) = engine.resume_deploys() {
-            eprintln!("deploys left unfinished: {e:#}");
-        }
+        let engine = Self { db: Arc::new(Mutex::new(Db::open(&db)?)), objects: Objects::open(&data.join("objects"))?, data: data.to_path_buf(), task_locks: Arc::default(), cloud: Arc::default(), land_queues: Arc::default() };
+        crate::seam::opened(&engine);
         Ok(engine)
     }
 
-    fn db(&self) -> std::sync::MutexGuard<'_, Db> {
+    pub(crate) fn db(&self) -> std::sync::MutexGuard<'_, Db> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -402,46 +359,6 @@ impl Engine {
         drop(db);
         let stack = if status.task.state == TaskState::Open { self.stack_word(&status.task)? } else { None };
         Ok(TaskStatus { stack, ..status })
-    }
-
-    /// Paths whose change needs a person's approval, whatever the proof says.
-    pub fn guard(&self, repo: &str, add: &[String], remove: &[String]) -> Result<Vec<String>> {
-        let db = self.db();
-        db.guard(repo, add, remove)?;
-        let now = db.guarded(repo)?;
-        db.emit(repo, "repo.guarded", None, None, serde_json::json!({ "added": add, "removed": remove, "guarded": now }))?;
-        Ok(now)
-    }
-
-    pub fn set_landing(&self, repo: &str, rule: LandingRule) -> Result<()> {
-        let db = self.db();
-        db.set_landing(repo, rule)?;
-        db.emit(repo, "repo.landing", None, None, serde_json::json!({ "landing": rule }))?;
-        Ok(())
-    }
-
-    /// A person's word on a task. A refusal reaches the agent as the reason of its next land. An
-    /// approval of a task whose proof is green lands it at once: the person who read the change
-    /// is the last step, nobody has to ask the agent to land again.
-    pub fn approve(&self, task_id: &str, person: &str, approved: bool, reason: &str) -> Result<Approval> {
-        let (green, task, writes) = {
-            let db = self.db();
-            let task = db.task(task_id)?;
-            anyhow::ensure!(task.state == TaskState::Open, "task is {:?}", task.state);
-            let a = Approval { task: task_id.into(), person: person.into(), approved, reason: reason.into(), at: now_ms() };
-            db.set_approval(&a)?;
-            db.emit(&task.repo, if approved { "task.approved" } else { "task.refused" }, Some(task_id), None, serde_json::json!({ "person": person, "reason": reason }))?;
-            (db.last_proof(task_id)?.is_some_and(|p| p.verdict == Verdict::Green), task, db.writes(task_id)?)
-        };
-        // Red only without the secrets its checks name: approved, it is proven again with them.
-        let withheld = approved && !green && !self.withheld_secrets(&task, &self.candidate(&task, &writes)?)?.is_empty();
-        if approved && (green || withheld) {
-            let (e, t) = (self.clone(), task_id.to_string());
-            std::thread::spawn(move || {
-                let _ = e.land(&t);
-            });
-        }
-        Ok(Approval { task: task_id.into(), person: person.into(), approved, reason: reason.into(), at: now_ms() })
     }
 
     /// What a task changes, file by file, against the position it stands on: what a person reads
@@ -835,20 +752,13 @@ impl Engine {
 
     // ---- proofs ----
 
-    /// Runs a candidate's checks, or one part of them: on a worker when the server has them
-    /// (AVP_WORKERS=1), here otherwise, or when no worker answers in time. A speculative proof
-    /// goes to a worker or nowhere: the server does not spend itself on a guess.
+    /// Runs a candidate's checks, or one part of them: where the seam says (AVP Cloud's workers),
+    /// here otherwise, or when no worker answers in time.
     #[allow(clippy::too_many_arguments)]
     pub fn prove(&self, repo: &str, tree: &Tree, tree_hash: &str, name: &str, files: &[String], steps_override: Option<&str>, part: Option<&Part>, speculative: bool) -> Result<Vec<Step>> {
-        if let Some(d) = crate::workers::dispatcher() {
-            let job = crate::workers::Job { id: new_id("job"), repo: repo.into(), tree: tree.clone(), tree_hash: tree_hash.into(), name: name.into(), files: files.to_vec(), steps_override: steps_override.map(String::from), part: part.cloned() };
-            // Listed until a worker claims it: a land the drain holds in the queue hears why.
-            let _queued = crate::check::queued(&job.id, name);
-            if let Some(steps) = d.run(job) {
-                return Ok(steps);
-            }
-            anyhow::ensure!(!speculative, "no worker took the speculative proof");
-            eprintln!("no worker answered for {name}: proving here");
+        let job = crate::worker::Job { id: new_id("job"), repo: repo.into(), tree: tree.clone(), tree_hash: tree_hash.into(), name: name.into(), files: files.to_vec(), steps_override: steps_override.map(String::from), part: part.cloned() };
+        if let Some(steps) = crate::seam::prove_away(job, speculative)? {
+            return Ok(steps);
         }
         let ws = Workspace::new(&self.data, repo);
         Ok(ws.check(&self.objects, tree, tree_hash, name, files, steps_override, part)?.0)
@@ -860,7 +770,7 @@ impl Engine {
     /// one step whose output holds each share's.
     fn prove_task(&self, task: &Task, tree: &Tree, tree_hash: &str, files: &[String], speculative: bool) -> Result<Vec<Step>> {
         let cfg = read_config(tree, &self.objects)?.check;
-        let line_secrets = self.line_secrets(task, tree)?;
+        let line_secrets = crate::seam::line_secrets(self, task, tree)?;
         let most = std::env::var("AVP_SPLIT_MAX").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(8);
         let splits: Vec<(String, usize)> = if cfg.steps.iter().any(|s| s.split.is_some()) {
             let related = crate::check::related_tests(&self.objects, tree, files);
@@ -887,9 +797,7 @@ impl Engine {
                         let steps = self.prove(&task.repo, tree, tree_hash, &task.id, files, None, Some(p), speculative)?;
                         if red(&steps) {
                             crate::check::cancel_tree(&task.id, tree_hash);
-                            if let Some(d) = crate::workers::dispatcher() {
-                                d.cancel_tree(&task.id, tree_hash);
-                            }
+                            crate::seam::cancel_tree(&task.id, tree_hash);
                         }
                         Ok::<_, anyhow::Error>(steps)
                     })
@@ -960,44 +868,6 @@ impl Engine {
         self.task_locks.lock().unwrap_or_else(|e| e.into_inner()).entry(task_id.to_string()).or_default().clone()
     }
 
-    /// The secrets a task that changes the checks may give its steps: those the checks of the
-    /// position it stands on give theirs, which its code already reaches, until a person approves
-    /// it as it now is; then every one its checks name (avp migrate's first avp.toml names the
-    /// secrets the tests need, and no line gave them yet). None when it leaves them alone (its
-    /// avp.toml is the line's) or once approved.
-    fn line_secrets(&self, task: &Task, tree: &Tree) -> Result<Option<Vec<String>>> {
-        if self.approved_as_written(&task.id)? {
-            return Ok(None);
-        }
-        self.secrets_of_base(task, tree)
-    }
-
-    /// A person's yes given after the task's last write: a later write does not ride on it.
-    fn approved_as_written(&self, task_id: &str) -> Result<bool> {
-        let db = self.db();
-        let last = db.writes(task_id)?.iter().map(|w| w.at).max().unwrap_or(0);
-        Ok(db.approval(task_id)?.is_some_and(|w| w.approved && w.at >= last))
-    }
-
-    /// The secrets a task's checks name that the line's do not give: its proof runs without them
-    /// until a person approves it.
-    fn withheld_secrets(&self, task: &Task, tree: &Tree) -> Result<Vec<String>> {
-        let Some(given) = self.secrets_of_base(task, tree)? else { return Ok(vec![]) };
-        let named = read_config(tree, &self.objects).map(|c| crate::check::secrets_named(&c.check, None, None)).unwrap_or_default();
-        Ok(named.into_iter().filter(|s| !given.contains(s)).collect())
-    }
-
-    /// What the checks of the position a task stands on give its steps, when the task changes them.
-    fn secrets_of_base(&self, task: &Task, tree: &Tree) -> Result<Option<Vec<String>>> {
-        let base = self.objects.get_tree(&task.base_tree)?;
-        if CHECK_FILES.iter().all(|n| base.get(*n) == tree.get(*n)) {
-            return Ok(None);
-        }
-        // Checks on the line that do not read give none.
-        let given = read_config(&base, &self.objects).map(|c| crate::check::secrets_named(&c.check, None, None)).unwrap_or_default();
-        Ok(Some(given.into_iter().collect()))
-    }
-
     fn check_as(&self, task_id: &str, speculative: bool) -> Result<Proof> {
         let (task, writes) = {
             let db = self.db();
@@ -1008,9 +878,7 @@ impl Engine {
         let tree_hash = self.objects.put_tree(&tree)?;
         // A proof of an older tree of this task is worth nothing now: stop it, here or on a worker.
         crate::check::cancel_other(task_id, &tree_hash);
-        if let Some(d) = crate::workers::dispatcher() {
-            d.cancel_other(task_id, &tree_hash);
-        }
+        crate::seam::cancel_other(task_id, &tree_hash);
         let lock = self.task_lock(task_id);
         let _one = lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = self.db().last_proof(task_id)? {
@@ -1296,14 +1164,10 @@ impl Engine {
             _ => false,
         };
         let proof = if reusable { last.unwrap() } else { self.check(task_id)? };
-        let withheld = if proof.verdict == Verdict::Red { self.withheld_secrets(&task, &candidate)? } else { vec![] };
-        if !withheld.is_empty() && !self.approved_as_written(task_id)? {
-            // Red, proven without secrets its checks name and the line's do not give: a person's
-            // word gives them, and `approve` proves it again with them.
-            let note = format!("proven without {}, which its avp.toml names and the line's does not give: a person's approval gives them, and it is proven again", withheld.join(", "));
-            let db = self.db();
-            self.emit_told(&db, &task.repo, "task.awaiting_approval", Some(task_id), serde_json::json!({ "proof": proof.id, "goal": task.goal, "secrets": withheld }))?;
-            return Ok(LandOutcome::NotLanded(NotLanded { guarded: CHECK_FILES.iter().map(|f| f.to_string()).filter(|f| candidate.get(f.as_str()).is_some()).collect(), reason: "approval".into(), conflicts: vec![], proof: Some(proof), waits_for: vec![], word: None, note: Some(note), stack: vec![] }));
+        // What holds a green proof back (a person's approval, in AVP Cloud), or a red one proven
+        // without the secrets it names.
+        if let Some(n) = crate::seam::landing_gate(self, &task, &writes, &candidate, &proof)? {
+            return Ok(LandOutcome::NotLanded(n));
         }
         if proof.verdict != Verdict::Green {
             // Only a blocked proof waits for someone: a red one is this task's to fix, even when some
@@ -1311,34 +1175,6 @@ impl Engine {
             // agent polling for 13 minutes instead of fixing the tests its change broke).
             let waits: Vec<String> = if proof.verdict == Verdict::Blocked { proof.blamed.iter().filter_map(|(_, h)| h.clone()).collect::<BTreeSet<_>>().into_iter().collect() } else { vec![] };
             return Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: if proof.verdict == Verdict::Blocked { "blocked".into() } else { "red".into() }, conflicts: vec![], proof: Some(proof), waits_for: waits, word: None, note: None, stack: vec![] }));
-        }
-        // The landing rule: a green proof may still need a person's word, for the whole repo or
-        // because the task touches a guarded path (kept on the server, not in the tree: a task
-        // cannot lift its own guard).
-        let (rule, word, patterns) = {
-            let db = self.db();
-            (db.repo(&task.repo)?.landing, db.approval(task_id)?, db.guarded(&task.repo)?)
-        };
-        // The checks themselves are always guarded: a task proven by its own checks may change
-        // them, but only a person makes that change count.
-        let base = self.objects.get_tree(&task.base_tree)?;
-        let guarded: Vec<String> = Self::effective_writes(&writes)
-            .keys()
-            .filter(|p| patterns.iter().any(|g| path_matches(g, p)) || (CHECK_FILES.contains(&p.as_str()) && base.get(*p) != candidate.get(*p)))
-            .cloned()
-            .collect();
-        if rule == LandingRule::ProofAndApproval || !guarded.is_empty() {
-            match &word {
-                Some(w) if w.approved && w.at >= proof.created_at.min(task.created_at) => {}
-                Some(w) if !w.approved => {
-                    return Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: "refused".into(), conflicts: vec![], proof: Some(proof), waits_for: vec![], word: word.clone(), note: None, stack: vec![] }));
-                }
-                _ => {
-                    let db = self.db();
-                    self.emit_told(&db, &task.repo, "task.awaiting_approval", Some(task_id), serde_json::json!({ "proof": proof.id, "goal": task.goal, "guarded": guarded }))?;
-                    return Ok(LandOutcome::NotLanded(NotLanded { guarded: guarded.clone(), reason: "approval".into(), conflicts: vec![], proof: Some(proof), waits_for: vec![], word: None, note: None, stack: vec![] }));
-                }
-            }
         }
         let entry = {
             // Every landing appends in its repo's turn.
@@ -1374,348 +1210,8 @@ impl Engine {
             }
             entry
         };
-        if task.actor.person == avp_actor().person && task.actor.agent == avp_actor().agent {
-            if let Err(e) = self.revert_approved(&task.repo, task_id, entry.position) {
-                eprintln!("revert landed at {}: {e:#}", entry.position);
-            }
-        }
-        self.full_suite_after(&task.repo, entry.position, candidate_hash.clone(), true, None);
+        crate::seam::after_landing(self, &task, entry.position, &candidate_hash);
         Ok(LandOutcome::Landed(Landed { position: entry.position, tree: candidate_hash, proof: proof.id, replayed, stack: vec![] }))
-    }
-
-    /// The whole suite, after the fact, on a copy of the engine. Red reopens nothing by itself:
-    /// it records and tells; the position stays. (Bisection is trivial on a line: the previous
-    /// green position bounds it.) `scheduled`: a suite `[[check.schedule]]` started, of the shards it
-    /// names.
-    fn full_suite_after(&self, repo: &str, position: i64, tree_hash: String, give_way: bool, scheduled: Option<Schedule>) {
-        let engine = self.clone();
-        let repo = repo.to_string();
-        std::thread::spawn(move || {
-            let run = || -> Result<()> {
-                let _one_at_a_time = LINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                let tree = engine.objects.get_tree(&tree_hash)?;
-                let cfg = read_config(&tree, &engine.objects)?.check;
-                let mut shards = cfg.shards();
-                if shards.is_empty() {
-                    return Ok(());
-                }
-                // A scheduled suite runs the shards it names (each job of a shard's matrix), every one
-                // when it names none. Some of the shards green say nothing of the whole: then only a
-                // red counts for the position.
-                let every = shards.len();
-                if let Some(s) = scheduled.as_ref().filter(|s| !s.shards.is_empty()) {
-                    shards.retain(|shard| s.shards.iter().any(|n| shard.name == *n || shard.name.starts_with(&format!("{n} ("))));
-                    anyhow::ensure!(!shards.is_empty(), "the suite scheduled at {} names no shard of avp.toml ({})", s.at, s.shards.join(", "));
-                }
-                let whole = shards.len() == every;
-                // A batch: landings come faster than a suite runs. The newest position holds every
-                // earlier one, so a suite that waited while the line moved gives its turn to it.
-                let head = engine.db().head(&repo)?.map(|h| h.position).unwrap_or(position);
-                if give_way && head > position {
-                    engine.db().emit(&repo, "line.full_covered", None, None, serde_json::json!({ "position": position, "by": head }))?;
-                    return Ok(());
-                }
-                // Every shard at once: one job each, so as many workers as shards run the suite. A
-                // shard comes back with its steps and, when it flaked, the tests its red run failed.
-                let (runs, flakes): (Vec<Vec<Step>>, Vec<Option<Vec<String>>>) = std::thread::scope(|sc| {
-                    let runs: Vec<_> = shards
-                        .iter()
-                        .enumerate()
-                        .map(|(i, shard)| {
-                            let (engine, repo, tree, tree_hash) = (&engine, &repo, &tree, &tree_hash);
-                            let (name, run, part) = (&shard.name, &shard.run, Part::of_shard(shard));
-                            sc.spawn(move || {
-                                let attempt = || match engine.prove(repo, tree, tree_hash, &format!("line-{i}"), &[], Some(run), Some(&part), false) {
-                                    Ok(mut st) => {
-                                        for s in st.iter_mut() {
-                                            s.name = name.clone();
-                                        }
-                                        st
-                                    }
-                                    Err(e) => vec![Step { name: name.clone(), command: run.clone(), exit: 1, seconds: 0.0, output: format!("{e:#}") }],
-                                };
-                                let first = attempt();
-                                if first.iter().all(|s| s.exit == 0) {
-                                    return (first, None);
-                                }
-                                // Red once may be the machine (a browser that did not start, a timing
-                                // test under load: on Murmell's line, 24/10, positions went red on tests
-                                // their changes did not reach, and were blamed): the shard runs again,
-                                // once, on the same tree. Green the second time is flaky and says so,
-                                // with the first run's end and the tests it failed; red twice is red. A
-                                // task's proof never runs again: it gates a landing, and a red there is
-                                // the agent's to read.
-                                let mut second = attempt();
-                                if second.iter().any(|s| s.exit != 0) {
-                                    return (second, None);
-                                }
-                                let red: Vec<&str> = first.iter().filter(|s| s.exit != 0).map(|s| s.output.as_str()).collect();
-                                let tail = red.iter().map(|o| o.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")).collect::<Vec<_>>().join("\n");
-                                for s in second.iter_mut() {
-                                    s.name = format!("{} (flaky: red, then green on its retry)", s.name);
-                                    s.output = format!("first run, red:\n{tail}\n--- retry ---\n{}", s.output);
-                                }
-                                (second, Some(failing_tests(&red.join("\n"))))
-                            })
-                        })
-                        .collect();
-                    runs.into_iter().map(|h| h.join().unwrap_or_default()).unzip()
-                });
-                let steps: Vec<Step> = runs.into_iter().flatten().collect();
-                let flaky: Vec<(&String, Vec<String>)> = shards.iter().map(|s| &s.name).zip(flakes).filter_map(|(name, tests)| tests.map(|t| (name, t))).collect();
-                let red = steps.iter().any(|s| s.exit != 0);
-                let verdict = if red { Verdict::Red } else if flaky.is_empty() { Verdict::Green } else { Verdict::Flaky };
-                let output = steps.iter().map(|s| s.output.as_str()).collect::<Vec<_>>().join("\n");
-                let blamed = if red { failed_files(&output, &tree).into_iter().map(|f| (f, None)).collect() } else { vec![] };
-                let proof = Proof { id: new_id("proof"), task: None, base_position: position, candidate_tree: tree_hash.clone(), files: vec![], steps, verdict, blamed, created_at: now_ms() };
-                let db = engine.db();
-                db.insert_proof(&repo, &proof)?;
-                if whole || red {
-                    db.set_full(&repo, position, proof.verdict, &proof.id)?;
-                }
-                let task = db.line_at(&repo, position)?.task;
-                // Each shard that flaked says so, whatever the others did: a flaky test is worth
-                // knowing on a red position too. A flaky position has no other verdict event.
-                for (shard, tests) in &flaky {
-                    db.emit(&repo, "line.flaky", task.as_deref(), None, serde_json::json!({ "position": position, "proof": proof.id, "shard": shard, "tests": tests }))?;
-                }
-                if verdict != Verdict::Flaky {
-                    let mut data = serde_json::json!({ "position": position, "proof": proof.id });
-                    if let Some(s) = &scheduled {
-                        data["scheduled"] = s.at.clone().into();
-                    }
-                    engine.emit_told(&db, &repo, if red { "line.red" } else { "line.green" }, task.as_deref(), data)?;
-                }
-                drop(db);
-                // Environments that follow the full suite take the newest green position, or flaky.
-                if !red {
-                    engine.follow_full(&repo)?;
-                } else if give_way {
-                    // Red twice after a landing: the line does not stay red.
-                    engine.repair(&repo, position, &shards, &proof);
-                }
-                Ok(())
-            };
-            if let Err(e) = run() {
-                eprintln!("full suite at {position}: {e:#}");
-            }
-        });
-    }
-
-    /// A full suite red twice after a landing. With agents landing every few minutes, a line left red
-    /// until a person acts is a line the next ones build on: the position that broke it goes back
-    /// off the line, by a task AVP opens, proves and lands itself (`line.reverted`). What AVP cannot
-    /// settle that way stays red for a person, and `line.revert_failed` says why. It runs in the
-    /// suite's thread, holding the line's lock: the suites of what lands meanwhile wait, then the
-    /// newest of them runs, on the revert or after it.
-    fn repair(&self, repo: &str, red_at: i64, shards: &[Shard], proof: &Proof) {
-        let Some(red) = proof.steps.iter().find(|s| s.exit != 0) else { return };
-        let Some(shard) = shards.iter().find(|s| s.name == red.name) else { return };
-        if let Err(e) = self.revert_red(repo, red_at, shard, red, &proof.id) {
-            let task = self.db().line_at(repo, red_at).ok().and_then(|l| l.task);
-            let _ = self.db().emit(repo, "line.revert_failed", task.as_deref(), None, serde_json::json!({ "position": red_at, "shard": shard.name, "proof": proof.id, "reason": format!("{e:#}") }));
-        }
-    }
-
-    /// Finds the position that turned shard `shard` red at `red_at`, and reverts it. The batch is
-    /// what landed since the newest position whose suite ran (or that AVP's last revert landed): one
-    /// position, it is that one; several, the shard runs on the positions in between, halving, down
-    /// to the first red one. A batch whose base is not known green runs the shard there first: red
-    /// there too, the red is older than the batch and nothing in it is to blame.
-    fn revert_red(&self, repo: &str, red_at: i64, red_shard: &Shard, red: &Step, proof: &str) -> Result<()> {
-        let (shard, red_proof) = (red_shard.name.as_str(), proof);
-        let (head, below) = {
-            let db = self.db();
-            (db.head(repo)?.ok_or_else(|| anyhow!("no line"))?, db.line(repo, red_at - 1, 1000)?)
-        };
-        if !read_config(&self.objects.get_tree(&head.tree)?, &self.objects)?.line.auto_revert {
-            return Ok(());
-        }
-        anyhow::ensure!(!self.by_avp(repo, red_at)?, "position {red_at} is AVP's own revert, and red: a person decides");
-        let reverts: BTreeSet<i64> = below.iter().filter_map(|e| e.reverted.as_ref().map(|r| r.by)).collect();
-        let base = below.iter().find(|e| e.full.is_some() || reverts.contains(&e.position)).or(below.last()).ok_or_else(|| anyhow!("nothing below position {red_at} to compare it with"))?;
-        let mut probes = Vec::new();
-        if !matches!(base.full, Some(Verdict::Green | Verdict::Flaky)) {
-            let r = self.shard_red(repo, base.position, red_shard)?;
-            probes.push(serde_json::json!({ "position": base.position, "red": r.is_some() }));
-            anyhow::ensure!(r.is_none(), "shard {shard} is red on position {} too, before the positions it would blame: a person decides", base.position);
-        }
-        let mut failed = red.clone();
-        let culprit = halve(base.position, red_at, |mid| {
-            let r = self.shard_red(repo, mid, red_shard)?;
-            probes.push(serde_json::json!({ "position": mid, "red": r.is_some() }));
-            Ok(r.map(|step| failed = step).is_some())
-        })?;
-        anyhow::ensure!(!self.by_avp(repo, culprit)?, "position {culprit}, AVP's own revert, turned shard {shard} red: a person decides");
-        let entry = self.db().line_at(repo, culprit)?;
-        let mut tests = failing_tests(&failed.output);
-        if tests.is_empty() {
-            // A runner that names no failing test: its last words.
-            tests = failed.output.lines().rev().map(str::trim).filter(|l| !l.is_empty()).take(3).map(String::from).collect();
-            tests.reverse();
-        }
-        tests.truncate(3);
-        // A culprit below the red position read red on that shard: its verdict says so.
-        let proof = if culprit == red_at {
-            proof.to_string()
-        } else {
-            let tree = self.objects.get_tree(&entry.tree)?;
-            let p = Proof { id: new_id("proof"), task: None, base_position: culprit, candidate_tree: entry.tree.clone(), files: vec![], steps: vec![failed.clone()], verdict: Verdict::Red, blamed: failed_files(&failed.output, &tree).into_iter().map(|f| (f, None)).collect(), created_at: now_ms() };
-            let db = self.db();
-            db.insert_proof(repo, &p)?;
-            db.set_full(repo, culprit, Verdict::Red, &p.id)?;
-            p.id
-        };
-        let note: String = entry.note.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect();
-        let goal = format!("Revert position {culprit}: {note} (full suite red twice, shard {shard}: {})", tests.join(" | ").chars().take(300).collect::<String>());
-        let (revert, landed, files) = self.revert_as_avp(repo, culprit, goal)?;
-        let culprit_task = entry.task.as_deref().map(|t| self.db().task(t)).transpose()?;
-        let tail = failed.output.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-        let said = serde_json::json!({
-            "position": culprit, "revert_task": revert.id, "red": red_at, "shard": shard, "tests": tests, "output": tail, "proof": proof,
-            "goal": entry.note, "person": culprit_task.as_ref().map(|t| &t.actor.person), "agent": culprit_task.as_ref().map(|t| &t.actor.agent), "files": files, "probes": probes,
-        });
-        match landed {
-            Reverting::Landed(l) => self.record_revert(repo, said, l.position),
-            // Proven green, it waits for a person, open: approved, it lands as any task does, and
-            // its landing records it (`revert_approved`) from what this event keeps.
-            Reverting::Waits(guarded) => {
-                let changes = if guarded.is_empty() { String::new() } else { format!(", as it changes {}", guarded.join(", ")) };
-                let reason = format!("the revert of position {culprit} is proven green and waits for a person's approval{changes}: `avp diff {0}` shows it, `avp approve {0}` lands it", revert.id);
-                let task = self.db().line_at(repo, red_at)?.task;
-                self.db().emit(repo, "line.revert_failed", task.as_deref(), None, serde_json::json!({ "position": red_at, "shard": shard, "proof": red_proof, "reason": reason, "revert": said }))?;
-                // Approved and landed before this event was there for its landing to find.
-                match self.db().task(&revert.id)?.landed_position {
-                    Some(by) => self.record_revert(repo, said, by),
-                    None => Ok(()),
-                }
-            }
-        }
-    }
-
-    /// AVP's revert landed at `by`: the position it took back says by what and why, and
-    /// `line.reverted` hands it back to its person and agent, once. `said`: what the event says, `by`
-    /// aside.
-    fn record_revert(&self, repo: &str, mut said: serde_json::Value, by: i64) -> Result<()> {
-        said["by"] = by.into();
-        let position = said["position"].as_i64().ok_or_else(|| anyhow!("a revert names no position"))?;
-        let text = |k: &str| said[k].as_str().unwrap_or_default().to_string();
-        let r = Reverted { by, task: text("revert_task"), shard: text("shard"), tests: serde_json::from_value(said["tests"].clone()).unwrap_or_default(), proof: text("proof") };
-        let db = self.db();
-        let entry = db.line_at(repo, position)?;
-        if entry.reverted.is_some() {
-            return Ok(());
-        }
-        let task = entry.task;
-        db.set_reverted(repo, position, &r)?;
-        self.emit_told(&db, repo, "line.reverted", task.as_deref(), said)
-    }
-
-    /// AVP's revert of a guarded path, landed once a person approved it: recorded as one that lands
-    /// at once, from the `line.revert_failed` that said it waited. Nothing when none did.
-    fn revert_approved(&self, repo: &str, task_id: &str, by: i64) -> Result<()> {
-        let waited = self.db().events_of(repo, &["line.revert_failed"], 0)?.into_iter().rev().find(|e| e.data["revert"]["revert_task"] == task_id);
-        match waited {
-            Some(e) => self.record_revert(repo, e.data["revert"].clone(), by),
-            None => Ok(()),
-        }
-    }
-
-    /// Whether AVP's own revert landed this position.
-    fn by_avp(&self, repo: &str, position: i64) -> Result<bool> {
-        let db = self.db();
-        let Some(t) = db.line_at(repo, position)?.task else { return Ok(false) };
-        let a = db.task(&t)?.actor;
-        Ok(a.person == avp_actor().person && a.agent == avp_actor().agent)
-    }
-
-    /// A shard on position `position`, run again once when red as the full suite runs it: its red
-    /// step when red twice, None when green. A shard that cannot run stops the bisection: a position
-    /// is never blamed for the machine. The shard of that name in the position's own avp.toml, as
-    /// its suite ran it: a position that changed the command would otherwise blame every one before
-    /// it. One without it is not red on it.
-    fn shard_red(&self, repo: &str, position: i64, shard: &Shard) -> Result<Option<Step>> {
-        let entry = self.db().line_at(repo, position)?;
-        let tree = self.objects.get_tree(&entry.tree)?;
-        let Some(shard) = read_config(&tree, &self.objects)?.check.shards().into_iter().find(|s| s.name == shard.name) else { return Ok(None) };
-        let mut red = None;
-        for _ in 0..2 {
-            let steps = self.prove(repo, &tree, &entry.tree, &format!("bisect-{position}"), &[], Some(&shard.run), Some(&Part::of_shard(&shard)), false)?;
-            match steps.into_iter().find(|s| s.exit != 0) {
-                Some(s) => red = Some(Step { name: shard.name.clone(), ..s }),
-                None => return Ok(None),
-            }
-        }
-        Ok(red)
-    }
-
-    /// Takes position `position` back on the head, as `avp revert` does, in a task AVP opens itself:
-    /// proven and landed like any other. One proven green that waits for a person (it changes a
-    /// guarded path: avp.toml, always) stays open for them; one that does not land is abandoned, and
-    /// the error says why. Returns the task, where it went, and the files it took back.
-    fn revert_as_avp(&self, repo: &str, position: i64, goal: String) -> Result<(Task, Reverting, Vec<String>)> {
-        let task = self.open_task(repo, OpenTask { goal, actor: avp_actor(), scope: vec![], transcript: None })?;
-        let landed = self.write_revert(&task, position).and_then(|files| match self.land(&task.id)? {
-            LandOutcome::Landed(l) => Ok((Reverting::Landed(l), files)),
-            LandOutcome::NotLanded(n) if n.reason == "approval" => Ok((Reverting::Waits(n.guarded), files)),
-            LandOutcome::NotLanded(n) => {
-                let red = n.proof.as_ref().and_then(|p| p.steps.iter().find(|s| s.exit != 0)).map(|s| format!(", {} ends with:\n{}", s.name, crate::check::red_part(&s.output).lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"))).unwrap_or_default();
-                Err(match n.reason.as_str() {
-                    "conflict" => anyhow!("the revert of position {position} conflicts with what landed meanwhile, in {}: a person settles it (`avp revert {position}`)", n.conflicts.join(", ")),
-                    "empty" | "already" => anyhow!("the head no longer holds what position {position} changed: nothing to take back"),
-                    r => anyhow!("the revert of position {position} does not land: its proof is {r}{red}"),
-                })
-            }
-        });
-        match landed {
-            Ok((l, files)) => Ok((task, l, files)),
-            Err(e) => {
-                let _ = self.abandon(&task.id);
-                Err(e)
-            }
-        }
-    }
-
-    /// The writes that take `position` back on the task's base. A file nobody changed since comes
-    /// back as it was; one changed since gets the inverse change merged in; lines changed again
-    /// since stop it, for a person to settle. AVP takes no lease: its revert is the line's own, and
-    /// neither waits for an agent's lease nor takes one away.
-    fn write_revert(&self, task: &Task, position: i64) -> Result<Vec<String>> {
-        anyhow::ensure!(position > 0, "position 0 is where the line starts: there is nothing to revert");
-        let (before, after) = (self.tree_at(&task.repo, position - 1)?, self.tree_at(&task.repo, position)?);
-        let head = self.objects.get_tree(&task.base_tree)?;
-        let paths: BTreeSet<&String> = before.keys().chain(after.keys()).filter(|p| before.get(*p) != after.get(*p)).collect();
-        let text = |e: &Entry| -> Result<Option<String>> { Ok(String::from_utf8(self.objects.get(&e.blob)?).ok()) };
-        let (mut writes, mut conflicts) = (Vec::new(), Vec::new());
-        for path in paths {
-            let (was, became, now) = (before.get(path), after.get(path), head.get(path));
-            if now == became {
-                writes.push(match was {
-                    Some(e) => PutWrite { path: path.clone(), kind: WriteKind::Put, blob: Some(e.blob.clone()), mode: e.mode },
-                    None => PutWrite { path: path.clone(), kind: WriteKind::Delete, blob: None, mode: default_mode() },
-                });
-                continue;
-            }
-            let merged = match (was, became, now) {
-                (Some(w), Some(b), Some(n)) => match (text(w)?, text(b)?, text(n)?) {
-                    (Some(w), Some(b), Some(t)) => diffy::merge(&b, &t, &w).ok(),
-                    _ => None,
-                },
-                // Added by the position, or deleted by it, and changed again since: a person decides.
-                _ => None,
-            };
-            match (merged, now) {
-                (Some(m), Some(n)) => writes.push(PutWrite { path: path.clone(), kind: WriteKind::Put, blob: Some(self.objects.put(m.as_bytes())?), mode: n.mode }),
-                _ => conflicts.push(path.clone()),
-            }
-        }
-        anyhow::ensure!(conflicts.is_empty(), "the lines position {position} changed were changed again since, in {}: a person settles them (`avp revert {position}`)", conflicts.join(", "));
-        let db = self.db();
-        for w in &writes {
-            let write = db.append_write(&task.id, &w.path, w.kind, w.blob.as_deref(), w.mode)?;
-            db.emit(&task.repo, "write", Some(&task.id), Some(&w.path), serde_json::json!({ "kind": w.kind, "seq": write.seq, "reverts": position }))?;
-        }
-        Ok(writes.into_iter().map(|w| w.path).collect())
     }
 
     /// The reverts of the last day a task should hear of as it opens: those of positions that
@@ -1828,38 +1324,6 @@ impl Engine {
         self.db().set_tag_git(repo, name, sha)
     }
 
-    /// Each environment that follows the full suite takes the newest green position, once it
-    /// serves the one it was last promoted to. Promoted again while a deploy runs, it would start
-    /// another deploy that takes the place of the first (on Murmell, staging moved from 108 to
-    /// nowhere for 30 minutes while green positions kept coming). A deploy that has not been served
-    /// in AVP_FOLLOW_STUCK_S (default 1800) is taken for lost, and the next one goes. A deploy AVP
-    /// runs itself waits for the one before it on its own: the newest green position goes at once.
-    pub fn follow_full(&self, repo: &str) -> Result<()> {
-        let stuck_ms = std::env::var("AVP_FOLLOW_STUCK_S").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(1800) * 1000;
-        for (name, cfg) in self.env_config(repo)? {
-            if cfg.follow.as_deref() != Some("full") {
-                continue;
-            }
-            let (newest, wanted, serves) = {
-                let db = self.db();
-                (db.newest_green(repo)?, db.promotion(repo, &name)?, db.env(repo, &name)?.map(|e| e.position))
-            };
-            let Some(newest) = newest else { continue };
-            let settled = match &wanted {
-                _ if matches!(cfg.deploy, Some(Deploy::Run(_))) => true,
-                None => true,
-                Some(w) => serves.is_some_and(|s| s >= w.position) || now_ms() - w.at > stuck_ms,
-            };
-            if settled && wanted.as_ref().is_none_or(|w| w.position < newest) && serves.is_none_or(|s| s < newest) {
-                // In the background: the full suite that called holds the line's lock.
-                if let Err(e) = self.promote_as(repo, &name, Some(newest), false, "avp", "full suite", false, None) {
-                    eprintln!("{name} does not follow position {newest}: {e:#}");
-                }
-            }
-        }
-        Ok(())
-    }
-
     // ---- reading ----
 
     pub fn why(&self, repo: &str, path: &str, at: Option<i64>) -> Result<Why> {
@@ -1932,45 +1396,6 @@ impl Engine {
             .collect())
     }
 
-    /// What an environment really serves, read from the git commit it publishes (a deployment
-    /// that AVP did not drive: GitHub's workflows during the transition). Moves the pointer
-    /// without asking for a proof, and says so in the event.
-    pub fn observe_env(&self, repo: &str, name: &str, sha: &str) -> Result<Environment> {
-        let db = self.db();
-        let position = db.position_of_git(repo, sha)?.ok_or_else(|| anyhow!("no position of the line is git commit {sha} (served from before the line?)"))?;
-        if db.env(repo, name)?.map(|e| e.position) == Some(position) {
-            return Ok(db.env(repo, name)?.unwrap());
-        }
-        let env = db.set_env(repo, name, position)?;
-        let task = db.line_at(repo, position)?.task;
-        let rollback = Self::rollback_from(&db, repo, name, position)?;
-        self.emit_told(&db, repo, "env.moved", task.as_deref(), rolled_back(serde_json::json!({ "env": name, "position": position, "observed": true, "git": sha }), rollback))?;
-        drop(db);
-        // Its deploy is done: an environment that follows the full suite takes the newest green.
-        self.follow_full(repo)?;
-        Ok(env)
-    }
-
-    /// Runs the full suite of a position again (none: the head), whatever its last verdict: after a
-    /// red that looked like the machine, or to prove an older position. Starts it and returns.
-    pub fn rerun_full(&self, repo: &str, position: Option<i64>) -> Result<i64> {
-        let entry = {
-            let db = self.db();
-            let position = match position {
-                Some(p) => p,
-                None => db.head(repo)?.ok_or_else(|| anyhow!("no line"))?.position,
-            };
-            db.line_at(repo, position)?
-        };
-        self.full_suite_after(repo, entry.position, entry.tree.clone(), false, None);
-        Ok(entry.position)
-    }
-
-    /// The environments avp.toml declares, read from the head of the line.
-    pub fn env_config(&self, repo: &str) -> Result<std::collections::BTreeMap<String, crate::check::EnvConfig>> {
-        Ok(self.config(repo)?.envs)
-    }
-
     /// avp.toml as the head of the line has it.
     pub fn config(&self, repo: &str) -> Result<crate::check::AvpConfig> {
         let head = { self.db().head(repo)? };
@@ -1979,333 +1404,10 @@ impl Engine {
         read_config(&tree, &self.objects)
     }
 
-    /// The GitHub bridge found the run of a promotion's deploy (`deploy.dispatched`): where an
-    /// agent follows it, and what a server that restarts follows again instead of dispatching twice.
-    pub fn github_dispatched(&self, repo: &str, name: &str, p: &Promotion, workflow: &str, run: u64, url: &str) -> Result<()> {
-        let db = self.db();
-        let task = db.line_at(repo, p.position)?.task;
-        db.emit(repo, "deploy.dispatched", task.as_deref(), None, serde_json::json!({ "env": name, "position": p.position, "by": p.by, "workflow": workflow, "run": run, "url": url }))
-    }
-
-    /// The run of a promotion's GitHub deploy is green and nothing else says what the environment
-    /// serves (no `serves` URL): it serves the position now, as when a `run` deploy exits 0.
-    pub fn github_deployed(&self, repo: &str, name: &str, p: &Promotion, url: &str) -> Result<Environment> {
-        let db = self.db();
-        let env = db.set_env(repo, name, p.position)?;
-        let task = db.line_at(repo, p.position)?.task;
-        let rollback = Self::rollback_from(&db, repo, name, p.position)?;
-        self.emit_told(&db, repo, "env.moved", task.as_deref(), rolled_back(serde_json::json!({ "env": name, "position": p.position, "by": p.by, "run": url }), rollback))?;
-        drop(db);
-        self.progress.lock().unwrap_or_else(|e| e.into_inner()).remove(&(repo.to_string(), name.to_string()));
-        self.follow_full(repo)?;
-        Ok(env)
-    }
-
-    /// The run of a promotion's GitHub deploy failed: the environment stays, `reason` names the job.
-    pub fn github_failed(&self, repo: &str, name: &str, p: &Promotion, reason: &str, url: &str) -> Result<()> {
-        let db = self.db();
-        let task = db.line_at(repo, p.position)?.task;
-        let rollback = Self::rollback_from(&db, repo, name, p.position)?;
-        self.emit_told(&db, repo, "env.failed", task.as_deref(), rolled_back(serde_json::json!({ "env": name, "position": p.position, "by": p.by, "reason": reason, "run": url }), rollback))
-    }
-
-    /// Every environment: what it serves (-1 when nothing yet), its last promotion, its deploy.
-    pub fn envs_view(&self, repo: &str) -> Result<Vec<Environment>> {
-        let cfg = self.env_config(repo)?;
-        let db = self.db();
-        let mut out: std::collections::BTreeMap<String, Environment> = db.envs(repo)?.into_iter().map(|e| (e.name.clone(), e)).collect();
-        for name in cfg.keys() {
-            out.entry(name.clone()).or_insert_with(|| Environment { name: name.clone(), position: -1, moved_at: 0, wanted: None, deploy: None, progress: None });
-        }
-        for (name, e) in out.iter_mut() {
-            // A promotion the environment went past since, by other means (a deploy run from
-            // GitHub), is no longer asked for: carried out now, it would take it back. One made
-            // after the environment moved is a rollback, and stays asked for.
-            e.wanted = db.promotion(repo, name)?.filter(|w| !(e.moved_at > w.at && e.position > w.position));
-            let deploy = cfg.get(name).and_then(|c| c.deploy.as_ref());
-            // For the bridge, which carries out the GitHub kind only: AVP runs the other itself.
-            e.deploy = deploy.and_then(Deploy::github).cloned();
-            // Only for the promotion still deploying, and only while the bridge keeps reading it. A
-            // deploy AVP runs needs no reading: its last line stays, a failure's until the next
-            // promotion, and a server that restarted reads it back from the database.
-            let ours = matches!(deploy, Some(Deploy::Run(_)));
-            let fresh = now_ms() - 5 * 60_000;
-            let live = self.progress.lock().unwrap_or_else(|p| p.into_inner()).get(&(repo.to_string(), name.clone())).cloned();
-            let kept = match (&live, ours) {
-                (None, true) => db.last_deploy(repo, name)?.filter(|d| !d.step.is_empty()).map(|d| DeployProgress { position: d.promotion.position, step: d.step, since: d.step_at, url: None, at: d.step_at }),
-                _ => None,
-            };
-            e.progress = live.or(kept).filter(|p| (ours || p.at >= fresh) && e.wanted.as_ref().is_some_and(|w| w.position == p.position && w.position != e.position));
-        }
-        Ok(out.into_values().collect())
-    }
-
-    /// The bridge's latest reading of a deploy's step.
-    pub fn deploy_progress(&self, repo: &str, name: &str, mut p: DeployProgress) -> Result<DeployProgress> {
-        p.at = now_ms();
-        self.progress.lock().unwrap_or_else(|e| e.into_inner()).insert((repo.to_string(), name.to_string()), p.clone());
-        Ok(p)
-    }
-
-    /// Promotes a position to an environment, by the rules avp.toml sets for it: a green full suite
-    /// (unless forced), what `after` serves, one of `approvers`. With a GitHub deploy, the promotion
-    /// is recorded and AVP's bridge carries it out (the environment moves when it is observed serving
-    /// it); with a `run` deploy, AVP runs it and answers once it is over, as a land answers once its
-    /// proof is; without one, the environment moves at once. No position: what `after` serves, or
-    /// the head.
-    pub fn promote(&self, repo: &str, name: &str, position: Option<i64>, force: bool, person: &str, agent: &str) -> Result<Environment> {
-        self.promote_as(repo, name, position, force, person, agent, true, None)
-    }
-
-    /// Takes an environment back to the position it served before the one it serves now, through
-    /// the same deploy as a promotion, recorded as a rollback: its `env.promoted` and `env.moved`
-    /// say `rollback` and the position it came `from`. What an emergency needs at once: the full
-    /// suite and `after` are not asked again (that position passed them to be served), `approvers`
-    /// are. A second rollback takes it back where the first one found it.
-    pub fn rollback(&self, repo: &str, name: &str, person: &str, agent: &str) -> Result<Environment> {
-        let (serves, before) = {
-            let db = self.db();
-            let serves = db.env(repo, name)?.map(|e| e.position).filter(|p| *p >= 0).ok_or_else(|| anyhow!("{name} serves nothing yet: there is nothing to roll back"))?;
-            let before = Self::served(&db, repo, name)?.into_iter().rev().find(|p| *p != serves);
-            (serves, before.ok_or_else(|| anyhow!("{name} has served only position {serves}: there is nothing to roll back to"))?)
-        };
-        self.promote_as(repo, name, Some(before), true, person, agent, true, Some(serves))
-    }
-
-    /// The positions an environment moved to, oldest first, as its `env.moved` events say.
-    fn served(db: &Db, repo: &str, name: &str) -> Result<Vec<i64>> {
-        Ok(db.events_since(repo, 0, i64::MAX)?.into_iter().filter(|e| e.kind == "env.moved" && e.data["env"] == name).filter_map(|e| e.data["position"].as_i64()).collect())
-    }
-
-    /// The position the newest promotion of `name` rolls back from, when it is a rollback to
-    /// `position`: what its deploy says once it is over, however long after (a restart between).
-    fn rollback_from(db: &Db, repo: &str, name: &str, position: i64) -> Result<Option<i64>> {
-        let promoted = db.events_since(repo, 0, i64::MAX)?.into_iter().rev().find(|e| e.kind == "env.promoted" && e.data["env"] == name);
-        Ok(promoted.filter(|e| e.data["position"] == position && e.data["rollback"] == true).and_then(|e| e.data["from"].as_i64()))
-    }
-
-    /// `wait` false: a `run` deploy goes on in the background and the promotion answers at once.
-    /// `rollback`: the position a rollback takes the environment back from.
-    #[allow(clippy::too_many_arguments)]
-    fn promote_as(&self, repo: &str, name: &str, position: Option<i64>, force: bool, person: &str, agent: &str, wait: bool, rollback: Option<i64>) -> Result<Environment> {
-        let cfg = self.env_config(repo)?.remove(name).unwrap_or_default();
-        let db = self.db();
-        let serves = |env: &str| -> Result<Option<i64>> { Ok(db.env(repo, env)?.map(|e| e.position).filter(|p| *p >= 0)) };
-        let position = match (position, &cfg.after) {
-            (Some(p), _) => p,
-            (None, Some(after)) => serves(after)?.ok_or_else(|| anyhow!("{after} serves nothing yet: nothing to promote to {name}"))?,
-            (None, None) => db.head(repo)?.ok_or_else(|| anyhow!("no line"))?.position,
-        };
-        let entry = db.line_at(repo, position)?;
-        if !force {
-            // Flaky is green on its retry: it promotes as green does.
-            anyhow::ensure!(matches!(entry.full, Some(Verdict::Green | Verdict::Flaky)), "position {position} has no green full suite yet (full = {:?}): --force to promote it anyway", entry.full);
-            if let Some(after) = &cfg.after {
-                let s = serves(after)?;
-                anyhow::ensure!(s == Some(position), "{name} takes what {after} serves ({}), not position {position}", s.map(|p| format!("position {p}")).unwrap_or_else(|| "nothing yet".into()));
-            }
-        }
-        anyhow::ensure!(cfg.approvers.is_empty() || cfg.approvers.iter().any(|a| a == person), "{name} is promoted by {} only, not {person}", cfg.approvers.join(" or "));
-        let Some(deploy) = cfg.deploy else {
-            let env = db.set_env(repo, name, position)?;
-            db.emit(repo, "env.moved", entry.task.as_deref(), None, rolled_back(serde_json::json!({ "env": name, "position": position, "by": person }), rollback))?;
-            return Ok(env);
-        };
-        let p = Promotion { position, git: entry.git.clone(), by: person.to_string(), agent: agent.to_string(), at: now_ms() };
-        db.set_promotion(repo, name, &p)?;
-        db.emit(repo, "env.promoted", entry.task.as_deref(), None, rolled_back(serde_json::json!({ "env": name, "position": position, "by": person, "agent": agent, "git": entry.git }), rollback))?;
-        let mut env = db.env(repo, name)?.unwrap_or(Environment { name: name.to_string(), position: -1, moved_at: 0, wanted: None, deploy: None, progress: None });
-        env.wanted = Some(p.clone());
-        let run = match deploy {
-            Deploy::GitHub(d) => {
-                env.deploy = Some(d);
-                return Ok(env);
-            }
-            // Recorded with the promotion: a server that restarts before its turn still runs it.
-            Deploy::Run(command) => db.insert_deploy(repo, name, &p, &command)?,
-        };
-        drop(db);
-        if wait {
-            return self.run_deploy(&run);
-        }
-        self.run_deploy_behind(run);
-        Ok(env)
-    }
-
-    fn run_deploy_behind(&self, d: DeployRun) {
-        let e = self.clone();
-        std::thread::spawn(move || {
-            if let Err(err) = e.run_deploy(&d) {
-                eprintln!("{err:#}");
-            }
-        });
-    }
-
-    /// The deploys a server left unfinished when it stopped, settled by the next one as it starts:
-    /// a deploy that waited for its turn runs now; one that was running is cut (`env.interrupted`)
-    /// and runs again once, from the start, while its promotion is still the one asked for: the
-    /// environment is still asked to serve that position. Cut a second time, it is left failed,
-    /// with the reason (`env.failed`). Every unfinished deploy is this server's to settle: a data
-    /// folder is served by one server at a time.
-    pub fn resume_deploys(&self) -> Result<()> {
-        let left = self.db().unfinished_deploys()?;
-        for d in left {
-            let db = self.db();
-            let p = &d.promotion;
-            let wanted = db.promotion(&d.repo, &d.env)?.filter(|w| (w.position, w.at) == (p.position, p.at));
-            let task = db.line_at(&d.repo, p.position).ok().and_then(|l| l.task);
-            let again = wanted.is_some() && d.attempt < 2;
-            if d.started_at.is_some() {
-                db.emit(&d.repo, "env.interrupted", task.as_deref(), None, serde_json::json!({ "env": d.env, "position": p.position, "by": p.by, "attempt": d.attempt, "again": again, "step": d.step }))?;
-            }
-            if wanted.is_none() {
-                db.deploy_finished(&d.id, None, Some("a newer promotion goes instead"), "")?;
-                continue;
-            }
-            if d.started_at.is_some() && !again {
-                let reason = format!("a restart of the server cut it {} times", d.attempt);
-                db.deploy_finished(&d.id, None, Some(&reason), &format!("failed: {reason}"))?;
-                self.emit_told(&db, &d.repo, "env.failed", task.as_deref(), serde_json::json!({ "env": d.env, "position": p.position, "by": p.by, "reason": reason }))?;
-                continue;
-            }
-            let mut d = d;
-            if d.started_at.is_some() {
-                d.step = "cut by a restart of the server: runs again from the start".into();
-                db.deploy_again(&d.id, &d.step)?;
-                d.attempt += 1;
-                d.started_at = None;
-            }
-            drop(db);
-            self.run_deploy_behind(d);
-        }
-        Ok(())
-    }
-
-    /// Deploys AVP runs that are not over, running or waiting for their turn (`GET /work`).
-    pub fn deploys_in_flight(&self) -> Result<usize> {
-        Ok(self.db().unfinished_deploys()?.len())
-    }
-
-    /// What the server has in hand (`GET /work`): what an autoscaler follows, and what a restart now
-    /// would cut, which the server's updater waits for (server-update.sh drains, then waits for 0).
-    pub fn work(&self) -> Result<Work> {
-        let deploys = self.db().unfinished_deploys()?;
-        let (waiting, running) = crate::check::local();
-        let left = crate::check::draining();
-        let mut work = Work {
-            workers: None,
-            waiting,
-            running,
-            demand: None,
-            deploys: deploys.len(),
-            deploying: deploys.iter().filter(|d| d.started_at.is_some()).count(),
-            draining: left.is_some(),
-            drain_left_s: left.map(|l| l.as_secs()),
-        };
-        match crate::workers::dispatcher() {
-            Some(d) => {
-                let q = d.depth();
-                work.waiting += q.waiting;
-                work.running += q.running;
-                work.demand = Some(q.demand);
-            }
-            None => work.workers = Some("off".into()),
-        }
-        Ok(work)
-    }
-
-    /// Carries out a promotion whose deploy is `run`: the position laid out in the environment's
-    /// own folder (what `keep` names stays from one deploy to the next, as from one proof to the
-    /// next), the command run there as a proof's steps are, with what AVP_DEPLOY_ENV lists beside
-    /// (its values masked in the output), each line it prints the deploy's progress. Green, the
-    /// environment moves; red, it stays where it was, and the event, the progress and the answer
-    /// say why. Its output is kept as a proof (`avp proof <id>`). One deploy at a time per
-    /// environment: a promotion made while this one waited goes instead. Whatever ends it, the
-    /// database has its end.
-    fn run_deploy(&self, d: &DeployRun) -> Result<Environment> {
-        let key = (d.repo.clone(), d.env.clone());
-        let lock = self.deploy_locks.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
-        let _one = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let out = self.deploy_in_turn(d);
-        if let Err(e) = &out {
-            let _ = self.db().deploy_finished(&d.id, None, Some(&format!("{e:#}")), "");
-        }
-        out
-    }
-
-    fn deploy_in_turn(&self, d: &DeployRun) -> Result<Environment> {
-        let (repo, name, command, p) = (d.repo.as_str(), d.env.as_str(), d.command.as_str(), &d.promotion);
-        // A server that drains starts no deploy: this one waits, recorded, and the server that
-        // takes its place runs it if the drain ends in a restart.
-        crate::check::wait_drain(&format!("deploy {repo}/{name}"));
-        if let Some(w) = self.db().promotion(repo, name)?.filter(|w| (w.position, w.at) != (p.position, p.at)) {
-            anyhow::bail!("{name} was promoted to position {} by {} while the deploy of position {} waited: that one goes instead", w.position, w.by, p.position);
-        }
-        // Read now: the mirror may have written the position's commit since it was promoted.
-        let entry = self.db().line_at(repo, p.position)?;
-        self.db().deploy_started(&d.id, &format!("lays out position {}", p.position))?;
-        // Every line in memory, at most one a second in the database: a deploy may print thousands.
-        let written = std::cell::Cell::new(now_ms());
-        let say = |step: String| {
-            if now_ms() - written.get() >= 1000 {
-                written.set(now_ms());
-                let _ = self.db().deploy_step(&d.id, &step);
-            }
-            let _ = self.deploy_progress(repo, name, DeployProgress { position: p.position, step, since: now_ms(), url: None, at: 0 });
-        };
-        let colors = regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").unwrap();
-        let ran = || -> Result<Step> {
-            anyhow::ensure!(safe_path(name) && !name.contains('/'), "{name:?} cannot name the deploy's folder");
-            let mut run = command.replace("{position}", &p.position.to_string());
-            if run.contains("{git}") {
-                let git = entry.git.as_deref().ok_or_else(|| anyhow!("the deploy takes {{git}}, and position {} has no git commit yet", p.position))?;
-                run = run.replace("{git}", git);
-            }
-            say(format!("lays out position {}", p.position));
-            let tree = self.objects.get_tree(&entry.tree)?;
-            let keep = read_config(&tree, &self.objects).map(|c| c.check.keep).unwrap_or_default();
-            let dir = self.data.join("deploy").join(repo).join(name);
-            crate::check::materialize(&self.objects, &tree, &dir, &keep)?;
-            say(format!("runs {run}"));
-            let mut watch = |line: &str| {
-                let line = colors.replace_all(line, "");
-                if !line.trim().is_empty() {
-                    say(line.trim().chars().take(200).collect());
-                }
-            };
-            Ok(crate::check::run_deploy(&dir, &run, &mut watch))
-        };
-        let mut step = ran().unwrap_or_else(|e| Step { name: String::new(), command: command.to_string(), exit: -1, seconds: 0.0, output: format!("{e:#}") });
-        step.name = format!("deploy {name}");
-        let exit = step.exit;
-        let plain = colors.replace_all(&step.output, "");
-        let tail = plain.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-        let last = tail.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(200).collect::<String>();
-        let proof = Proof { id: new_id("proof"), task: None, base_position: p.position, candidate_tree: entry.tree.clone(), files: vec![], steps: vec![step], verdict: if exit == 0 { Verdict::Green } else { Verdict::Red }, blamed: vec![], created_at: now_ms() };
-        let db = self.db();
-        db.insert_proof(repo, &proof)?;
-        let rollback = Self::rollback_from(&db, repo, name, p.position)?;
-        if exit != 0 {
-            let failed = format!("failed (exit {exit}): {last}");
-            db.deploy_finished(&d.id, Some(exit), None, &failed)?;
-            self.emit_told(&db, repo, "env.failed", entry.task.as_deref(), rolled_back(serde_json::json!({ "env": name, "position": p.position, "by": p.by, "exit": exit, "proof": proof.id, "output": tail }), rollback))?;
-            let serves = db.env(repo, name)?.map(|e| e.position).filter(|s| *s >= 0);
-            drop(db);
-            say(failed);
-            let stays = serves.map(|s| format!("still serves position {s}")).unwrap_or_else(|| "serves nothing yet".into());
-            anyhow::bail!("the deploy of position {} to {name} failed (exit {exit}), {name} {stays}. `avp proof {}` has its output, which ends with:\n{tail}", p.position, proof.id);
-        }
-        db.deploy_finished(&d.id, Some(0), None, &format!("serves position {}", p.position))?;
-        let env = db.set_env(repo, name, p.position)?;
-        self.emit_told(&db, repo, "env.moved", entry.task.as_deref(), rolled_back(serde_json::json!({ "env": name, "position": p.position, "by": p.by, "proof": proof.id }), rollback))?;
-        self.progress.lock().unwrap_or_else(|e| e.into_inner()).remove(&(repo.to_string(), name.to_string()));
-        Ok(env)
-    }
-
     // ---- notifications ----
 
     /// Emits an event, and tells the webhooks of `[notify]` when a person must hear of it.
-    fn emit_told(&self, db: &Db, repo: &str, kind: &str, task: Option<&str>, data: serde_json::Value) -> Result<()> {
+    pub(crate) fn emit_told(&self, db: &Db, repo: &str, kind: &str, task: Option<&str>, data: serde_json::Value) -> Result<()> {
         db.emit(repo, kind, task, None, data.clone())?;
         self.notify(repo, kind, task, data);
         Ok(())
@@ -2375,67 +1477,6 @@ impl Engine {
         Ok(())
     }
 
-    // ---- scheduled suites ----
-
-    /// Starts the scheduled suites (`[[check.schedule]]`) as their time comes: a look every 20
-    /// seconds, for as long as the server runs.
-    pub fn run_schedules(&self) {
-        let e = self.clone();
-        std::thread::spawn(move || loop {
-            if let Err(err) = e.scheduled(now_ms()) {
-                eprintln!("scheduled suites: {err:#}");
-            }
-            std::thread::sleep(std::time::Duration::from_secs(20));
-        });
-    }
-
-    /// Starts, on the head of each repo, the suites its avp.toml schedules whose time has come at
-    /// `now` (ms): once a day, within the hour after its `at` (UTC), so that a server down at that
-    /// minute still runs it once it is back. A `line.scheduled` event says it started; its red is told
-    /// like any red. Returns the repos and positions it started on.
-    pub fn scheduled(&self, now: i64) -> Result<Vec<(String, i64)>> {
-        const DAY: i64 = 86_400_000;
-        let mut started = Vec::new();
-        // Read first: the loop takes the database again.
-        let repos = self.db().repos()?;
-        for repo in repos {
-            let Some(head) = self.db().head(&repo.id)? else { continue };
-            // An avp.toml that does not read: every proof of the repo says why.
-            let Ok(cfg) = read_config(&self.objects.get_tree(&head.tree)?, &self.objects) else { continue };
-            for s in cfg.check.schedule {
-                let today = now - now.rem_euclid(DAY) + s.minute * 60_000;
-                let due = if today > now { today - DAY } else { today };
-                if now - due >= 3_600_000 {
-                    continue;
-                }
-                let key = (repo.id.clone(), format!("{} {}", s.at, s.shards.join(",")));
-                let mut ran = SCHEDULED.lock().unwrap_or_else(|e| e.into_inner());
-                // Read back once per server: one that started it today before a restart did run it.
-                let last = match ran.get(&key) {
-                    Some(at) => *at,
-                    None => self.db().events_since(&repo.id, 0, i64::MAX)?.into_iter().rev().find(|e| e.kind == "line.scheduled" && e.data["at"] == s.at.as_str() && e.data["shards"] == serde_json::json!(s.shards)).map_or(i64::MIN, |e| e.at),
-                };
-                ran.insert(key, if last >= due { last } else { now });
-                drop(ran);
-                if last >= due {
-                    continue;
-                }
-                self.db().emit(&repo.id, "line.scheduled", head.task.as_deref(), None, serde_json::json!({ "position": head.position, "at": s.at, "shards": s.shards }))?;
-                self.full_suite_after(&repo.id, head.position, head.tree.clone(), false, Some(s));
-                started.push((repo.id.clone(), head.position));
-            }
-        }
-        Ok(started)
-    }
-}
-
-/// An environment's event, marked as a rollback's when it is one, with the position it came from.
-fn rolled_back(mut data: serde_json::Value, from: Option<i64>) -> serde_json::Value {
-    if let Some(from) = from {
-        data["rollback"] = true.into();
-        data["from"] = from.into();
-    }
-    data
 }
 
 /// What a webhook says of an event: a sentence a person reads in a chat, and what to do next.

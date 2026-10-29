@@ -364,7 +364,7 @@ fn prove(client: &Client, repo: &Repo, head: &LineEntry, tree: &Tree, text: &str
     let mut values = BTreeMap::new();
     if !up::is_team(client) {
         let data = std::env::var("AVP_DATA").map(PathBuf::from).unwrap_or_else(|_| up::home().join("data"));
-        values = check::SecretStore::new(&data).values(&repo.id, &named).unwrap_or_default();
+        values = crate::seam::secret_values(&data, &repo.id, &named).unwrap_or_default();
     }
     for n in &named {
         if let (false, None, Ok(v)) = (values.contains_key(n), check::refused_secret(n), std::env::var(n)) {

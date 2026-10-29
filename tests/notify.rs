@@ -1,5 +1,6 @@
 //! What AVP tells people through the webhooks of `[notify]`. Alone in its file: the test sets the
 //! server's environment, which no other test of the process may read meanwhile.
+#![cfg(feature = "cloud")]
 
 use avp::engine::{Engine, LandOutcome};
 use avp::model::*;

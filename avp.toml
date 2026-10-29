@@ -1,9 +1,11 @@
 # How AVP proves a change to AVP itself: a build and the unit tests on every task, the end-to-end
 # tests (tests/ci.sh) once it lands. The proof profile (Cargo.toml) leaves out the link-time
-# optimization of release builds. Cargo knows what in target/ is stale: it stays.
+# optimization of release builds. Cargo knows what in target/ is stale: it stays. Both builds are
+# proven: the free AVP (`cargo build`), and AVP Cloud's (`--features cloud`), which the end-to-end
+# tests run.
 [check]
 keep = ["target"]
-full = "cargo build --profile proof --locked && AVP=$PWD/target/proof/avp bash tests/ci.sh"
+full = "cargo build --profile proof --locked --features cloud && AVP=$PWD/target/proof/avp bash tests/ci.sh"
 
 [[check.steps]]
 name = "build"
@@ -12,3 +14,7 @@ run = "cargo build --profile proof --locked"
 [[check.steps]]
 name = "tests"
 run = "cargo test --profile proof --locked"
+
+[[check.steps]]
+name = "tests (cloud)"
+run = "cargo test --profile proof --locked --features cloud"

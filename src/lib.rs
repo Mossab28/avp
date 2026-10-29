@@ -1,7 +1,6 @@
 //! AVP (agent versioning protocol): version control for agents. The server holds the truth; a task
 //! replaces the branch, the commit and the pull request; a proof replaces the CI run.
 
-pub mod auth;
 pub mod blame;
 pub mod check;
 pub mod checkout;
@@ -9,7 +8,6 @@ pub mod client;
 pub mod db;
 pub mod engine;
 pub mod gitbridge;
-pub mod github;
 pub mod merge;
 pub mod history;
 pub mod importci;
@@ -18,12 +16,17 @@ pub mod migrate;
 pub mod model;
 pub mod objects;
 pub mod offline;
+pub mod seam;
 pub mod server;
 pub mod stats;
 pub mod up;
 pub mod view;
 pub mod wait;
-pub mod workers;
+pub mod worker;
+
+// AVP Cloud, a team's hosted server: the core reaches it through `seam` alone.
+#[cfg(feature = "cloud")]
+pub mod cloud;
 
 /// What this binary runs on, as `avp update` compares it with the server's: a client takes the
 /// server's binary only when both run on the same platform.

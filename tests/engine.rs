@@ -237,6 +237,7 @@ mod tempdir {
 }
 
 #[test]
+#[cfg(feature = "cloud")]
 fn landing_rule_waits_for_a_person() {
     let (e, _d) = engine();
     let r = repo(&e, LeasePolicy::Advisory);
@@ -291,6 +292,7 @@ fn the_same_change_twice_lands_once_and_a_landed_task_stays_landed() {
 }
 
 #[test]
+#[cfg(feature = "cloud")]
 fn promotions_follow_the_rules_of_avp_toml() {
     let (e, _d) = engine();
     let r = e.create_repo("envs", LeasePolicy::Advisory).unwrap().id;
@@ -452,16 +454,17 @@ fn a_test_naming_a_touched_file_is_related() {
 
 /// With AVP_TOKEN, the server knows who asks from the name given with the token, and nothing else.
 #[test]
+#[cfg(feature = "cloud")]
 fn the_token_names_the_person() {
     use base64::Engine as _;
     let basic = |s: &str| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(s));
     let t = "s3cret-token";
-    assert_eq!(avp::server::token_user(Some(&basic("gabriel:s3cret-token")), t).as_deref(), Some("gabriel"));
-    assert_eq!(avp::server::token_user(Some("Bearer s3cret-token"), t).as_deref(), Some("token"));
-    assert_eq!(avp::server::token_user(Some(&basic("gabriel:wrong")), t), None);
-    assert_eq!(avp::server::token_user(Some(&basic(":s3cret-token")), t), None);
-    assert_eq!(avp::server::token_user(Some("Bearer s3cret-toke"), t), None);
-    assert_eq!(avp::server::token_user(None, t), None);
+    assert_eq!(avp::cloud::auth::token_user(Some(&basic("gabriel:s3cret-token")), t).as_deref(), Some("gabriel"));
+    assert_eq!(avp::cloud::auth::token_user(Some("Bearer s3cret-token"), t).as_deref(), Some("token"));
+    assert_eq!(avp::cloud::auth::token_user(Some(&basic("gabriel:wrong")), t), None);
+    assert_eq!(avp::cloud::auth::token_user(Some(&basic(":s3cret-token")), t), None);
+    assert_eq!(avp::cloud::auth::token_user(Some("Bearer s3cret-toke"), t), None);
+    assert_eq!(avp::cloud::auth::token_user(None, t), None);
 }
 
 /// Six agents land at once, each on its own line of the same file: every one lands (the late ones
@@ -584,10 +587,11 @@ fn a_split_step_runs_side_by_side_and_stops_at_the_first_red() {
 /// secret the line's checks do not give: it does not hand itself one before a person reads it.
 /// Landed, the checks give it.
 #[test]
+#[cfg(feature = "cloud")]
 fn a_change_to_the_checks_gets_no_secret_the_lines_do_not_give() {
     let (e, _d) = engine();
     let r = repo(&e, LeasePolicy::Advisory);
-    avp::check::SecretStore::new(&e.data).set(&r, "STRIPE_KEY", "pay-sandbox-value-5c71e2").unwrap();
+    avp::cloud::secrets::SecretStore::new(&e.data).set(&r, "STRIPE_KEY", "pay-sandbox-value-5c71e2").unwrap();
     let t = open(&e, &r, "the pay step gets the key", &[]);
     put(&e, &t.id, "avp.toml", "[check]\n[[check.steps]]\nname = \"pay\"\nrun = \"test -z \\\"$STRIPE_KEY\\\"\"\nsecrets = [\"STRIPE_KEY\"]\n");
     let p = e.check(&t.id).unwrap();
@@ -603,6 +607,7 @@ fn a_change_to_the_checks_gets_no_secret_the_lines_do_not_give() {
 /// staging serves the one it was promoted to, then goes at once. Promoted again mid-deploy, it
 /// would start a deploy that takes the place of the running one, and never settle.
 #[test]
+#[cfg(feature = "cloud")]
 fn staging_takes_the_newest_green_once_its_deploy_is_served() {
     let (e, _d) = engine();
     let r = e.create_repo("follow", LeasePolicy::Advisory).unwrap().id;

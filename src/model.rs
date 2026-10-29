@@ -468,3 +468,39 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
     re.push('$');
     regex::Regex::new(&re).map(|r| r.is_match(path)).unwrap_or(false)
 }
+
+// ---- accounts, as the CLI reads them (AVP Cloud keeps them) ----
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct User {
+    pub name: String,
+    pub email: Option<String>,
+    /// The GitHub login that signs this person in to AVP Live, lowercase.
+    pub github: Option<String>,
+    /// Admin of the server: people, every repo, the workers.
+    pub admin: bool,
+    pub created_at: i64,
+    pub created_by: String,
+}
+
+/// A token as the server keeps it: never its value, which only its hash stands for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenInfo {
+    pub id: String,
+    pub person: String,
+    pub name: String,
+    /// `token`, for AVP_TOKEN; `session`, AVP Live's.
+    pub kind: String,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub used_at: Option<i64>,
+}
+
+/// A token just made: the one time its value is shown.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewToken {
+    pub token: String,
+    #[serde(flatten)]
+    pub info: TokenInfo,
+}

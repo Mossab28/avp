@@ -11,24 +11,24 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-type S = State<Engine>;
-type R = Result<Response, Response>;
+pub(crate) type S = State<Engine>;
+pub(crate) type R = Result<Response, Response>;
 
 /// Routes take a repo id or its name.
-fn rid(e: &Engine, key: &str) -> anyhow::Result<String> {
+pub(crate) fn rid(e: &Engine, key: &str) -> anyhow::Result<String> {
     Ok(e.db.lock().unwrap().repo(key)?.id)
 }
 
 /// A task of this repo. One of another repo answers as one that does not exist: "no task", never
 /// a hint that the id is real.
-fn own_task(e: &Engine, repo: &str, task: &str) -> anyhow::Result<()> {
+pub(crate) fn own_task(e: &Engine, repo: &str, task: &str) -> anyhow::Result<()> {
     let r = rid(e, repo)?;
     let db = e.db.lock().unwrap();
     anyhow::ensure!(db.task(task)?.repo == r, "no task {task}");
     Ok(())
 }
 
-fn err(e: anyhow::Error) -> Response {
+pub(crate) fn err(e: anyhow::Error) -> Response {
     let (code, body) = err_parts(&e);
     (code, Json(body)).into_response()
 }
@@ -43,7 +43,7 @@ pub(crate) fn err_parts(e: &anyhow::Error) -> (StatusCode, serde_json::Value) {
 /// every 15 s while it is worked out, so that nothing between (a load balancer, a NAT) cuts a
 /// connection it takes for idle, then `{"status": <code>, "body": <answer>}`. Any other client gets
 /// the plain answer with its status. The work goes on to its end if the client leaves.
-async fn kept_alive(headers: &HeaderMap, work: impl FnOnce() -> anyhow::Result<(StatusCode, serde_json::Value)> + Send + 'static) -> Response {
+pub(crate) async fn kept_alive(headers: &HeaderMap, work: impl FnOnce() -> anyhow::Result<(StatusCode, serde_json::Value)> + Send + 'static) -> Response {
     let job = tokio::task::spawn_blocking(work);
     let parts = |out: Result<anyhow::Result<(StatusCode, serde_json::Value)>, tokio::task::JoinError>| match out {
         Ok(Ok(answer)) => answer,
@@ -72,11 +72,11 @@ async fn kept_alive(headers: &HeaderMap, work: impl FnOnce() -> anyhow::Result<(
     Response::builder().header("content-type", "application/json").body(axum::body::Body::from_stream(stream)).unwrap()
 }
 
-fn ok<T: serde::Serialize>(v: T) -> R {
+pub(crate) fn ok<T: serde::Serialize>(v: T) -> R {
     Ok(Json(v).into_response())
 }
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> Result<T, Response> {
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> Result<T, Response> {
     tokio::task::spawn_blocking(f).await.map_err(|e| err(anyhow::anyhow!(e)))?.map_err(err)
 }
 
@@ -91,19 +91,19 @@ fn advisory() -> LeasePolicy {
 }
 
 /// On a server with accounts, the person who creates a repo is its admin.
-async fn create_repo(State(e): S, who: Option<axum::Extension<crate::auth::Who>>, Json(req): Json<CreateRepo>) -> R {
+async fn create_repo(State(e): S, asker: axum::http::Extensions, Json(req): Json<CreateRepo>) -> R {
     ok(blocking(move || {
         let repo = e.create_repo(&req.name, req.policy)?;
-        crate::auth::created(&e, &repo, who.as_deref())?;
+        crate::seam::created(&e, &repo, &asker)?;
         Ok(repo)
     })
     .await?)
 }
 /// The repos the asker may read: on a server with accounts, those they have a role on.
-async fn repos(State(e): S, who: Option<axum::Extension<crate::auth::Who>>) -> R {
+async fn repos(State(e): S, asker: axum::http::Extensions) -> R {
     ok(blocking(move || {
         let db = e.db.lock().unwrap();
-        crate::auth::readable(&db, db.repos()?, who.as_deref())
+        crate::seam::readable(&db, db.repos()?, &asker)
     })
     .await?)
 }
@@ -180,205 +180,7 @@ struct MirrorEvent {
 async fn mirror_event(State(e): S, P(repo): P<String>, Json(req): Json<MirrorEvent>) -> R {
     ok(blocking(move || { let r = rid(&e, &repo)?; e.mirror_event(&r, req.blocked, &req.branch, req.commit.as_deref(), req.position)?; Ok(serde_json::json!({ "ok": true })) }).await?)
 }
-#[derive(Deserialize)]
-struct Claim {
-    #[serde(default)]
-    wait_s: Option<u64>,
-    /// The worker runs parts of a proof (AVP 0.4.7 and later).
-    #[serde(default)]
-    parts: bool,
-}
-/// A worker asks for a proof to run; answers 204 after `wait_s` (at most 55 s) if there is none,
-/// or while the server drains.
-async fn work_claim(State(e): S, Json(req): Json<Claim>) -> R {
-    let Some(d) = crate::workers::dispatcher() else { return Err(err(anyhow::anyhow!("workers are off on this server (AVP_WORKERS=1 turns them on)"))) };
-    let wait = std::time::Duration::from_secs(req.wait_s.unwrap_or(25).min(55));
-    match blocking(move || Ok(claim_undrained(d, wait, req.parts).map(|job| with_secrets(&e, job)))).await? {
-        Some(claimed) => ok(claimed),
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
-    }
-}
 
-/// The job with the values of the secrets its steps name, read from the store as it is handed
-/// over. A store that cannot be read sends none: the steps that name one say it did not reach them.
-fn with_secrets(e: &Engine, job: crate::workers::Job) -> crate::workers::Claimed {
-    let named = crate::check::read_config(&job.tree, &e.objects).map(|c| crate::check::secrets_named(&c.check, job.steps_override.as_deref(), job.part.as_ref())).unwrap_or_default();
-    let secrets = if named.is_empty() {
-        Default::default()
-    } else {
-        crate::check::SecretStore::new(&e.data).values(&job.repo, &named).unwrap_or_else(|err| {
-            eprintln!("{}: secrets not read: {err:#}", job.id);
-            Default::default()
-        })
-    };
-    crate::workers::Claimed { job, secrets }
-}
-
-/// The oldest job this worker can run, within `wait`, none while the server drains. It waits by
-/// slices of a second, each one after a look at the drain: a drain that begins while a claim waits
-/// lets that claim's job go within a second at most, a job that then runs and counts as running,
-/// which the updater waits for.
-fn claim_undrained(d: &crate::workers::Dispatcher, wait: std::time::Duration, parts: bool) -> Option<crate::workers::Job> {
-    let deadline = std::time::Instant::now() + wait;
-    let left = || deadline.saturating_duration_since(std::time::Instant::now());
-    while !left().is_zero() && crate::check::lifted_within(left()) {
-        if let Some(job) = d.claim(left().min(std::time::Duration::from_secs(1)), parts) {
-            crate::check::claimed(&job.id);
-            return Some(job);
-        }
-    }
-    None
-}
-#[derive(Deserialize)]
-struct WorkResult {
-    steps: Vec<Step>,
-    /// Each step's whole log and artifacts, by `check::kept_key`: kept before the steps are handed
-    /// on, so that the proof they make has them. A worker from before sends none.
-    #[serde(default)]
-    kept: HashMap<String, crate::check::KeptStep>,
-}
-async fn work_result(State(e): S, P(id): P<String>, Json(req): Json<WorkResult>) -> R {
-    let Some(d) = crate::workers::dispatcher() else { return Err(err(anyhow::anyhow!("workers are off"))) };
-    let kept = crate::check::Kept::new(&e.data);
-    let accepted = blocking(move || {
-        for (key, step) in &req.kept {
-            if let Err(err) = kept.put(key, step, None) {
-                eprintln!("{id}: a step's log not kept: {err:#}");
-            }
-        }
-        Ok(d.complete(&id, req.steps))
-    })
-    .await?;
-    ok(serde_json::json!({ "accepted": accepted }))
-}
-#[derive(Deserialize)]
-struct Guard {
-    #[serde(default)]
-    add: Vec<String>,
-    #[serde(default)]
-    remove: Vec<String>,
-}
-async fn guard(State(e): S, P(repo): P<String>, Json(req): Json<Guard>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.guard(&r, &req.add, &req.remove) }).await?)
-}
-async fn guarded(State(e): S, P(repo): P<String>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.db.lock().unwrap().guarded(&r) }).await?)
-}
-#[derive(Deserialize)]
-struct Observed {
-    sha: String,
-}
-async fn observe_env(State(e): S, P((repo, name)): P<(String, String)>, Json(req): Json<Observed>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.observe_env(&r, &name, &req.sha) }).await?)
-}
-async fn env_progress(State(e): S, P((repo, name)): P<(String, String)>, Json(req): Json<DeployProgress>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.deploy_progress(&r, &name, req) }).await?)
-}
-async fn work_alive(P(id): P<String>) -> R {
-    let Some(d) = crate::workers::dispatcher() else { return Err(err(anyhow::anyhow!("workers are off"))) };
-    let (alive, cancel) = d.alive(&id);
-    ok(serde_json::json!({ "alive": alive, "cancel": cancel }))
-}
-/// The proofs waiting and running, here and on workers, the deploys AVP runs, and whether the
-/// server drains (see Engine::work).
-async fn work_depth(State(e): S) -> R {
-    ok(blocking(move || e.work()).await?)
-}
-
-#[derive(Deserialize)]
-struct DrainQuery {
-    /// How long the drain lasts at most, in minutes: 10 by default, 60 at most.
-    minutes: Option<f64>,
-    /// The task whose proof the asker waits for.
-    task: Option<String>,
-}
-
-fn drain_answer(task: Option<&str>) -> R {
-    let left = crate::check::draining();
-    ok(serde_json::json!({ "draining": left.is_some(), "left_s": left.map(|l| l.as_secs()), "held": task.is_some_and(crate::check::held) }))
-}
-
-/// Whether the server drains, and with `?task=` whether that task's proof waits for it: what a land
-/// that waits tells its agent.
-async fn drain_state(Query(q): Query<DrainQuery>) -> R {
-    drain_answer(q.task.as_deref())
-}
-
-/// The server starts no new work until `DELETE /drain`, the bound, or its restart: what runs ends,
-/// what comes waits (see check::drain). Its own machine asks for it, before it takes a new version.
-async fn drain(Query(q): Query<DrainQuery>, req: axum::extract::Request) -> R {
-    from_host(&req)?;
-    let minutes = q.minutes.unwrap_or(10.0);
-    if !(minutes > 0.0 && minutes <= 60.0) {
-        return Err(err(anyhow::anyhow!("minutes: more than 0, 60 at most")));
-    }
-    crate::check::drain(std::time::Duration::from_secs_f64(minutes * 60.0));
-    eprintln!("draining for {minutes} min: no new work starts");
-    drain_answer(None)
-}
-
-async fn undrain(req: axum::extract::Request) -> R {
-    from_host(&req)?;
-    crate::check::undrain();
-    eprintln!("drain lifted: the work it held starts");
-    drain_answer(None)
-}
-
-/// What only the server's own machine may ask (the drain stops everyone's proofs): a request from a
-/// loopback address that no proxy forwarded (the one in front of a shared server runs on the same
-/// machine, and says whom it forwards), one with the server's token, or one of a server admin's.
-fn from_host(req: &axum::extract::Request) -> Result<(), Response> {
-    if req.extensions().get::<crate::auth::Who>().is_some_and(|w| matches!(w, crate::auth::Who::Person(u) if u.admin)) {
-        return Ok(());
-    }
-    let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok());
-    if std::env::var("AVP_TOKEN").ok().filter(|t| !t.is_empty()).is_some_and(|t| token_user(auth, &t).is_some()) {
-        return Ok(());
-    }
-    let loopback = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().is_some_and(|c| c.0.ip().to_canonical().is_loopback());
-    let forwarded = ["forwarded", "x-forwarded-for", "x-real-ip", "x-avp-user"].iter().any(|h| req.headers().contains_key(*h));
-    if loopback && !forwarded {
-        return Ok(());
-    }
-    Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "only the server's own machine (127.0.0.1, no proxy) or its token may drain it" }))).into_response())
-}
-#[derive(Deserialize)]
-struct SetSecret {
-    value: String,
-    #[serde(default)]
-    person: Option<String>,
-}
-
-/// `avp secret set`: the value comes in the body, never in the address, and never goes back out.
-async fn set_secret(State(e): S, P((repo, name)): P<(String, String)>, headers: HeaderMap, Json(req): Json<SetSecret>) -> R {
-    let person = verified_person(&headers).or(req.person).unwrap_or_else(|| "someone".into());
-    ok(blocking(move || {
-        let r = rid(&e, &repo)?;
-        let set = crate::check::SecretStore::new(&e.data).set(&r, &name, &req.value)?;
-        e.db.lock().unwrap().emit(&r, "secret.set", None, None, serde_json::json!({ "name": set.name, "by": person }))?;
-        Ok(set)
-    })
-    .await?)
-}
-/// The repo's secrets: names and dates, no value.
-async fn secrets(State(e): S, P(repo): P<String>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; crate::check::SecretStore::new(&e.data).list(&r) }).await?)
-}
-#[derive(Deserialize, Default)]
-struct Who {
-    #[serde(default)]
-    person: Option<String>,
-}
-async fn remove_secret(State(e): S, P((repo, name)): P<(String, String)>, headers: HeaderMap, body: Option<Json<Who>>) -> R {
-    let person = verified_person(&headers).or(body.and_then(|b| b.0.person)).unwrap_or_else(|| "someone".into());
-    ok(blocking(move || {
-        let r = rid(&e, &repo)?;
-        anyhow::ensure!(crate::check::SecretStore::new(&e.data).remove(&r, &name)?, "no secret {name} in this repo: `avp secret list` shows those set");
-        e.db.lock().unwrap().emit(&r, "secret.removed", None, None, serde_json::json!({ "name": name, "by": person }))?;
-        Ok(serde_json::json!({ "removed": name }))
-    })
-    .await?)
-}
 #[derive(Deserialize)]
 struct TagsQuery {
     /// Those deleted whose git tag the mirror has yet to delete, too.
@@ -576,26 +378,11 @@ async fn agents(State(e): S, P(repo): P<String>) -> R {
     .await?)
 }
 
-/// With `AVP_TOKEN` set, the server checks every request itself: Basic auth whose password is the
-/// token (`https://name:TOKEN@host`, the name is who is asking), or `Bearer TOKEN`. Returns the
-/// person, or None when the request does not carry the token.
-pub fn token_user(authorization: Option<&str>, token: &str) -> Option<String> {
-    use base64::Engine as _;
-    let same = |a: &[u8], b: &[u8]| a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
-    let h = authorization?.trim();
-    if let Some(t) = h.strip_prefix("Bearer ") {
-        return same(t.trim().as_bytes(), token.as_bytes()).then(|| "token".to_string());
-    }
-    let raw = base64::engine::general_purpose::STANDARD.decode(h.strip_prefix("Basic ")?.trim()).ok()?;
-    let (user, pass) = std::str::from_utf8(&raw).ok()?.split_once(':')?;
-    (same(pass.as_bytes(), token.as_bytes()) && !user.is_empty()).then(|| user.to_string())
-}
-
 /// The person the request is known to come from (`X-Avp-User`): the one whose token it carries on a
-/// server with accounts (auth::gate sets it), or the one the proxy in front authenticated (Caddy's
+/// server with accounts (AVP Cloud's gate sets it), or the one the proxy in front authenticated (Caddy's
 /// basic auth), never taken from the client. It wins over the person a client declares, so a task,
 /// an approval and a promotion carry who really sent them.
-fn verified_person(h: &HeaderMap) -> Option<String> {
+pub(crate) fn verified_person(h: &HeaderMap) -> Option<String> {
     h.get("x-avp-user").and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
 
@@ -860,26 +647,6 @@ async fn context(State(e): S, P(repo): P<String>, Json(q): Json<ContextQuery>) -
     ok(blocking(move || { let r = rid(&e, &repo)?; crate::blame::context(&e, &r, &q.paths, q.task.as_deref()) }).await?)
 }
 
-#[derive(Deserialize)]
-struct Word {
-    person: String,
-    approved: bool,
-    #[serde(default)]
-    reason: String,
-}
-async fn approve(State(e): S, P((repo, task)): P<(String, String)>, headers: HeaderMap, Json(mut req): Json<Word>) -> R {
-    if let Some(person) = verified_person(&headers) {
-        req.person = person;
-    }
-    ok(blocking(move || { own_task(&e, &repo, &task)?; e.approve(&task, &req.person, req.approved, &req.reason) }).await?)
-}
-#[derive(Deserialize)]
-struct Landing {
-    landing: LandingRule,
-}
-async fn set_landing(State(e): S, P(repo): P<String>, Json(req): Json<Landing>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.set_landing(&r, req.landing)?; e.db.lock().unwrap().repo(&r) }).await?)
-}
 /// A proof, each step with how many lines its whole log keeps (`log`) and what its artifacts hold
 /// (`artifacts`), when they are kept.
 async fn proof(State(e): S, P((repo, id)): P<(String, String)>) -> R {
@@ -958,98 +725,6 @@ async fn proof_artifacts(State(e): S, P((repo, id)): P<(String, String)>, Query(
     .await?;
     Ok(([(axum::http::header::CONTENT_TYPE, "application/gzip".to_string()), (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))], bytes).into_response())
 }
-async fn envs(State(e): S, P(repo): P<String>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.envs_view(&r) }).await?)
-}
-#[derive(Deserialize)]
-struct StatsQuery {
-    /// RFC3339, a date, or how long ago (`7d`, `48h`): see stats::parse_when.
-    since: Option<String>,
-    until: Option<String>,
-}
-/// The line's numbers over a window (default: the 7 days before now): what `avp stats`, `avp_stats`
-/// and AVP Live read.
-async fn stats(State(e): S, P(repo): P<String>, Query(q): Query<StatsQuery>) -> R {
-    ok(blocking(move || {
-        let r = rid(&e, &repo)?;
-        let (since, until) = crate::stats::window(q.since.as_deref(), q.until.as_deref(), now_ms())?;
-        crate::stats::stats(&e, &r, since, until)
-    })
-    .await?)
-}
-/// The before AVP a person saved (`avp stats --github --before --save`): GitHub's numbers only, read
-/// where the token is; the server never sees the token. Each save replaces the one before it.
-async fn before(State(e): S, P(repo): P<String>) -> R {
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.db.lock().unwrap().before(&r) }).await?)
-}
-async fn save_before(State(e): S, P(repo): P<String>, Json(b): Json<crate::stats::Before>) -> R {
-    ok(blocking(move || {
-        let r = rid(&e, &repo)?;
-        let (since, until) = (crate::stats::parse_time(&b.since)?, crate::stats::parse_time(&b.until)?);
-        anyhow::ensure!(since < until, "the before's window ends before it starts");
-        e.db.lock().unwrap().set_before(&r, &b)?;
-        Ok(b)
-    })
-    .await?)
-}
-#[derive(Deserialize, Default)]
-struct RerunFull {
-    #[serde(default)]
-    position: Option<i64>,
-}
-async fn rerun_full(State(e): S, P(repo): P<String>, body: Option<Json<RerunFull>>) -> R {
-    let req = body.map(|b| b.0).unwrap_or_default();
-    ok(blocking(move || { let r = rid(&e, &repo)?; e.rerun_full(&r, req.position).map(|p| serde_json::json!({ "position": p, "started": true })) }).await?)
-}
-#[derive(Deserialize)]
-struct Promote {
-    /// None: what the environment's `after` serves, or the head.
-    #[serde(default)]
-    position: Option<i64>,
-    #[serde(default)]
-    force: bool,
-    /// The field's name before `force`: false forced.
-    #[serde(default = "yes")]
-    require_full: bool,
-    #[serde(default)]
-    person: Option<String>,
-    #[serde(default)]
-    agent: Option<String>,
-}
-fn yes() -> bool {
-    true
-}
-/// Answers once a deploy AVP runs is over, which may take longer than a proxy waits on a silent
-/// connection: kept alive as a land is.
-async fn promote(State(e): S, P((repo, name)): P<(String, String)>, headers: HeaderMap, Json(req): Json<Promote>) -> Response {
-    let person = verified_person(&headers).or(req.person).unwrap_or_else(|| "someone".into());
-    let agent = req.agent.unwrap_or_else(|| "human".into());
-    let force = req.force || !req.require_full;
-    kept_alive(&headers, move || {
-        let r = rid(&e, &repo)?;
-        Ok((StatusCode::OK, serde_json::to_value(e.promote(&r, &name, req.position, force, &person, &agent)?)?))
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-struct Rollback {
-    #[serde(default)]
-    person: Option<String>,
-    #[serde(default)]
-    agent: Option<String>,
-}
-/// Back to the position the environment served before the one it serves now, kept alive as a
-/// promotion is. A route of its own: a server from before it answers 404, not a promotion.
-async fn rollback(State(e): S, P((repo, name)): P<(String, String)>, headers: HeaderMap, Json(req): Json<Rollback>) -> Response {
-    let person = verified_person(&headers).or(req.person).unwrap_or_else(|| "someone".into());
-    let agent = req.agent.unwrap_or_else(|| "human".into());
-    kept_alive(&headers, move || {
-        let r = rid(&e, &repo)?;
-        Ok((StatusCode::OK, serde_json::to_value(e.rollback(&r, &name, &person, &agent)?)?))
-    })
-    .await
-}
 
 /// The binary this server runs and its hash, read once.
 fn own_binary() -> anyhow::Result<&'static (Vec<u8>, String)> {
@@ -1078,8 +753,6 @@ async fn client_binary() -> R {
 pub fn router(engine: Engine) -> Router {
     let router: Router<Engine> = Router::new()
         .route("/", get(|| async { "avp" }))
-        // AVP Live: the line as it moves, read from this API by the browser (behind the same auth).
-        .route("/live", get(|| async { ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], include_str!("../ui/live.html")) }))
         .route("/client", get(client_info))
         .route("/client/avp", get(client_binary))
         .route("/repos", post(create_repo).get(repos))
@@ -1087,14 +760,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/repos/{repo}/objects/{hash}", put(put_object).get(get_object).head(has_object))
         .route("/repos/{repo}/objects", post(get_objects))
         .route("/repos/{repo}/import", post(import))
-        .route("/work/claim", post(work_claim))
-        .route("/work/{id}/result", post(work_result))
-        .route("/work/{id}/alive", post(work_alive))
-        .route("/work", get(work_depth))
-        .route("/drain", get(drain_state).post(drain).delete(undrain))
         .route("/repos/{repo}/line/{position}/git", post(set_git))
         .route("/repos/{repo}/mirror", post(mirror_event))
-        .route("/repos/{repo}/full", post(rerun_full))
         .route("/repos/{repo}/line/{position}/last-git", get(last_git))
         .route("/repos/{repo}/tags", get(tags).post(tag))
         .route("/repos/{repo}/tags/remove", post(untag))
@@ -1130,52 +797,26 @@ pub fn router(engine: Engine) -> Router {
         .route("/repos/{repo}/history/log", get(file_log))
         .route("/repos/{repo}/history/blame", get(blame))
         .route("/repos/{repo}/history/context", post(context))
-        .route("/repos/{repo}/tasks/{task}/approve", post(approve))
-        .route("/repos/{repo}/landing", post(set_landing))
-        .route("/repos/{repo}/guarded", post(guard).get(guarded))
-        .route("/repos/{repo}/secrets", get(secrets))
-        .route("/repos/{repo}/secrets/{name}", post(set_secret))
-        .route("/repos/{repo}/secrets/{name}/remove", post(remove_secret))
-        .route("/repos/{repo}/envs/{name}/observed", post(observe_env))
-        .route("/repos/{repo}/envs/{name}/progress", post(env_progress))
         .route("/repos/{repo}/proofs/{id}", get(proof))
         .route("/repos/{repo}/proofs/{id}/log", get(proof_log))
         .route("/repos/{repo}/proofs/{id}/artifacts", get(proof_artifacts))
-        .route("/repos/{repo}/envs", get(envs))
-        .route("/repos/{repo}/stats", get(stats))
-        .route("/repos/{repo}/before", get(before).post(save_before))
-        .route("/repos/{repo}/envs/{name}", post(promote))
-        .route("/repos/{repo}/envs/{name}/rollback", post(rollback))
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
-        .merge(crate::auth::routes());
-    // Who asks and whether they may, for every route (see auth::gate): with no user on the server,
-    // its one token when it has one, as before accounts.
-    router
-        .layer(axum::middleware::from_fn_with_state(crate::auth::Gate::new(engine.clone()), crate::auth::gate))
-        .with_state(engine)
+        .merge(crate::seam::routes())
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024));
+    // Who asks and whether they may, for every route: AVP Cloud's accounts and tokens.
+    crate::seam::access(router, &engine).with_state(engine)
 }
 
 pub async fn serve(engine: Engine, addr: &str) -> anyhow::Result<()> {
     let host = addr.rsplit_once(':').map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']')).unwrap_or(addr);
     let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false);
-    let token = std::env::var("AVP_TOKEN").is_ok_and(|t| !t.is_empty());
     let open = std::env::var("AVP_INSECURE").is_ok_and(|v| v == "1");
-    anyhow::ensure!(
-        loopback || token || open,
-        "{addr} is reachable from other machines, and nothing would check who is asking: set AVP_TOKEN \
-         (clients use https://name:TOKEN@host), or listen on 127.0.0.1 behind a proxy that authenticates, \
-         or set AVP_INSECURE=1 if this network is yours alone"
-    );
-    // Secrets sealed with blake3 by a server from before XChaCha20-Poly1305, resealed before a proof opens one.
-    match crate::check::SecretStore::new(&engine.data).reseal_old() {
-        Ok(said) => said.iter().for_each(|line| eprintln!("{line}")),
-        Err(e) => eprintln!("secrets not resealed: {e:#}"),
+    if !loopback && !open {
+        crate::seam::may_listen(addr)?;
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("avp serving on http://{addr}  data: {}", engine.data.display());
-    engine.run_schedules();
-    // GitHub's side of the deploys and of avp/full, when the server has AVP_GITHUB_BRIDGE=1.
-    crate::github::start(engine.clone());
+    // What runs beside the routes: AVP Cloud's scheduled suites, deploys and GitHub bridge.
+    crate::seam::start(&engine);
     // `[git]` of avp.toml: the server reaches itself on loopback, whatever address it listens on.
     let mut local = listener.local_addr()?;
     if local.ip().is_unspecified() {

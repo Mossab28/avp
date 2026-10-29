@@ -68,6 +68,7 @@ fn the_heads_avp_toml_reads_as_json() {
 }
 
 #[test]
+#[cfg(feature = "cloud")]
 fn a_saved_before_comes_with_the_stats() {
     let (base, _rt, _d) = served();
     assert_eq!((get(&format!("{base}/before")), &get(&format!("{base}/stats"))["before"]), (Value::Null, &Value::Null), "nothing saved yet");

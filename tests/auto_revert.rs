@@ -1,6 +1,7 @@
 //! A line that never stays red: a full suite red twice after a landing finds the position that
 //! broke it, halving the batch, and AVP takes it back in a task of its own, proven and landed. What
 //! AVP cannot settle that way stays red for a person.
+#![cfg(feature = "cloud")]
 
 use avp::engine::{Engine, LandOutcome};
 use avp::model::*;

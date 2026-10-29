@@ -6,9 +6,12 @@ use avp::model::*;
 use avp::offline::{self, Op};
 use avp::{engine, gitbridge, mcp, server, up, view};
 
+/// What `avp --version` says: an AVP Cloud build says so (tests/ci.sh needs one).
+const VERSION: &str = if cfg!(feature = "cloud") { concat!(env!("CARGO_PKG_VERSION"), " (AVP Cloud)") } else { env!("CARGO_PKG_VERSION") };
+
 /// Version control for agents: open, write, check, land.
 #[derive(Parser)]
-#[command(name = "avp", version, about)]
+#[command(name = "avp", version = VERSION, about)]
 struct Cli {
     /// Server to talk to (or AVP_SERVER). Its value is never shown in the help: it may carry a password.
     #[arg(long, global = true, env = "AVP_SERVER", hide_env_values = true, default_value = "http://127.0.0.1:7117")]
@@ -1137,7 +1140,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Worker { data } => {
-            avp::workers::work(&client, &data)?;
+            avp::worker::work(&client, &data)?;
         }
         Cmd::Mirror { repo, branch, remote, committer, follow } => {
             let mut last = String::new();
@@ -2143,7 +2146,7 @@ proven on this machine (the server proves it again when the land reaches it): {}
 }
 
 /// A token as `avp token create` and `avp user add` print it: the one time it is shown.
-fn token_text(t: &avp::auth::NewToken) -> String {
+fn token_text(t: &avp::model::NewToken) -> String {
     let ends = t.info.expires_at.map(|e| format!("until {} UTC", avp::blame::utc(e))).unwrap_or_else(|| "no end".into());
     format!("token {} for {} ({}, {ends}), shown once:\n  {}\nit goes in AVP_TOKEN; `avp token revoke {}` stops it", t.info.id, t.info.person, t.info.name, t.token, t.info.id)
 }
@@ -2152,7 +2155,7 @@ fn users(client: &Client, dir: &Path, cmd: UserCmd, json: bool) -> Result<()> {
     match cmd {
         UserCmd::Add { name, email, github, admin } => {
             let added: serde_json::Value = client.post("/users", &serde_json::json!({ "name": name, "email": email, "github": github, "admin": admin }))?;
-            let token: avp::auth::NewToken = serde_json::from_value(added["token"].clone())?;
+            let token: avp::model::NewToken = serde_json::from_value(added["token"].clone())?;
             print(json, &added, |_| {
                 let what = if added["user"]["admin"] == true { ", admin of this server" } else { ": `avp user role` gives them a role on a repo" };
                 format!("{name} added{what}\n{}", token_text(&token))
@@ -2197,7 +2200,7 @@ fn users(client: &Client, dir: &Path, cmd: UserCmd, json: bool) -> Result<()> {
             print(json, &r, |_| format!("{name} removed: their tokens stop working, their roles are gone"));
         }
         UserCmd::Admin { name, off } => {
-            let u: avp::auth::User = client.post(&format!("/users/{name}/admin"), &serde_json::json!({ "admin": !off }))?;
+            let u: avp::model::User = client.post(&format!("/users/{name}/admin"), &serde_json::json!({ "admin": !off }))?;
             print(json, &u, |u| format!("{} is {}", u.name, if u.admin { "an admin of the server" } else { "no admin of the server" }));
         }
         UserCmd::Role { name, role, repo } => {
@@ -2237,7 +2240,7 @@ fn users(client: &Client, dir: &Path, cmd: UserCmd, json: bool) -> Result<()> {
 fn tokens(client: &Client, cmd: TokenCmd, json: bool) -> Result<()> {
     match cmd {
         TokenCmd::Create { name, expires, user } => {
-            let t: avp::auth::NewToken = client.post("/tokens", &serde_json::json!({ "name": name, "expires": expires, "person": user }))?;
+            let t: avp::model::NewToken = client.post("/tokens", &serde_json::json!({ "name": name, "expires": expires, "person": user }))?;
             print(json, &t, token_text);
         }
         TokenCmd::List { user } => {
@@ -2245,7 +2248,7 @@ fn tokens(client: &Client, cmd: TokenCmd, json: bool) -> Result<()> {
                 Some(u) => format!("/tokens?person={u}"),
                 None => "/tokens".into(),
             };
-            let ts: Vec<avp::auth::TokenInfo> = client.get(&path)?;
+            let ts: Vec<avp::model::TokenInfo> = client.get(&path)?;
             print(json, &ts, |ts| {
                 if ts.is_empty() {
                     return "no token that works: `avp token create` makes one".into();
@@ -2261,7 +2264,7 @@ fn tokens(client: &Client, cmd: TokenCmd, json: bool) -> Result<()> {
             });
         }
         TokenCmd::Revoke { id } => {
-            let t: avp::auth::TokenInfo = client.post(&format!("/tokens/{id}/revoke"), &serde_json::json!({}))?;
+            let t: avp::model::TokenInfo = client.post(&format!("/tokens/{id}/revoke"), &serde_json::json!({}))?;
             print(json, &t, |t| format!("{} revoked: {}'s {} no longer works", t.id, t.person, t.name));
         }
     }

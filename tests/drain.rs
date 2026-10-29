@@ -1,6 +1,7 @@
 //! The drain (`POST /drain`): while it lasts the server starts no new work, what runs goes to its
 //! end, and it lifts when asked or at its bound. Proofs here run in the server's own slots; the
 //! workers' side is tests/drain_workers.rs.
+#![cfg(feature = "cloud")]
 
 use avp::engine::Engine;
 use avp::model::*;

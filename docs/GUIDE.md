@@ -6,6 +6,32 @@ the words this guide uses.
 What the README leaves out: the checks, the environments, a person in the loop, AVP without
 `avp up`.
 
+## AVP and AVP Cloud
+
+The free AVP is the tool one person runs on their machine: its server (`avp up`, `avp serve`)
+answers 127.0.0.1 alone (`AVP_INSECURE=1` when the network is yours alone), proves every task
+itself, and lands it once green. The proof steps, the history verbs, the mirror to Git, offline,
+the MCP tools and `avp import-ci` are all there.
+
+AVP Cloud is a team's hosted server. What only makes sense there is its own, and so are the
+sections of this guide that say so:
+
+| AVP Cloud | Here |
+|---|---|
+| Proof workers (`avp worker`, `AVP_WORKERS=1`) and the drain before an update | [Your checks, your environments](#your-checks-your-environments) |
+| The full suite after each landing, its flaky reruns and reverts, `avp full` | [Your checks, your environments](#your-checks-your-environments), [Scheduled suites](#scheduled-suites) |
+| Environments: `avp envs`, `avp promote`, `avp rollback`, deploys, the GitHub bridge | [Your checks, your environments](#your-checks-your-environments), [Rollback](#rollback) |
+| A person in the loop: `avp approve`, `avp refuse`, `avp landing`, `avp guard` | [A person in the loop](#a-person-in-the-loop) |
+| Secrets for tests: `avp secret` | [Secrets for tests](#secrets-for-tests) |
+| `avp stats` and the before and after, AVP Live | [Measure it](#measure-it) |
+| Accounts and tokens: `avp user`, `avp token`, `avp whoami` | [A team server](#a-team-server) |
+
+The CLI and the MCP tools keep every verb: on a free server, a verb of AVP Cloud answers
+`<what> is part of AVP Cloud`, with what to do (`AVP_SERVER` pointed at the team's server). What
+avp.toml says of them (`[envs]`, `full`, `[[check.schedule]]`, `secrets`) reads on both: a free
+server leaves it be. Without them, a free server's task that changes avp.toml lands on its own
+proof, as any other.
+
 ## Your checks, your environments
 
 `avp.toml` is yours to edit:
@@ -524,7 +550,7 @@ each commit, its task and what became of it; `avp import-git` exits 2 when one i
 
 ## A team server
 
-Everyone runs `avp up` in their own checkout with `AVP_SERVER` set to the team's server, a plain
+A team server is AVP Cloud's (see [AVP and AVP Cloud](#avp-and-avp-cloud)). Everyone runs `avp up` in their own checkout with `AVP_SERVER` set to the team's server, a plain
 address, and the secret in `AVP_TOKEN`: their own token on a server with accounts (below), or the
 server's one token with their name in `AVP_USER` (or `AVP_PERSON`). The client sends them as a
 header, so the secret never sits in a URL that ends up in configs and logs. A name and password in

@@ -76,6 +76,20 @@ CREATE TABLE IF NOT EXISTS tags (
   git TEXT, deleted INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (repo, name)
 );
+-- People, tokens and roles: AVP Cloud's accounts. Every server has the tables, so a data folder
+-- moves between a free server and a cloud one as it is.
+CREATE TABLE IF NOT EXISTS users (
+  name TEXT PRIMARY KEY, email TEXT, github TEXT, admin INTEGER NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_github ON users (github);
+CREATE TABLE IF NOT EXISTS tokens (
+  id TEXT PRIMARY KEY, hash TEXT UNIQUE NOT NULL, person TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
+  created_at INTEGER NOT NULL, expires_at INTEGER, revoked_at INTEGER, used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS tokens_person ON tokens (person);
+CREATE TABLE IF NOT EXISTS roles (
+  repo TEXT NOT NULL, person TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (repo, person)
+);
 "#;
 
 /// A name for a position of the line (`v1.2`): what a release is called, shown by `avp log` and AVP
@@ -271,7 +285,6 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(crate::auth::SCHEMA)?;
         // Older databases: the landing rule column.
         let _ = conn.execute("ALTER TABLE repos ADD COLUMN landing TEXT NOT NULL DEFAULT 'proof'", []);
         // Older databases: the git commit of a position (import, export).

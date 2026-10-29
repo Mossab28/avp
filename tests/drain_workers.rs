@@ -1,6 +1,7 @@
 //! The drain with proof workers (AVP_WORKERS=1, which the queue reads once per process: this test
 //! has its binary to itself): while the server drains, a proof waits in the queue and no worker's
 //! claim gets it; once the drain is lifted, the next claim does.
+#![cfg(feature = "cloud")]
 
 use avp::engine::Engine;
 use avp::model::*;
@@ -54,7 +55,7 @@ fn no_worker_claims_a_proof_while_the_server_drains() {
     assert_eq!(http.delete(format!("{base}/drain")).send().unwrap().status().as_u16(), 200);
     let got = claim();
     assert_eq!(got.status().as_u16(), 200, "lifted, the next claim gets it");
-    let job: avp::workers::Job = got.json().unwrap();
+    let job: avp::worker::Job = got.json().unwrap();
     assert_eq!(job.name, t.id);
     let work = get("/work");
     assert_eq!((&work["waiting"], &work["running"], &work["draining"]), (&serde_json::json!(0), &serde_json::json!(1), &serde_json::json!(false)), "{work}");
