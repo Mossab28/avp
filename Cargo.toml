@@ -1,6 +1,6 @@
 [package]
 name = "avp"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "AVP, agent versioning protocol: version control for agents. A server that holds the truth, tasks instead of branches, proofs instead of CI."
 license = "Elastic-2.0"

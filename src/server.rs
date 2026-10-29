@@ -536,11 +536,15 @@ struct LandQuery {
     /// The open tasks it is stacked on land first (`avp land --stack`).
     #[serde(default)]
     stack: bool,
+    /// Open tasks to land with it, as one position proven whole (`avp land --with`), comma separated.
+    #[serde(default)]
+    with: String,
 }
 async fn land(State(e): S, headers: HeaderMap, P((repo, task)): P<(String, String)>, Query(q): Query<LandQuery>) -> Response {
     kept_alive(&headers, move || {
         own_task(&e, &repo, &task)?;
-        Ok(match if q.stack { e.land_stack(&task)? } else { e.land(&task)? } {
+        let with: Vec<String> = q.with.split(',').map(str::trim).filter(|w| !w.is_empty()).map(String::from).collect();
+        Ok(match if !with.is_empty() { e.land_with(&task, &with)? } else if q.stack { e.land_stack(&task)? } else { e.land(&task)? } {
             LandOutcome::Landed(l) => (StatusCode::OK, serde_json::to_value(l)?),
             LandOutcome::NotLanded(n) => (StatusCode::CONFLICT, serde_json::to_value(n)?),
         })
@@ -557,6 +561,17 @@ struct EventsQuery {
     kinds: Option<String>,
     /// The newest this many, oldest first, instead of the oldest after `since`.
     last: Option<i64>,
+}
+#[derive(Deserialize)]
+struct WaitBody {
+    #[serde(default)]
+    tasks: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+/// An open task's `avp wait` looks (Engine::waiting): what it waits on, remembered while it runs.
+async fn waits(State(e): S, P((repo, task)): P<(String, String)>, Json(b): Json<WaitBody>) -> R {
+    ok(blocking(move || { own_task(&e, &repo, &task)?; e.waiting(&task, &b.tasks, &b.paths) }).await?)
 }
 /// The reverts a task opening should hear of (Engine::reverted_for).
 async fn reverted(State(e): S, P((repo, task)): P<(String, String)>) -> R {
@@ -791,6 +806,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/repos/{repo}/tasks/{task}/catch-up", post(catch_up))
         .route("/repos/{repo}/tasks/{task}/diff", get(task_diff))
         .route("/repos/{repo}/tasks/{task}/land", post(land))
+        .route("/repos/{repo}/tasks/{task}/waits", post(waits))
         .route("/repos/{repo}/tasks/{task}/reverted", get(reverted))
         .route("/repos/{repo}/events", get(events))
         .route("/repos/{repo}/why", get(why))

@@ -236,7 +236,16 @@ impl Client {
     /// `stack`: the open tasks it is stacked on land first, bottom first (`avp land --stack`).
     pub fn land_as(&self, repo: &str, task: &str, stack: bool) -> Result<Result<Landed, NotLanded>> {
         let stack = if stack { "?stack=true" } else { "" };
-        match self.post_long(&format!("/repos/{repo}/tasks/{task}/land{stack}"), None)? {
+        self.land_at(&format!("/repos/{repo}/tasks/{task}/land{stack}"))
+    }
+
+    /// `with`: open tasks landed with it as one position, proven whole (`avp land --with`).
+    pub fn land_with(&self, repo: &str, task: &str, with: &[String]) -> Result<Result<Landed, NotLanded>> {
+        self.land_at(&format!("/repos/{repo}/tasks/{task}/land?with={}", with.join(",")))
+    }
+
+    fn land_at(&self, path: &str) -> Result<Result<Landed, NotLanded>> {
+        match self.post_long(path, None)? {
             (409, text) => Ok(Err(serde_json::from_str(&text)?)),
             (s, text) if (200..300).contains(&s) => Ok(Ok(serde_json::from_str(&text)?)),
             (s, text) => Err(refused(s, serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(text))),

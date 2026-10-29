@@ -332,6 +332,30 @@ pub struct TaskStatus {
     /// For a stacked task, where the task it is stacked on stands, and what to do about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+    /// A task landed together with others (`avp land --with`): those others, landed at the same position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<String>,
+}
+
+/// What the server says each time an open task's `avp wait` looks (`POST .../waits`). It remembers
+/// what the task waits on while the wait runs, so it sees the tasks that wait on each other.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WaitSeen {
+    /// Tasks that need each other, this one first: each waits on the next (or is red on a file the
+    /// next one holds), the last on this one. None of them lands alone: waiting changes nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycle: Vec<String>,
+    /// How each task of the cycle needs the next, one line each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    /// A landing that holds this task runs now (with others, `avp land --with`): it may land it.
+    #[serde(default)]
+    pub landing: bool,
+    /// This task landed meanwhile, landed with others: where, and with which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<String>,
 }
 
 /// One file of a task's change, for a person to read before approving it.
@@ -377,6 +401,9 @@ pub struct Landed {
     /// With `--stack`: the tasks under this one that landed before it, bottom first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<StackLanded>,
+    /// With `--with`: the other tasks proven with this one as one candidate, landed at the same position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

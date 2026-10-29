@@ -123,6 +123,7 @@ fn moved_line_merges_disjoint_hunks_and_flags_overlap() {
         LandOutcome::NotLanded(n) => {
             assert_eq!(n.reason, "conflict");
             assert_eq!(n.conflicts, vec!["src/a.txt".to_string()]);
+            assert!(n.note.as_deref().is_some_and(|n| n.contains("src/a.txt") && n.contains("never delete a side")), "{:?}", n.note);
             let st = e.status(&fourth.id).unwrap();
             let live = Engine::effective_writes(&st.writes);
             let w = live["src/a.txt"];
@@ -137,6 +138,24 @@ fn moved_line_merges_disjoint_hunks_and_flags_overlap() {
     put(&e, &fourth.id, "src/a.txt", "A1\nmine and theirs\nA3\n");
     assert!(matches!(e.land(&fourth.id).unwrap(), LandOutcome::Landed(_)));
     assert_eq!(content(&e, &r, 4, "src/a.txt"), "A1\nmine and theirs\nA3\n");
+}
+
+#[test]
+fn insertions_into_the_same_line_land_with_both() {
+    let (e, _d) = engine();
+    let r = repo(&e, LeasePolicy::Advisory);
+    let base = open(&e, &r, "store", &[]);
+    put(&e, &base.id, "src/store.ts", "import type { Customer, Invoice } from \"./types.js\";\n");
+    assert!(matches!(e.land(&base.id).unwrap(), LandOutcome::Landed(_)));
+    let payments = open(&e, &r, "payments", &[]);
+    let refunds = open(&e, &r, "refunds", &[]);
+    put(&e, &payments.id, "src/store.ts", "import type { Customer, Invoice, Payment } from \"./types.js\";\n");
+    put(&e, &refunds.id, "src/store.ts", "import type { Customer, Invoice, Refund } from \"./types.js\";\n");
+    assert!(matches!(e.land(&payments.id).unwrap(), LandOutcome::Landed(_)));
+    match e.land(&refunds.id).unwrap() {
+        LandOutcome::Landed(l) => assert_eq!(content(&e, &r, l.position, "src/store.ts"), "import type { Customer, Invoice, Payment, Refund } from \"./types.js\";\n"),
+        LandOutcome::NotLanded(n) => panic!("{} {:?}", n.reason, n.conflicts),
+    }
 }
 
 #[test]

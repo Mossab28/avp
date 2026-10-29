@@ -479,6 +479,34 @@ task right under the one it builds on, and so does AVP Live. Agents have `avp_op
 `avp_land` with `stack`, and `avp_refresh`. `avp wait --task <id>` is for the other case: a task that
 needs another's work on the line, without building on it before it lands.
 
+**Waiting.** A red proof that comes from teammates' work not on the line yet is fixed by waiting,
+not by editing: `avp land` lists the other open tasks, and names first the one that holds a file
+the proof fails on. `avp wait --task <id>` (or `--path <file>`, as many as needed; `avp_wait` for
+agents) blocks until those tasks have landed and those paths are on the line, then brings them into
+the folder: land again.
+
+**Tasks that need each other** land together. When the Customers tests need Invoices and the
+Invoices tests need Customers, each proof is red alone, and each agent waiting on the other would
+wait forever. The server knows who waits on whom while `avp wait` runs: when the task waited on
+waits on the waiter in turn, or is red on a file the waiter holds, the wait answers at once, at any
+length of cycle (A waits on B, B on C, C on A):
+
+```sh
+avp wait --task task_01k8...
+# cycle: this task and task task_01k8... need each other (...): none lands alone, and waiting changes nothing.
+# Land them together, proven as one position: `avp land --with task_01k8...` (avp_land with `with`). ...
+avp land --with task_01k8...        # --with again for each other task of the cycle
+```
+
+`avp land --with <task>` merges this task's writes and those of each named open task (what the
+server holds of each) on the head of the line, and proves them as one candidate. Green, they land
+as one position, whose goal names every task, and each task is landed at it: its agent's `avp
+land`, `avp wait` and `avp status` say so, and its folder becomes the line. A conflict or a red
+lands nothing and changes no task: the answer says whose files are at fault, and each agent fixes
+its own. A stacked task lands with the tasks under it. Both agents are told the cycle; whichever
+lands first lands both, and the other's land says where. `avp wait --json` gives the cycle and the
+command (`state`, `cycle`, `land`); agents have `avp_land` with `with`.
+
 Work that already lives in a git branch comes in by its pull request. Run, from a checkout:
 
 ```sh

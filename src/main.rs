@@ -232,6 +232,10 @@ enum Cmd {
         /// Land the open tasks it is stacked on first, the bottom one first, then this one.
         #[arg(long)]
         stack: bool,
+        /// An open task to land with this one, as one position proven whole: tasks that need each
+        /// other, red each alone (`avp wait` names them). As many as needed; each with its stack.
+        #[arg(long, value_name = "TASK")]
+        with: Vec<String>,
     },
     /// Undo writes after a sequence number (0 = all), or one path back to the base, or take the task
     /// to a save point (`--to`); lays the result out.
@@ -1000,12 +1004,22 @@ fn main() -> Result<()> {
         Cmd::Update => update(&client)?,
         Cmd::Wait { task, path, timeout } => {
             let mut state = view_or_repo(&dir)?;
-            let said = avp::wait::wait(&client, &state.repo, state.task.as_deref(), &task, &path, std::time::Duration::from_secs(timeout))?;
-            println!("{said}");
-            // Ready, with a task open here: what was waited for comes into the folder, to build on.
-            if said.starts_with("ready") && state.task.is_some() {
-                println!("{}", view::catch_up(&client, &dir, &mut state)?);
-            }
+            let w = avp::wait::wait(&client, &state.repo, state.task.as_deref(), &task, &path, std::time::Duration::from_secs(timeout))?;
+            let folder = match w.state.as_str() {
+                // Ready, with a task open here: what was waited for comes into the folder, to build on.
+                "ready" if state.task.is_some() => Some(view::catch_up(&client, &dir, &mut state)?),
+                // Landed with others: the folder becomes the line.
+                "landed" => {
+                    let tree: Tree = client.get(&format!("/repos/{}/tree/{}", state.repo, w.position))?;
+                    state.task = None;
+                    view::materialize(&client, &tree, &dir, &mut state)?;
+                    Some(format!("this folder holds position {} of the line", w.position))
+                }
+                _ => None,
+            };
+            let mut shown = serde_json::to_value(&w)?;
+            shown["folder"] = serde_json::json!(folder);
+            print(json, &shown, |_| folder.as_ref().map(|f| format!("{}\n{f}", w.text)).unwrap_or_else(|| w.text.clone()));
         }
         Cmd::Init { name, policy } => {
             let repo: Repo = client.post("/repos", &serde_json::json!({ "name": name, "policy": policy }))?;
@@ -1425,6 +1439,9 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
                 let s = &st;
                 let live = engine::Engine::effective_writes(&s.writes);
                 let mut out = format!("task {} ({:?}) on position {} (head {}): {}\n{} live writes, {} leases", s.task.id, s.task.state, s.task.base_position, s.head_position, s.task.goal, live.len(), s.leases.len());
+                if let Some(at) = s.task.landed_position {
+                    out.push_str(&format!("\nlanded at position {at}{}", avp::wait::together(&s.with)));
+                }
                 if let Some(w) = &s.stack {
                     out.push_str(&format!("\n{w}"));
                 }
@@ -1508,7 +1525,7 @@ proven on this machine (the server proves it again when the land reaches it): {}
                 std::process::exit(1);
             }
         }
-        Cmd::Land { stack } => {
+        Cmd::Land { stack, with } => {
             let mut state = view::load(&dir)?;
             // The outbox just landed what was here, or holds its land still: said above, or now.
             if state.task.is_none() && (!link.said.is_empty() || offline::pending(&dir) > 0) {
@@ -1525,13 +1542,15 @@ proven on this machine (the server proves it again when the land reaches it): {}
             };
             if st.task.state == TaskState::Landed {
                 let position = st.task.landed_position.unwrap_or(st.head_position);
-                println!("landed at position {position}{}", st.approval.as_ref().map(|a| format!(", approved by {}", a.person)).unwrap_or_default());
+                println!("landed at position {position}{}{}", avp::wait::together(&st.with), st.approval.as_ref().map(|a| format!(", approved by {}", a.person)).unwrap_or_default());
                 let tree: Tree = client.get(&format!("/repos/{}/tree/{position}", state.repo))?;
                 state.task = None;
                 view::materialize(&client, &tree, &dir, &mut state)?;
                 return Ok(());
             }
-            let landed = view::sync(&client, &dir, &mut state).and_then(|_| avp::mcp::through_drain(&client, &task, say_drain(), || client.land_as(&state.repo, &task, stack)));
+            let landed = view::sync(&client, &dir, &mut state).and_then(|_| {
+                avp::mcp::through_drain(&client, &task, say_drain(), || if with.is_empty() { client.land_as(&state.repo, &task, stack) } else { client.land_with(&state.repo, &task, &with) })
+            });
             // The server went away during the proof: proven here, and queued.
             let landed = match landed {
                 Err(e) if unreachable(&e) => return land_offline(&client.base, &dir, &mut state, json),
@@ -1541,7 +1560,7 @@ proven on this machine (the server proves it again when the land reaches it): {}
                 Ok(l) => {
                     print(json, &l, |l| {
                         let under: String = l.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
-                        format!("{under}landed at position {}{} (proof {})", l.position, if l.replayed { ", replayed on the moved line" } else { "" }, l.proof)
+                        format!("{under}landed at position {}{}{} (proof {})", l.position, avp::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof)
                     });
                     // The view becomes the line: teammates' landed files arrive here too.
                     let tree: Tree = client.get(&format!("/repos/{}/tree/{}", state.repo, l.position))?;
@@ -1565,7 +1584,9 @@ proven on this machine (the server proves it again when the land reaches it): {}
                         if let Some(note) = &n.note {
                             s.push_str(&format!("\n  {note}"));
                         }
-                        if !n.conflicts.is_empty() {
+                        if !n.conflicts.is_empty() && !with.is_empty() {
+                            s.push_str(&format!("\n  conflicts: {}", n.conflicts.join(", ")));
+                        } else if !n.conflicts.is_empty() {
                             s.push_str("\n  conflicts (markers written, settle them, then land again):");
                             for c in &n.conflicts {
                                 s.push_str(&format!("\n    {c}"));
@@ -1577,8 +1598,8 @@ proven on this machine (the server proves it again when the land reaches it): {}
                         if !n.waits_for.is_empty() && n.note.is_none() {
                             s.push_str(&format!("\n  waits for: {}", n.waits_for.join(", ")));
                         }
-                        if n.reason == "red" {
-                            if let Some(h) = avp::wait::others_hint(&client, &state.repo, &task) {
+                        if n.reason == "red" && with.is_empty() {
+                            if let Some(h) = avp::wait::others_hint(&client, &state.repo, &task, n.proof.as_ref()) {
                                 s.push_str(&format!("\n  {}", h.replace('\n', "\n  ")));
                             }
                         }
@@ -1599,7 +1620,8 @@ proven on this machine (the server proves it again when the land reaches it): {}
                         }
                         s
                     });
-                    if n.reason == "conflict" {
+                    // Landed with others, a conflict changes no task: no markers to lay out.
+                    if n.reason == "conflict" && with.is_empty() {
                         let tree: Tree = client.get(&format!("/repos/{}/tasks/{task}/tree", state.repo))?;
                         view::materialize(&client, &tree, &dir, &mut state)?;
                     }

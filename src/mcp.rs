@@ -348,8 +348,8 @@ fn tools() -> Vec<Value> {
         tool("avp_open", "This repository is delivered through AVP, not git: no commit, push or pull request; every change is an AVP task (avp_open, edit, avp_land). Open a task on the head of the line before writing anything. If this directory is not an AVP view, a folder of your own holding the head of the line is laid out and its path returned: work there. It is the folder a session left free, with its install, when there is one; else a new one, cloned from the head with the install of a folder whose lockfiles are the same. `scope` lists the paths you intend to change; leases are taken on them now, and the answer says what the line remembers of them. Subagents: each one calls avp_open itself and gets a task and a folder of its own, beside the others (an open task is never taken over); with several open, every other avp_ tool takes `task`.", json!({ "goal": { "type": "string", "description": "What the task will do, one line, as a commit title." }, "repo": { "type": "string", "description": "AVP repo name, when this directory is not a view yet (default: $AVP_REPO)." }, "transcript": { "type": "string", "description": "Where your conversation lives (path or URL), if you know it: `avp why` shows it to whoever reads this code later." }, "scope": { "type": "array", "items": { "type": "string" }, "description": "Paths (files or directories) this task will write." }, "on": { "type": "string", "description": "An open task to stack this one on (its id, or the start of one): you build on its work before it lands, avp_refresh brings its latest changes, and this task lands after it (avp_land with `stack` lands both)." } }), &["goal"]),
         tool("avp_status", "The open task: live writes, leases, head position, last proof. Also sends the directory's changes as writes first.", json!({}), &[]),
         tool("avp_check", "See the proof without landing: typecheck and the related tests on the candidate tree (base + this task's writes), per avp.toml. avp_land runs it itself (and reuses a green one), so there is no need to check before landing. Returns the verdict, steps, blamed files and who holds them. Syncs first.", json!({}), &[]),
-        tool("avp_wait", "Wait until other tasks have landed (or been dropped) and paths are on the line: when a red proof comes from teammates' work not landed yet, wait here instead of polling, then avp_land again. Blocks up to timeout_s (default 600). To build on another task's work before it lands, open your task on it instead (avp_open with `on`).", json!({ "tasks": { "type": "array", "items": { "type": "string" }, "description": "Task ids (or their start)." }, "paths": { "type": "array", "items": { "type": "string" }, "description": "Paths that must be on the head of the line." }, "timeout_s": { "type": "number" } }), &[]),
-        tool("avp_land", "Deliver the task: this is how a change reaches the repository (never git commit or push). Land the task on the line. Syncs, replays if the line moved, verifies, then compare-and-swaps. On `conflict`, files with markers are laid out here: settle them and land again. On `red`, fix and land again. On `blocked`, another task holds a failing file: wait for it. On `stacked`, the task this one is stacked on has not landed: `stack` lands it first, then this one.", json!({ "stack": { "type": "boolean", "description": "Land the open tasks this one is stacked on first, the bottom one first, then this one." } }), &[]),
+        tool("avp_wait", "Wait until other tasks have landed (or been dropped) and paths are on the line: when a red proof comes from teammates' work not landed yet, wait here instead of polling, then avp_land again. Blocks up to timeout_s (default 600). When the tasks you wait on need yours in turn (they wait on it, or are red on files it holds), it answers at once with the cycle: land them together with avp_land `with`. To build on another task's work before it lands, open your task on it instead (avp_open with `on`).", json!({ "tasks": { "type": "array", "items": { "type": "string" }, "description": "Task ids (or their start)." }, "paths": { "type": "array", "items": { "type": "string" }, "description": "Paths that must be on the head of the line." }, "timeout_s": { "type": "number" } }), &[]),
+        tool("avp_land", "Deliver the task: this is how a change reaches the repository (never git commit or push). Land the task on the line. Syncs, replays if the line moved, verifies, then compare-and-swaps. On `conflict`, files with markers are laid out here: settle them and land again. On `red`, fix and land again. On `blocked`, another task holds a failing file: wait for it. On `stacked`, the task this one is stacked on has not landed: `stack` lands it first, then this one. Tasks that need each other (avp_wait says so) land together with `with`: one position, proven whole.", json!({ "stack": { "type": "boolean", "description": "Land the open tasks this one is stacked on first, the bottom one first, then this one." }, "with": { "type": "array", "items": { "type": "string" }, "description": "Open tasks (ids, or their start) to land with this one as one position, proven as one candidate: tasks that need each other, red each alone. Each lands with its stack." } }), &[]),
         tool("avp_refresh", "Bring into your folder the work this task builds on, your changes kept on top: what landed on the line since, or for a task stacked on another (avp_open with `on`), that task's latest changes. Syncs first; conflict markers, if any, are laid out to settle before avp_land.", json!({}), &[]),
         tool("avp_claim", "Take leases on paths you are about to write outside your scope. Returns the previous holder if someone else had it.", json!({ "paths": { "type": "array", "items": { "type": "string" } } }), &["paths"]),
         tool("avp_release", "Give leases back on paths you are done with (all of them when `paths` is empty).", json!({ "paths": { "type": "array", "items": { "type": "string" } } }), &[]),
@@ -433,6 +433,14 @@ impl Mcp {
         let list = || open.iter().map(|(d, t, g)| format!("  {t}  {g}  (folder {})", d.display())).collect::<Vec<_>>().join("\n");
         if let Some(want) = want {
             let hits: Vec<&(PathBuf, String, String)> = open.iter().filter(|(_, t, _)| t.starts_with(want)).collect();
+            // A task of this session another landed with its own (`avp land --with`): its folder, so
+            // that its land, wait and status say where it landed.
+            if hits.is_empty() {
+                let landed = self.slots.lock().unwrap_or_else(|e| e.into_inner()).keys().find(|d| view::load(d).ok().and_then(|s| s.task).is_some_and(|t| t.starts_with(want))).cloned();
+                if let Some(d) = landed {
+                    return Ok(d);
+                }
+            }
             return match hits.as_slice() {
                 [(d, _, _)] => Ok(d.clone()),
                 // A read needs the repo only: a task landed since is no reason to refuse it (28/10, a
@@ -743,6 +751,9 @@ impl Mcp {
                 let st: TaskStatus = self.client.get(&format!("/repos/{repo}/tasks/{t}"))?;
                 let live = Engine::effective_writes(&st.writes);
                 let mut out = format!("sync: {synced}\nfolder: {}\ntask {} ({:?}) on position {} (head {}): {}\nlive writes: {}", self.dir().display(), st.task.id, st.task.state, st.task.base_position, st.head_position, st.task.goal, live.len());
+                if let Some(at) = st.task.landed_position {
+                    out.push_str(&format!("\nlanded at position {at}{}", crate::wait::together(&st.with)));
+                }
                 if let Some(w) = &st.stack {
                     out.push_str(&format!("\n{w}"));
                 }
@@ -780,12 +791,17 @@ impl Mcp {
                     s.task = None;
                     view::materialize(&self.client, &tree, &self.dir(), &mut s)?;
                     view::save(&self.dir(), &s)?;
-                    return Ok(format!("landed at position {position}{}", st.approval.as_ref().map(|a| format!(", approved by {}", a.person)).unwrap_or_default()));
+                    return Ok(format!("landed at position {position}{}{}", crate::wait::together(&st.with), st.approval.as_ref().map(|a| format!(", approved by {}", a.person)).unwrap_or_default()));
                 }
                 let synced = self.sync(&mut s)?;
                 let (say, said) = self.drain_say();
                 let stack = args["stack"].as_bool() == Some(true);
-                let landed = through_drain(&self.client, &t, say, || self.client.land_as(&repo, &t, stack))?;
+                // One id, or a list of them.
+                let with: Vec<String> = match &args["with"] {
+                    Value::String(w) => vec![w.clone()],
+                    w => w.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default(),
+                };
+                let landed = through_drain(&self.client, &t, say, || if with.is_empty() { self.client.land_as(&repo, &t, stack) } else { self.client.land_with(&repo, &t, &with) })?;
                 // What the agent waited for, when the server drained under it, then the answer.
                 let waited: String = said.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| format!("{l}\n")).collect();
                 match landed {
@@ -802,7 +818,7 @@ impl Mcp {
                             std::thread::spawn(move || crate::checkout::align_when_written(&client, &dir, &repo, position, std::time::Duration::from_secs(120)));
                         }
                         let under: String = l.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
-                        Ok(format!("{waited}sync: {synced}\n{under}landed at position {}{} (proof {}). The task is closed; open a new one for the next piece of work.", l.position, if l.replayed { ", replayed on the moved line" } else { "" }, l.proof))
+                        Ok(format!("{waited}sync: {synced}\n{under}landed at position {}{}{} (proof {}). The task is closed; open a new one for the next piece of work.", l.position, crate::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof))
                     }
                     Err(n) => {
                         let under: String = n.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
@@ -810,7 +826,10 @@ impl Mcp {
                         if let Some(note) = &n.note {
                             out.push_str(&format!("\n{note}"));
                         }
-                        if !n.conflicts.is_empty() {
+                        // Landed with others, a conflict changes no task: the note says whose files.
+                        if !n.conflicts.is_empty() && !with.is_empty() {
+                            out.push_str(&format!("\nconflicts: {}", n.conflicts.join(", ")));
+                        } else if !n.conflicts.is_empty() {
                             let tree: Tree = self.client.get(&format!("/repos/{repo}/tasks/{t}/tree"))?;
                             view::materialize(&self.client, &tree, &self.dir(), &mut s)?;
                             out.push_str("\nconflict markers (<<<<<<< ours / ||||||| original / ======= / >>>>>>> theirs) are now in:");
@@ -825,8 +844,8 @@ impl Mcp {
                         if !n.waits_for.is_empty() && n.note.is_none() {
                             out.push_str(&format!("\nwaits for: {}", n.waits_for.join(", ")));
                         }
-                        if n.reason == "red" {
-                            if let Some(h) = crate::wait::others_hint(&self.client, &repo, &t) {
+                        if n.reason == "red" && with.is_empty() {
+                            if let Some(h) = crate::wait::others_hint(&self.client, &repo, &t, n.proof.as_ref()) {
                                 out.push_str(&format!("\n{h}"));
                             }
                         }
@@ -994,14 +1013,24 @@ impl Mcp {
             "avp_wait" => {
                 let list = |k: &str| args[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
                 let secs = args["timeout_s"].as_u64().unwrap_or(600);
-                let said = crate::wait::wait(&self.client, &repo, s.task.as_deref(), &list("tasks"), &list("paths"), std::time::Duration::from_secs(secs))?;
-                // Ready, with a task open here: what was waited for comes into the folder, to build on.
-                if said.starts_with("ready") && s.task.is_some() {
-                    let moved = view::catch_up(&self.client, &self.dir(), &mut s)?;
-                    view::save(&self.dir(), &s)?;
-                    return Ok(format!("{said}\n{moved}"));
+                let w = crate::wait::wait(&self.client, &repo, s.task.as_deref(), &list("tasks"), &list("paths"), std::time::Duration::from_secs(secs))?;
+                match w.state.as_str() {
+                    // Ready, with a task open here: what was waited for comes into the folder, to build on.
+                    "ready" if s.task.is_some() => {
+                        let moved = view::catch_up(&self.client, &self.dir(), &mut s)?;
+                        view::save(&self.dir(), &s)?;
+                        Ok(format!("{}\n{moved}", w.text))
+                    }
+                    // Landed with others: the folder becomes the line.
+                    "landed" => {
+                        let tree: Tree = self.client.get(&format!("/repos/{repo}/tree/{}", w.position))?;
+                        s.task = None;
+                        view::materialize(&self.client, &tree, &self.dir(), &mut s)?;
+                        view::save(&self.dir(), &s)?;
+                        Ok(format!("{}\nThe task is closed; open a new one for the next piece of work.", w.text))
+                    }
+                    _ => Ok(w.text),
                 }
-                Ok(said)
             }
             "avp_proof" => {
                 let id = match args["id"].as_str() {

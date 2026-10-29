@@ -36,6 +36,33 @@ pub struct Engine {
     pub cloud: Arc<crate::seam::State>,
     /// Each repo's landing queue.
     land_queues: Arc<Mutex<HashMap<String, Arc<LandQueue>>>>,
+    /// What each running `avp wait` of an open task waits on, by task: who waits on whom.
+    waits: Arc<Mutex<HashMap<String, Waiting>>>,
+    /// The tasks a landing holds right now: another landing of one of them waits for it to end.
+    landing: Arc<(Mutex<BTreeSet<String>>, Condvar)>,
+}
+
+/// What an open task's `avp wait` waits on: the tasks it names, and those holding the paths it
+/// names. It looks every few seconds; what it waited on is forgotten a few seconds after it stops.
+struct Waiting {
+    on: BTreeSet<String>,
+    until: i64,
+}
+
+/// How long a wait's last look stands for it: a few of its looks, 3 s apart.
+const WAIT_SEEN_MS: i64 = 10_000;
+
+/// The tasks a landing holds, given back when dropped.
+struct Holding(Arc<(Mutex<BTreeSet<String>>, Condvar)>, Vec<String>);
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let mut held = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        for t in &self.1 {
+            held.remove(t);
+        }
+        self.0 .1.notify_all();
+    }
 }
 
 /// A repo's landing queue: landings append to the line in turn, first come, first served.
@@ -132,12 +159,18 @@ pub fn saves_text(saves: &[Save]) -> String {
     out.join("\n")
 }
 
+/// What a land answer says of files left with markers. Both sides are work to keep: a small model
+/// told only "settle them" deletes one side with sed and loses a teammate's change (29/10 bench).
+pub fn keep_both(files: &[String]) -> String {
+    format!("in {}, both sides of every conflict are teammates' work to keep: never delete a side. `<<<<<<< ours` is this task's change, `>>>>>>> theirs` what landed on the line meanwhile, `||||||| original` what both started from: write one version holding both changes, without the markers, then land again", files.join(", "))
+}
+
 impl Engine {
     pub fn open(data: &Path) -> Result<Self> {
         std::fs::create_dir_all(data)?;
         // trame.sqlite: a server started before AVP was named AVP keeps its database.
         let db = if !data.join("avp.sqlite").exists() && data.join("trame.sqlite").exists() { data.join("trame.sqlite") } else { data.join("avp.sqlite") };
-        let engine = Self { db: Arc::new(Mutex::new(Db::open(&db)?)), objects: Objects::open(&data.join("objects"))?, data: data.to_path_buf(), task_locks: Arc::default(), cloud: Arc::default(), land_queues: Arc::default() };
+        let engine = Self { db: Arc::new(Mutex::new(Db::open(&db)?)), objects: Objects::open(&data.join("objects"))?, data: data.to_path_buf(), task_locks: Arc::default(), cloud: Arc::default(), land_queues: Arc::default(), waits: Arc::default(), landing: Arc::default() };
         crate::seam::opened(&engine);
         Ok(engine)
     }
@@ -355,7 +388,8 @@ impl Engine {
         let db = self.db();
         let task = db.task(task_id)?;
         let head = db.head(&task.repo)?.map(|h| h.position).unwrap_or(-1);
-        let status = TaskStatus { writes: db.writes(task_id)?, leases: db.leases_of(task_id)?, last_proof: db.last_proof(task_id)?, approval: db.approval(task_id)?, task, head_position: head, stack: None };
+        let with = Self::landed_with(&db, &task)?;
+        let status = TaskStatus { writes: db.writes(task_id)?, leases: db.leases_of(task_id)?, last_proof: db.last_proof(task_id)?, approval: db.approval(task_id)?, task, head_position: head, stack: None, with };
         drop(db);
         let stack = if status.task.state == TaskState::Open { self.stack_word(&status.task)? } else { None };
         Ok(TaskStatus { stack, ..status })
@@ -893,7 +927,7 @@ impl Engine {
         } else if speculative {
             anyhow::bail!("unsettled conflicts: nothing to prove yet");
         } else {
-            vec![Step { name: "conflicts".into(), command: String::new(), exit: 1, seconds: 0.0, output: format!("unsettled conflicts in:\n{}", conflicts.join("\n")) }]
+            vec![Step { name: "conflicts".into(), command: String::new(), exit: 1, seconds: 0.0, output: format!("unsettled conflicts in:\n{}\n{}", conflicts.join("\n"), keep_both(&conflicts)) }]
         };
         anyhow::ensure!(!steps.iter().any(|s| s.exit == crate::check::CANCELLED), "cancelled: the task's files changed, a newer tree is being proven");
         let red = steps.iter().any(|s| s.exit != 0);
@@ -1063,7 +1097,21 @@ impl Engine {
     }
 
     pub fn land(&self, task_id: &str) -> Result<LandOutcome> {
+        // A landing of it with others that runs now goes first: it may land it.
+        let _held = self.hold(&[task_id.to_string()]);
         self.land_in_turn(task_id, None)
+    }
+
+    /// Waits until no landing holds any of `tasks`, then holds them until dropped: two agents told
+    /// the same cycle both land it together, and the second finds it landed.
+    fn hold(&self, tasks: &[String]) -> Holding {
+        let (held, freed) = &*self.landing;
+        let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        while tasks.iter().any(|t| h.contains(t)) {
+            h = freed.wait(h).unwrap_or_else(|e| e.into_inner());
+        }
+        h.extend(tasks.iter().cloned());
+        Holding(self.landing.clone(), tasks.to_vec())
     }
 
     /// `turn`: the repo's landing turn, when the task already holds it.
@@ -1071,7 +1119,13 @@ impl Engine {
     fn already_landed(db: &Db, t: &Task) -> Result<Option<LandOutcome>> {
         let (TaskState::Landed, Some(position)) = (t.state, t.landed_position) else { return Ok(None) };
         let e = db.line_at(&t.repo, position)?;
-        Ok(Some(LandOutcome::Landed(Landed { position, tree: e.tree, proof: e.proof.unwrap_or_default(), replayed: false, stack: vec![] })))
+        Ok(Some(LandOutcome::Landed(Landed { position, tree: e.tree, proof: e.proof.unwrap_or_default(), replayed: false, stack: vec![], with: Self::landed_with(db, t)? })))
+    }
+
+    /// The other tasks a landed task landed with, at its position (`avp land --with`).
+    fn landed_with(db: &Db, t: &Task) -> Result<Vec<String>> {
+        let (TaskState::Landed, Some(position)) = (t.state, t.landed_position) else { return Ok(vec![]) };
+        Ok(db.landed_at(&t.repo, position)?.into_iter().map(|o| o.id).filter(|o| *o != t.id).collect())
     }
 
     /// Lands a stack (`avp land --stack`): the open tasks this one is stacked on, the bottom one
@@ -1133,7 +1187,8 @@ impl Engine {
             let conflicts = self.replay(&task, &writes, &head)?;
             replayed = true;
             if !conflicts.is_empty() {
-                return Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: "conflict".into(), conflicts, proof: None, waits_for: vec![], word: None, note: None, stack: vec![] }));
+                let note = Some(keep_both(&conflicts));
+                return Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: "conflict".into(), conflicts, proof: None, waits_for: vec![], word: None, note, stack: vec![] }));
             }
         }
         let task = self.db().task(task_id)?;
@@ -1211,7 +1266,290 @@ impl Engine {
             entry
         };
         crate::seam::after_landing(self, &task, entry.position, &candidate_hash);
-        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: candidate_hash, proof: proof.id, replayed, stack: vec![] }))
+        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: candidate_hash, proof: proof.id, replayed, stack: vec![], with: vec![] }))
+    }
+
+    // ---- tasks that need each other ----
+
+    /// An open task's `avp wait`, each time it looks: what it waits on (the tasks `tasks` names, ids
+    /// or the start of one, and the open tasks holding or writing `paths`) is remembered a few
+    /// seconds. The answer says what waiting will not bring: the tasks it waits on need it in turn,
+    /// at any length (A waits on B, B on C, C on A), so none of them lands alone; or it landed
+    /// meanwhile, with others. 29/10 bench: two agents whose tests needed each other's section each
+    /// waited on the other, and nothing landed in 22 minutes.
+    pub fn waiting(&self, task_id: &str, tasks: &[String], paths: &[String]) -> Result<WaitSeen> {
+        let db = self.db();
+        let task = db.task(task_id)?;
+        if task.state == TaskState::Landed {
+            return Ok(WaitSeen { landed: task.landed_position, with: Self::landed_with(&db, &task)?, ..Default::default() });
+        }
+        anyhow::ensure!(task.state == TaskState::Open, "task is {:?}", task.state);
+        let open: BTreeSet<String> = db.tasks(&task.repo, Some(TaskState::Open))?.into_iter().map(|t| t.id).collect();
+        // A start of an id names the first open task it starts, as the wait reads it.
+        let mut on: BTreeSet<String> = tasks.iter().filter(|w| !w.is_empty()).filter_map(|w| open.iter().find(|t| **t != task.id && t.starts_with(w.as_str())).cloned()).collect();
+        for p in paths {
+            on.extend(self.holder(&db, &task.repo, p, task_id)?);
+            on.extend(db.writers(&task.repo, p)?);
+        }
+        on.retain(|t| *t != task.id && open.contains(t));
+        let waits: HashMap<String, BTreeSet<String>> = {
+            let mut w = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+            let now = now_ms();
+            w.retain(|_, x| x.until > now);
+            w.insert(task.id.clone(), Waiting { on, until: now + WAIT_SEEN_MS });
+            w.iter().filter(|(t, _)| open.contains(*t)).map(|(t, x)| (t.clone(), x.on.clone())).collect()
+        };
+        if self.landing.0.lock().unwrap_or_else(|e| e.into_inner()).contains(task_id) {
+            return Ok(WaitSeen { landing: true, ..Default::default() });
+        }
+        let cycle = Self::cycle_from(&db, &task.id, &open, &waits)?;
+        Ok(WaitSeen { cycle: cycle.iter().map(|(t, _)| t.clone()).collect(), needs: cycle.into_iter().map(|(_, n)| n).collect(), ..Default::default() })
+    }
+
+    /// The shortest cycle of needs through `start`, each task with how it needs the next, or none.
+    /// A task needs what its running wait waits on and, while its last proof is not green, whoever
+    /// holds a file that proof fails on.
+    fn cycle_from(db: &Db, start: &str, open: &BTreeSet<String>, waits: &HashMap<String, BTreeSet<String>>) -> Result<Vec<(String, String)>> {
+        let needs = |x: &str| -> Result<Vec<(String, String)>> {
+            let mut out: Vec<(String, String)> = waits.get(x).into_iter().flatten().map(|y| (y.clone(), format!("{x} waits for {y}"))).collect();
+            if let Some(p) = db.last_proof(x)?.filter(|p| p.verdict != Verdict::Green) {
+                for (f, h) in p.blamed {
+                    if let Some(h) = h.filter(|h| !out.iter().any(|(y, _)| y == h)) {
+                        out.push((h.clone(), format!("{x} is red on {f}, which {h} holds")));
+                    }
+                }
+            }
+            out.retain(|(y, _)| y != x && open.contains(y));
+            Ok(out)
+        };
+        // Breadth first: the shortest cycle is the fewest tasks to land together.
+        let mut came: HashMap<String, (String, String)> = HashMap::new();
+        let mut next = std::collections::VecDeque::from([start.to_string()]);
+        while let Some(x) = next.pop_front() {
+            for (y, how) in needs(&x)? {
+                if y == start {
+                    let mut cycle = vec![(x.clone(), how)];
+                    let mut at = x.clone();
+                    while at != start {
+                        let (from, how) = came[&at].clone();
+                        cycle.push((from.clone(), how));
+                        at = from;
+                    }
+                    cycle.reverse();
+                    return Ok(cycle);
+                }
+                if !came.contains_key(&y) {
+                    came.insert(y.clone(), (x.clone(), how));
+                    next.push_back(y);
+                }
+            }
+        }
+        Ok(vec![])
+    }
+
+    /// Lands this task together with other open tasks (`avp land --with`, `with` their ids or the
+    /// start of one): tasks that need each other, red each alone. `--stack` was no way out: it lands
+    /// the bottom task first, alone, red. Each task's change, and those of the open tasks it is
+    /// stacked on, are merged on the head and proven as one candidate; green, they land as one
+    /// position, each task landed at it. A conflict or a red: nothing lands, nothing of any task
+    /// changes, and the answer says whose files are at fault.
+    pub fn land_with(&self, task_id: &str, with: &[String]) -> Result<LandOutcome> {
+        let ids = {
+            let db = self.db();
+            let lead = db.task(task_id)?;
+            let all = db.tasks(&lead.repo, None)?;
+            let mut asked = vec![lead];
+            for w in with {
+                let found: Vec<&Task> = all.iter().filter(|t| t.id == *w || (w.len() >= 6 && t.id.starts_with(w.as_str()))).collect();
+                match found.as_slice() {
+                    [t] => asked.push((*t).clone()),
+                    [] => anyhow::bail!("no task {w} on this repo: `avp tasks` lists the open ones"),
+                    _ => anyhow::bail!("{w} starts {} tasks: give more of the id", found.len()),
+                }
+            }
+            // A task lands with its stack: the open tasks under it first, the bottom one first.
+            let mut ids: Vec<String> = Vec::new();
+            for t in asked {
+                let mut below: Vec<String> = Self::open_below(&db, &t)?.into_iter().map(|b| b.id).collect();
+                below.reverse();
+                for id in below.into_iter().chain([t.id]) {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids
+        };
+        let _held = self.hold(&ids);
+        self.land_together(task_id, &ids, None)
+    }
+
+    /// `land_with` once its tasks are held. `turn`: the repo's landing turn, when it holds it already.
+    fn land_together(&self, lead: &str, ids: &[String], turn: Option<Turn>) -> Result<LandOutcome> {
+        let (tasks, head) = {
+            let db = self.db();
+            let t = db.task(lead)?;
+            // Landed already: the other agent of the cycle landed them together a moment ago.
+            if let Some(landed) = Self::already_landed(&db, &t)? {
+                return Ok(landed);
+            }
+            anyhow::ensure!(t.state == TaskState::Open, "task is {:?}", t.state);
+            let mut tasks = Vec::new();
+            for id in ids {
+                let o = db.task(id)?;
+                match o.state {
+                    TaskState::Open => tasks.push((o, db.writes(id)?)),
+                    // Landed since: the head holds its work.
+                    TaskState::Landed => {}
+                    TaskState::Abandoned => anyhow::bail!("task {id} was abandoned: its work is gone. Land without it"),
+                }
+            }
+            (tasks, db.head(&t.repo)?.ok_or_else(|| anyhow!("no line"))?)
+        };
+        if tasks.len() == 1 {
+            return self.land_in_turn(lead, turn);
+        }
+        let not_landed = |reason: &str, note: String, conflicts: Vec<String>, proof: Option<Proof>, waits_for: Vec<String>| -> Result<LandOutcome> {
+            Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: reason.into(), word: None, conflicts, proof, waits_for, note: Some(note), stack: vec![] }))
+        };
+        let repo = tasks[0].0.repo.clone();
+        let others: Vec<String> = tasks.iter().map(|(t, _)| t.id.clone()).filter(|t| t != lead).collect();
+        // Each task's change merged on the head after those before it, three ways, as a replay
+        // merges one; in memory, so that a conflict changes nothing of any task.
+        let mut tree = self.objects.get_tree(&head.tree)?;
+        let mut by: BTreeMap<String, String> = BTreeMap::new();
+        let (mut faults, mut conflicts) = (Vec::new(), Vec::new());
+        for (t, writes) in &tasks {
+            let live = Self::effective_writes(writes);
+            if live.is_empty() {
+                return not_landed("empty", format!("task {} has no write: its agent writes or abandons it, then land together again", t.id), vec![], None, vec![]);
+            }
+            let base = self.objects.get_tree(&t.base_tree)?;
+            for (path, w) in live {
+                let mine = (w.kind != WriteKind::Delete).then(|| Entry { blob: w.blob.clone().unwrap_or_default(), mode: w.mode });
+                let (was, now) = (base.get(&path), tree.get(&path));
+                let (merged, conflict) = if w.kind == WriteKind::Conflict {
+                    (mine, true)
+                } else if was == now || mine.as_ref() == now {
+                    (mine, false)
+                } else {
+                    self.merge_entries(was, mine.as_ref(), now)?
+                };
+                if conflict {
+                    faults.push(match (w.kind, by.get(&path)) {
+                        (WriteKind::Conflict, _) => format!("task {} holds conflict markers in {path}, to settle", t.id),
+                        (_, Some(o)) => format!("tasks {o} and {} change the same lines of {path}: one of them leaves them to the other", t.id),
+                        _ => format!("the line changed the same lines of {path} as task {} since it opened: its `avp refresh` lays the markers out", t.id),
+                    });
+                    conflicts.push(path);
+                    continue;
+                }
+                match merged {
+                    Some(e) => tree.insert(path.clone(), e),
+                    None => tree.remove(&path),
+                };
+                by.insert(path, t.id.clone());
+            }
+        }
+        if !faults.is_empty() {
+            return not_landed("conflict", format!("nothing landed, no task changed: {}. Then land together again", faults.join("; ")), conflicts, None, vec![]);
+        }
+        let hash = self.objects.put_tree(&tree)?;
+        if hash == head.tree {
+            return not_landed("already", "the line already holds these changes".into(), vec![], None, vec![]);
+        }
+        let lead_task = &tasks.iter().find(|(t, _)| t.id == lead).ok_or_else(|| anyhow!("task {lead} is not open"))?.0;
+        let files: Vec<String> = by.keys().cloned().collect();
+        let proof = {
+            // Proven in the lead's folder, one proof at a time there.
+            crate::check::cancel_other(lead, &hash);
+            crate::seam::cancel_other(lead, &hash);
+            let lock = self.task_lock(lead);
+            let _one = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut known = None;
+            for (t, _) in &tasks {
+                known = known.or(self.db().last_proof(&t.id)?.filter(|p| p.verdict == Verdict::Green && p.candidate_tree == hash));
+            }
+            match known {
+                Some(p) => p,
+                None => {
+                    let steps = self.prove_task(lead_task, &tree, &hash, &files, false)?;
+                    anyhow::ensure!(!steps.iter().any(|s| s.exit == crate::check::CANCELLED), "cancelled: a newer tree of task {lead} is being proven");
+                    let red = steps.iter().any(|s| s.exit != 0);
+                    let db = self.db();
+                    let mut blamed = Vec::new();
+                    if red {
+                        let output = steps.iter().map(|s| s.output.as_str()).collect::<Vec<_>>().join("\n");
+                        for f in failed_files(&output, &tree) {
+                            // The task whose change the file holds, or else whoever holds it.
+                            let holder = match by.get(&f) {
+                                Some(t) => Some(t.clone()),
+                                None => self.holder(&db, &repo, &f, "")?,
+                            };
+                            blamed.push((f, holder));
+                        }
+                    }
+                    let outside: BTreeSet<String> = blamed.iter().filter_map(|(_, h)| h.clone()).filter(|h| !ids.contains(h)).collect();
+                    let verdict = if !red { Verdict::Green } else if !outside.is_empty() && blamed.iter().all(|(_, h)| h.as_ref().is_some_and(|h| outside.contains(h))) { Verdict::Blocked } else { Verdict::Red };
+                    let proof = Proof { id: new_id("proof"), task: Some(lead.into()), base_position: head.position, candidate_tree: hash.clone(), files: files.clone(), steps, verdict, blamed, created_at: now_ms() };
+                    db.insert_proof(&repo, &proof)?;
+                    db.emit(&repo, "proof", Some(lead), None, serde_json::json!({ "proof": proof.id, "verdict": verdict, "waits_for": outside, "with": others }))?;
+                    proof
+                }
+            }
+        };
+        // What holds a green proof back (a person's approval, in AVP Cloud), task by task.
+        for (t, writes) in &tasks {
+            if let Some(n) = crate::seam::landing_gate(self, t, writes, &tree, &proof)? {
+                let why = n.note.clone().unwrap_or_else(|| n.reason.clone());
+                return Ok(LandOutcome::NotLanded(NotLanded { note: Some(format!("task {}, of this landing: {why}", t.id)), ..n }));
+            }
+        }
+        if proof.verdict != Verdict::Green {
+            let at_fault: BTreeSet<&str> = proof.blamed.iter().filter_map(|(_, h)| h.as_deref()).filter(|h| ids.iter().any(|i| i == h)).collect();
+            let blocked = proof.verdict == Verdict::Blocked;
+            let waits: Vec<String> = if blocked { proof.blamed.iter().filter_map(|(_, h)| h.clone()).collect::<BTreeSet<_>>().into_iter().collect() } else { vec![] };
+            let note = match at_fault.is_empty() {
+                true => format!("proven together, still {}: nothing landed. `avp proof {}` says where it fails", if blocked { "blocked" } else { "red" }, proof.id),
+                false => format!("proven together, still red in the files of task {}: nothing landed. Each agent fixes its own (`avp proof {}`), then land together again", at_fault.into_iter().collect::<Vec<_>>().join(", task "), proof.id),
+            };
+            return not_landed(if blocked { "blocked" } else { "red" }, note, vec![], Some(proof), waits);
+        }
+        let turn = match turn {
+            Some(t) => t,
+            None => self.landing_turn(&repo),
+        };
+        let entry = {
+            let db = self.db();
+            let head_now = db.head(&repo)?.map(|h| h.position).unwrap_or(-1);
+            let now: Vec<Task> = tasks.iter().map(|(t, _)| db.task(&t.id)).collect::<Result<_>>()?;
+            // The line moved while they were proven, or one of them landed or went: again, holding
+            // the turn, where nothing lands before them.
+            if head_now != head.position || now.iter().any(|t| t.state != TaskState::Open) {
+                drop(db);
+                return self.land_together(lead, ids, Some(turn));
+            }
+            // The position's record names every task: this one's goal, then each other's.
+            let goal = now.iter().find(|t| t.id == lead).map(|t| t.goal.clone()).unwrap_or_default();
+            let note = std::iter::once(goal).chain(now.iter().filter(|t| t.id != lead).map(|t| format!("together with {}: {}", t.id, t.goal))).collect::<Vec<_>>().join("; ");
+            let entry = db.append_line(&repo, head.position, Some(lead), &hash, Some(&proof.id), &note)?;
+            for t in &now {
+                db.set_task_state(&t.id, TaskState::Landed, Some(entry.position))?;
+                db.release_leases(&t.id, None)?;
+            }
+            for (t, (_, writes)) in now.iter().zip(&tasks) {
+                let with: Vec<&String> = now.iter().map(|o| &o.id).filter(|o| **o != t.id).collect();
+                let files: Vec<String> = Self::effective_writes(writes).into_keys().collect();
+                self.emit_told(&db, &repo, "task.landed", Some(&t.id), serde_json::json!({ "position": entry.position, "goal": t.goal, "files": files, "proof": proof.id, "with": with }))?;
+            }
+            for t in &now {
+                Self::tell_stacked(&db, &repo, &t.id, "task.parent_landed", serde_json::json!({ "position": entry.position }))?;
+            }
+            entry
+        };
+        drop(turn);
+        crate::seam::after_landing(self, lead_task, entry.position, &hash);
+        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: hash, proof: proof.id, replayed: lead_task.base_position != head.position, stack: vec![], with: others }))
     }
 
     /// The reverts of the last day a task should hear of as it opens: those of positions that
@@ -1340,7 +1678,7 @@ impl Engine {
             position -= 1;
         }
         let entry = db.line_at(repo, position)?;
-        let task = entry.task.as_deref().map(|t| db.task(t)).transpose()?;
+        let task = Self::writer(&db, &entry, path)?;
         let proof = entry.proof.as_deref().map(|p| db.proof(p)).transpose()?.flatten();
         Ok(Why { path: path.to_string(), position, task, proof, line: None, text: None })
     }
@@ -1371,9 +1709,22 @@ impl Engine {
             position -= 1;
         }
         let entry = db.line_at(repo, position)?;
-        let task = entry.task.as_deref().map(|t| db.task(t)).transpose()?;
+        let task = Self::writer(&db, &entry, path)?;
         let proof = entry.proof.as_deref().map(|p| db.proof(p)).transpose()?.flatten();
         Ok(Why { path: path.to_string(), position, task, proof, line: Some(line), text: Some(text) })
+    }
+
+    /// The task that wrote `path` at a position: the position's task or, of the tasks landed with it
+    /// (`avp land --with`), the one whose writes hold the path.
+    fn writer(db: &Db, entry: &LineEntry, path: &str) -> Result<Option<Task>> {
+        let task = entry.task.as_deref().map(|t| db.task(t)).transpose()?;
+        let Some(t) = task.as_ref().filter(|t| t.landed_position == Some(entry.position)) else { return Ok(task) };
+        for o in Self::landed_with(db, t)? {
+            if Self::effective_writes(&db.writes(&o)?).contains_key(path) {
+                return Ok(Some(db.task(&o)?));
+            }
+        }
+        Ok(task)
     }
 
     /// Events a task should see: its own, those on paths it holds or wrote, and the line's.

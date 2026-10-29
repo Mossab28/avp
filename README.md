@@ -44,11 +44,21 @@ AVP (25 to 27 October), same team, same product in production:
 Where each number comes from, and the command that measures it again:
 [docs/CASE-MURMELL.md](docs/CASE-MURMELL.md).
 
-On [go-chi/chi](https://github.com/go-chi/chi), with agents never told about AVP: Claude Code and
-Codex used it on their own (3 of 3 each); two agents on the same function were replayed with no
-conflict, where Git needed a third agent to settle one; one agent alone costs the same as with Git
-(146 s and $0.330 against 151 s and $0.332 for three tasks). On CooperBench `flash_10`, two agents
-pass 1 task in 10 through Git and 8 in 10 through AVP.
+## The benchmark
+
+64 Codex agents build the same 112-section spec in 40 minutes, each model with Git and CI (a push
+to main runs the typecheck and every test, and is refused when they fail), then with AVP:
+
+| 64 agents, 40 minutes | Git + CI | AVP |
+|---|---|---|
+| GPT-6.1 Sol | 8 of 112, $31.58 | **all 112 in 10 minutes**, $19.77 |
+| GPT-6.1 Terra | 0 of 112, $23.99 | **77 of 112**, $13.00 |
+| GPT-5.6 Luna | 110 of 112, $7.16 | 105 of 112, **$4.28** |
+
+With Git, the big models stall: sections whose tests need each other are refused by CI one by
+one, and their agents wait for each other. AVP lands them together. At 32 agents, AVP delivers as
+much as Git and CI for 35 to 60 % less, and GitHub's merge queue does worse than both. The method,
+every number and the harness: [bench/](bench/README.md).
 
 ## How it works
 
@@ -96,7 +106,6 @@ answers that it is part of AVP Cloud, and what to do. In this repository AVP Clo
 
 - It is new. Every defect a real run found is in [docs/RUNS.md](docs/RUNS.md) with its fix.
 - A proof is not the whole suite: a break the related tests miss is caught by the next batch run.
-- With one agent on a small repository with fast tests, it saves nothing: it costs what Git costs.
 
 ## License
 

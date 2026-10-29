@@ -479,6 +479,20 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The tasks landed at a position, oldest first: one, or several landed together (`avp land --with`).
+    pub fn landed_at(&self, repo: &str, position: i64) -> Result<Vec<Task>> {
+        let mut st = self.conn.prepare(&format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ?1 AND state = 'landed' AND landed_position = ?2 ORDER BY created_at"))?;
+        let rows = st.query_map(params![repo, position], task_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The open tasks with a live write on a path: who brings it to the line, lease or not.
+    pub fn writers(&self, repo: &str, path: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT DISTINCT w.task FROM writes w JOIN tasks t ON t.id = w.task WHERE t.repo = ?1 AND t.state = 'open' AND w.path = ?2 AND w.undone = 0")?;
+        let rows = st.query_map(params![repo, path], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Stacks a task on another: it stands on that one's tree from now on.
     pub fn stack_task(&self, id: &str, on: &str, tree: &str) -> Result<()> {
         self.conn.execute("UPDATE tasks SET on_task = ?2, base_tree = ?3 WHERE id = ?1", params![id, on, tree])?;
