@@ -1,10 +1,11 @@
-//! The boundary between the free AVP and AVP Cloud. The free AVP is the tool anyone runs on their
-//! machine: a local server, tasks, proofs, the line and its history, MCP, `avp up`, the import from
-//! Git. AVP Cloud is what a team's hosted server adds (src/cloud/, built with `--features cloud`).
-//! The core calls the functions here and never names a cloud module, so the cloud's folder moves
-//! as one. Built without the feature, each one does what the free AVP does: proofs run on the
-//! server itself, nothing gates a landing, nothing follows it, the server answers this machine
-//! alone, and the cloud's routes answer that they are part of AVP Cloud.
+//! The boundary between AVP's core and what a team's server adds: proof workers, accounts and
+//! tokens, the full suite after landings, approvals and guarded paths, secrets, environments and
+//! the GitHub deploy bridge, stats, AVP Live (src/cloud/, the `cloud` feature). Every default build
+//! and every release binary carries it. The core calls the functions here and never names a cloud
+//! module, so the cloud's folder moves as one. Built without the feature (`--no-default-features`),
+//! each one does what the small avp does: proofs run on the server itself, nothing gates a
+//! landing, nothing follows it, the server answers this machine alone, and the cloud's routes
+//! answer that this avp left them out.
 
 use crate::db::Db;
 use crate::engine::Engine;
@@ -19,21 +20,21 @@ use std::path::Path;
 #[cfg(feature = "cloud")]
 use crate::cloud as side;
 #[cfg(not(feature = "cloud"))]
-use free as side;
+use small as side;
 
-/// How a free server's answer on a route of AVP Cloud ends, after what the route does: the CLI and
-/// the MCP tools know it by this, and say what to do.
-pub const CLOUD: &str = "part of AVP Cloud";
+/// How the small avp's answer on a route of the `cloud` feature ends, after what the route does: the
+/// CLI and the MCP tools know it by this, and say what to do.
+pub const CLOUD: &str = "left out of this avp: it was built without the cloud feature";
 
-/// What AVP Cloud keeps in memory beside the engine (the deploys in flight): nothing in the free AVP.
+/// What the cloud keeps in memory beside the engine (the deploys in flight): nothing in the small avp.
 pub use side::State;
 
-/// The routes AVP Cloud adds to the server's own.
+/// The routes the cloud adds to the server's own.
 pub fn routes() -> Router<Engine> {
     side::routes()
 }
 
-/// Who asks and whether they may, around every route: AVP Cloud's accounts and tokens.
+/// Who asks and whether they may, around every route: accounts and tokens.
 pub fn access(router: Router<Engine>, engine: &Engine) -> Router<Engine> {
     side::access(router, engine)
 }
@@ -44,13 +45,13 @@ pub fn may_listen(addr: &str) -> Result<()> {
     side::may_listen(addr)
 }
 
-/// What the engine resumes as it opens: AVP Cloud's deploys a restart cut.
+/// What the engine resumes as it opens: the deploys a restart cut.
 pub fn opened(engine: &Engine) {
     side::opened(engine)
 }
 
-/// What runs beside the routes once the server starts: AVP Cloud's scheduled suites, the deploys
-/// GitHub carries out.
+/// What runs beside the routes once the server starts: the scheduled suites, the deploys GitHub
+/// carries out.
 pub fn start(engine: &Engine) {
     side::start(engine)
 }
@@ -65,8 +66,8 @@ pub fn created(e: &Engine, repo: &Repo, asker: &Extensions) -> Result<()> {
     side::created(e, repo, asker)
 }
 
-/// Where a proof runs: its steps when it ran elsewhere (AVP Cloud's workers), None when this server
-/// runs it itself.
+/// Where a proof runs: its steps when it ran elsewhere (proof workers), None when this server runs
+/// it itself.
 pub fn prove_away(job: Job, speculative: bool) -> Result<Option<Vec<Step>>> {
     side::prove_away(job, speculative)
 }
@@ -82,8 +83,8 @@ pub fn cancel_tree(name: &str, tree_hash: &str) {
     side::cancel_tree(name, tree_hash)
 }
 
-/// The values of the secrets a proof's steps name, from the server's store in `data`: AVP Cloud
-/// keeps them, the free AVP keeps none (a step that names one says it is not set).
+/// The values of the secrets a proof's steps name, from the server's store in `data`: the small avp
+/// keeps none (a step that names one says it is not set).
 pub fn secret_values(data: &Path, repo: &str, names: &BTreeSet<String>) -> Result<BTreeMap<String, String>> {
     side::secret_values(data, repo, names)
 }
@@ -94,19 +95,19 @@ pub fn line_secrets(e: &Engine, task: &Task, tree: &Tree) -> Result<Option<Vec<S
     side::line_secrets(e, task, tree)
 }
 
-/// What holds back a task whose proof is done: a person's approval (AVP Cloud's landing rule and
-/// guarded paths). None: it lands when green.
+/// What holds back a task whose proof is done: a person's approval (the landing rule and guarded
+/// paths). None: it lands when green.
 pub fn landing_gate(e: &Engine, task: &Task, writes: &[Write], candidate: &Tree, proof: &Proof) -> Result<Option<NotLanded>> {
     side::landing_gate(e, task, writes, candidate, proof)
 }
 
-/// What follows a landing at `position`: AVP Cloud's full suite, and the environments that follow it.
+/// What follows a landing at `position`: the full suite, and the environments that follow it.
 pub fn after_landing(e: &Engine, task: &Task, position: i64, tree_hash: &str) {
     side::after_landing(e, task, position, tree_hash)
 }
 
 #[cfg(not(feature = "cloud"))]
-mod free {
+mod small {
     use super::*;
     use axum::http::StatusCode;
     use axum::routing::{any, MethodRouter};
@@ -115,7 +116,7 @@ mod free {
     #[derive(Default)]
     pub struct State;
 
-    /// A route of AVP Cloud, as the free server answers it: 404, and what it is.
+    /// A route of the cloud, as the small avp answers it: 404, and what it is.
     fn cloud(what: &'static str) -> MethodRouter<Engine> {
         any(move || async move { (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("{what} {CLOUD}") }))) })
     }
@@ -155,8 +156,9 @@ mod free {
 
     pub(super) fn may_listen(addr: &str) -> Result<()> {
         anyhow::bail!(
-            "{addr} is reachable from other machines, and the free AVP checks nobody who asks (accounts and tokens are {CLOUD}): \
-             listen on 127.0.0.1, or set AVP_INSECURE=1 if this network is yours alone"
+            "{addr} is reachable from other machines, and this avp checks nobody who asks (accounts and tokens are {CLOUD}): \
+             run the release binaries (install.sh) or a default `cargo build`, which check AVP_TOKEN, listen on 127.0.0.1, \
+             or set AVP_INSECURE=1 if this network is yours alone"
         )
     }
 
@@ -164,7 +166,7 @@ mod free {
 
     pub(super) fn start(_: &Engine) {
         if std::env::var("AVP_TOKEN").is_ok_and(|t| !t.is_empty()) {
-            eprintln!("AVP_TOKEN is not checked here: accounts and tokens are {CLOUD}, and this server answers its own machine");
+            eprintln!("AVP_TOKEN is not checked here: accounts and tokens are {CLOUD}, and this server answers its own machine (the release binaries check it)");
         }
     }
 

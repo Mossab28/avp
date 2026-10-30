@@ -1,12 +1,13 @@
 #!/bin/bash
 # The end-to-end tests CI runs (deploy/Dockerfile, stage test): each prints PASS/FAIL per check;
 # any FAIL, or a test that printed no PASS, fails the build. Usage: AVP=<binary> bash tests/ci.sh
-# They run AVP Cloud's features too (workers, approvals, environments...): a free binary, built
-# without `--features cloud`, is built again with it from this checkout.
+# They run the cloud feature too (workers, approvals, environments...): a binary built without it
+# (`--no-default-features`) is built again with it from this checkout.
 set -u
 T=${AVP:?AVP=<avp binary>}
 D=$(cd "$(dirname "$0")" && pwd)
-if ! "$T" --version 2>/dev/null | grep -q "AVP Cloud"; then
+v=$("$T" --version 2>/dev/null)
+if [ -z "$v" ] || [[ $v == *"without the cloud feature"* ]]; then
   (cd "$D/.." && cargo build --profile proof --locked --features cloud) >&2 || exit 1
   T=${CARGO_TARGET_DIR:-$D/../target}/proof/avp
 fi

@@ -1,5 +1,5 @@
-//! The free AVP, built without `--features cloud`: a route of AVP Cloud answers 404 with what it
-//! is, and the CLI's client says what to do; nothing gates a landing, nothing follows it.
+//! The small avp, built with `--no-default-features`: a route of the cloud feature answers 404 with
+//! what it is, and the CLI's client says what to do; nothing gates a landing, nothing follows it.
 #![cfg(not(feature = "cloud"))]
 
 use avp::client::Client;
@@ -7,7 +7,7 @@ use avp::engine::{Engine, LandOutcome};
 use avp::model::*;
 
 #[test]
-fn a_route_of_avp_cloud_says_so_and_what_to_do() {
+fn a_route_this_build_left_out_says_so_and_what_to_do() {
     let dir = std::env::temp_dir().join(format!("avp-test-{}", ulid::Ulid::new()));
     let e = Engine::open(&dir).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -17,13 +17,13 @@ fn a_route_of_avp_cloud_says_so_and_what_to_do() {
 
     let r = reqwest::blocking::Client::new().post(format!("{base}/work/claim")).json(&serde_json::json!({ "wait_s": 1 })).send().unwrap();
     assert_eq!(r.status().as_u16(), 404);
-    assert_eq!(r.json::<serde_json::Value>().unwrap()["error"], "proof workers are part of AVP Cloud");
+    assert_eq!(r.json::<serde_json::Value>().unwrap()["error"], "proof workers are left out of this avp: it was built without the cloud feature");
 
     let err = Client::new(&base).get::<serde_json::Value>("/drain").unwrap_err();
     assert!(avp::client::cloud_only(&err), "{err:#}");
-    assert!(format!("{err:#}").contains("point AVP_SERVER at yours"), "{err:#}");
+    assert!(format!("{err:#}").contains("the release binaries (install.sh)"), "{err:#}");
     let err = Client::new(&base).post::<serde_json::Value>("/repos/app/envs/production", &serde_json::json!({})).unwrap_err();
-    assert!(format!("{err:#}").starts_with("environments are part of AVP Cloud"), "{err:#}");
+    assert!(format!("{err:#}").starts_with("environments are left out of this avp"), "{err:#}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -1,9 +1,10 @@
 //! `avp worker`: the worker's side of proof workers, a client of the API as any verb is. A server
-//! of AVP Cloud started with AVP_WORKERS=1 does not run a proof itself: it queues the candidate, a
-//! `avp worker` (any machine that reaches the server) claims it, lays it out with the same code,
-//! runs the same steps and sends the steps back. What a step leaves beside its output (its whole
-//! log, its artifacts) goes back with the steps. The queue is the server's (src/cloud/workers.rs);
-//! a free server answers that workers are part of AVP Cloud, and the worker stops there.
+//! started with AVP_WORKERS=1 does not run a proof itself: it queues the candidate, a `avp worker`
+//! (any machine that reaches the server: your own runners) claims it, lays it out with the same
+//! code, runs the same steps and sends the steps back. What a step leaves beside its output (its
+//! whole log, its artifacts) goes back with the steps. The queue is the server's
+//! (src/cloud/workers.rs); a server built without the cloud feature answers that workers are left
+//! out of it, and the worker stops there.
 
 use crate::check::{Kept, KeptStep, Workspace};
 use crate::client::Client;
@@ -59,7 +60,7 @@ pub fn work(client: &Client, data: &Path) -> Result<()> {
         }
         let claimed: Option<Claimed> = match client.post_maybe("/work/claim", &serde_json::json!({ "wait_s": 25, "parts": true })) {
             Ok(j) => j,
-            // A free server has no queue: claiming again will not make one.
+            // A server built without the cloud has no queue: claiming again will not make one.
             Err(e) if crate::client::cloud_only(&e) => return Err(e),
             Err(e) => {
                 eprintln!("claim: {e:#}");

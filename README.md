@@ -3,6 +3,9 @@
 **Version control that replaces Git for coding agents.** Built at [Murmell](https://murmell.com),
 where it runs our own repository.
 
+Free for any use, at work too: on your machines, your team's server and your own runners, with
+all of AVP in every build. The one thing reserved is offering it to others as a hosted service.
+
 Why we built it, with the numbers and a diagram:
 [AVP, version control that replaces Git for coding agents](https://murmell.com/blog/agents-outgrew-pull-requests).
 
@@ -20,7 +23,8 @@ macOS and Linux, x86_64 and arm64; on Windows, inside WSL. Then ask your coding 
 in that folder: `avp up` wires each one it finds (Claude Code, Codex, Cursor, Gemini CLI, GitHub
 Copilot, OpenCode, Qwen Code, Kiro, Zed, Amp, Windsurf, Cline, Aider), `avp agents` says which.
 Nothing to tell the agent: it finds AVP through the MCP server and one rule in `AGENTS.md` (or the
-file it reads). A team shares one server, AVP Cloud's: see [AVP and AVP Cloud](#avp-and-avp-cloud).
+file it reads). A team shares one server, on a machine of its own or hosted by us: see
+[AVP and AVP Cloud](#avp-and-avp-cloud).
 
 New to AVP? [Your first 15 minutes](docs/QUICKSTART.md) goes from install to two agents on one
 file, with the output of each command. [The concepts](docs/CONCEPTS.md) say the words (line,
@@ -69,8 +73,8 @@ every number and the harness: [bench/](bench/README.md).
   the proof runs (typecheck and the tests related to the task), and only green lands. If the line
   moved, the task is replayed on the new head first.
 - The proof starts while the agent is still running its own tests, so landing rarely waits.
-- On AVP Cloud, the whole suite runs once per batch of landings. Staging can follow a green suite,
-  and production is `avp promote production`.
+- The whole suite runs once per batch of landings, on the server or on your own runners
+  (`avp worker`). Staging can follow a green suite, and production is `avp promote production`.
 - For people, the history stays readable: every position is a Git commit on `avp/line` (goal, author,
   agent, proof), `avp show <position>` prints what it changed and why, `avp why <file>:<line>` which
   task wrote that line, its goal, its agent, its proof and the agent's conversation, and
@@ -87,20 +91,14 @@ each does best. Releases, hotfixes and long-lived branches:
 
 ## AVP and AVP Cloud
 
-AVP is the free tool anyone runs on their machine, as Git is: a local server (`avp up`), tasks,
-proofs, the line and its history (`log`, `show`, `why`, `blame`, `revert`, `bisect`), the mirror to
-Git, the MCP server for every agent, the import from Git and from a CI. `cargo build` and the
-release binaries are this AVP; its server answers its own machine, on 127.0.0.1.
+AVP is all of it, in every build and in this source: tasks, proofs, the line and its history, the
+mirror to Git, the MCP server for every agent, the imports from Git and from a CI, and what a
+team's server adds: proof workers on your own runners, accounts and tokens, the full suite after
+landings, approvals and guarded paths, secrets for tests, environments and the GitHub deploy
+bridge, stats, AVP Live. `cargo build` and the release binaries carry everything; a team runs its
+server with `avp serve` and a token ([A team server](docs/GUIDE.md#a-team-server)).
 
-AVP Cloud is the hosted server a team pays for, as GitHub is: what only makes sense on a team's
-server. Proof workers; the full suite after each landing, its flaky reruns, the reverts it makes
-and the scheduled suites; a person in the loop (approvals, the landing rule, guarded paths);
-secrets for tests; environments, with promotions, rollbacks and the GitHub deploy bridge; stats and
-the before and after; AVP Live; a team's accounts and tokens.
-
-The CLI keeps every verb, as `gh` speaks to GitHub: on a free server, `avp promote` or `avp approve`
-answers that it is part of AVP Cloud, and what to do. In this repository AVP Cloud's code sits in
-`src/cloud/`, behind one seam (`src/seam.rs`), and builds with `cargo build --features cloud`.
+AVP Cloud is the same AVP, hosted: we run the server, its storage and the runners for a team.
 
 ## Limits
 
@@ -109,7 +107,7 @@ answers that it is part of AVP Cloud, and what to do. In this repository AVP Clo
 
 ## License
 
-Copyright (C) 2026 IntrudR. [Elastic License 2.0](LICENSE): you may use, change and run AVP for
-yourself and your team; you may not offer it to others as a hosted or managed service, or work
-around its license keys. Releases up to and including 0.5.0 were published under the AGPL-3.0.
-Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).
+Copyright (C) 2026 IntrudR. [Elastic License 2.0](LICENSE): free to use, change and run for any
+purpose, commercial included, on your machines, your team's server and your runners. The one thing
+it reserves: offering AVP to others as a hosted or managed service. Releases up to and including
+0.5.0 were published under the AGPL-3.0. Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).

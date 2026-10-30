@@ -3,7 +3,7 @@
 
 use avp::model::now_ms;
 
-/// The numbers as AVP Cloud's server reads them back from its database.
+/// The numbers as the server reads them back from its database.
 #[cfg(feature = "cloud")]
 mod line {
     use avp::engine::{Engine, LandOutcome};

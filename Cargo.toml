@@ -1,6 +1,6 @@
 [package]
 name = "avp"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "AVP, agent versioning protocol: version control for agents. A server that holds the truth, tasks instead of branches, proofs instead of CI."
 license = "Elastic-2.0"
@@ -10,8 +10,11 @@ name = "avp"
 path = "src/main.rs"
 
 [features]
-# AVP Cloud (src/cloud/): what a team's hosted server adds. Off, `cargo build` and the release
-# binaries give the free AVP; the server image builds with it (deploy/Dockerfile).
+# Every build carries all of AVP: `cloud` (src/cloud/) is what a team's server adds (workers,
+# accounts and tokens, the full suite, approvals, secrets, environments, stats, AVP Live), and it
+# is on by default, in `cargo build` and the release binaries. `--no-default-features` builds the
+# small avp without it.
+default = ["cloud"]
 cloud = ["dep:chacha20poly1305"]
 
 [dependencies]

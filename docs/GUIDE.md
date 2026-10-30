@@ -8,17 +8,14 @@ What the README leaves out: the checks, the environments, a person in the loop, 
 
 ## AVP and AVP Cloud
 
-The free AVP is the tool one person runs on their machine: its server (`avp up`, `avp serve`)
-answers 127.0.0.1 alone (`AVP_INSECURE=1` when the network is yours alone), proves every task
-itself, and lands it once green. The proof steps, the history verbs, the mirror to Git, offline,
-the MCP tools and `avp import-ci` are all there.
+Every build of AVP carries all of it, the release binaries and `cargo build` alike, free for any
+use, at work too. On one machine, its server (`avp up`, `avp serve`) answers 127.0.0.1; shared by
+a team on a machine of yours ([A team server](#a-team-server)), it checks who asks. Either way it
+has what a team leans on, each in its section:
 
-AVP Cloud is a team's hosted server. What only makes sense there is its own, and so are the
-sections of this guide that say so:
-
-| AVP Cloud | Here |
+| What a team leans on | Here |
 |---|---|
-| Proof workers (`avp worker`, `AVP_WORKERS=1`) and the drain before an update | [Your checks, your environments](#your-checks-your-environments) |
+| Proof workers on your own runners (`avp worker`, `AVP_WORKERS=1`) and the drain before an update | [Your checks, your environments](#your-checks-your-environments), [A team server](#a-team-server) |
 | The full suite after each landing, its flaky reruns and reverts, `avp full` | [Your checks, your environments](#your-checks-your-environments), [Scheduled suites](#scheduled-suites) |
 | Environments: `avp envs`, `avp promote`, `avp rollback`, deploys, the GitHub bridge | [Your checks, your environments](#your-checks-your-environments), [Rollback](#rollback) |
 | A person in the loop: `avp approve`, `avp refuse`, `avp landing`, `avp guard` | [A person in the loop](#a-person-in-the-loop) |
@@ -26,11 +23,14 @@ sections of this guide that say so:
 | `avp stats` and the before and after, AVP Live | [Measure it](#measure-it) |
 | Accounts and tokens: `avp user`, `avp token`, `avp whoami` | [A team server](#a-team-server) |
 
-The CLI and the MCP tools keep every verb: on a free server, a verb of AVP Cloud answers
-`<what> is part of AVP Cloud`, with what to do (`AVP_SERVER` pointed at the team's server). What
-avp.toml says of them (`[envs]`, `full`, `[[check.schedule]]`, `secrets`) reads on both: a free
-server leaves it be. Without them, a free server's task that changes avp.toml lands on its own
-proof, as any other.
+AVP Cloud is the same AVP, hosted: we run the server, its storage and the runners for a team.
+Nothing in this guide needs it. Offering AVP to others that way is the one thing the license
+reserves.
+
+An avp built with `--no-default-features` is the small one, without the `cloud` feature (src/cloud/):
+a verb of the table answers `<what> is left out of this avp: it was built without the cloud
+feature`, and what avp.toml says of them (`[envs]`, `full`, `[[check.schedule]]`, `secrets`) is left
+be. Run the release binaries, or a default `cargo build`, as the server.
 
 ## Your checks, your environments
 
@@ -578,7 +578,22 @@ each commit, its task and what became of it; `avp import-git` exits 2 when one i
 
 ## A team server
 
-A team server is AVP Cloud's (see [AVP and AVP Cloud](#avp-and-avp-cloud)). Everyone runs `avp up` in their own checkout with `AVP_SERVER` set to the team's server, a plain
+A team server is the same avp on a machine the team reaches, with a key, and workers on your own
+runners when one machine is not enough:
+
+```sh
+export AVP_TOKEN=$(openssl rand -hex 20)   # the server's key: without it, it listens on 127.0.0.1 alone
+AVP_WORKERS=1 avp serve --listen 0.0.0.0:7117 --data /srv/avp   # a proxy in front gives it TLS
+AVP_SERVER=https://avp.example.com AVP_TOKEN=... avp worker      # on each runner, one per proof at once
+```
+
+A worker is any machine with the project's tools that reaches the server: it claims a proof or a
+shard of the full suite, runs its steps with the same code the server would, and sends them back;
+one no worker claims in time, the server runs itself. Without `AVP_WORKERS=1` the server proves
+everything itself. Give workers the server's `AVP_TOKEN` or an admin's own (below): a job carries
+the secrets its steps name.
+
+Everyone runs `avp up` in their own checkout with `AVP_SERVER` set to the team's server, a plain
 address, and the secret in `AVP_TOKEN`: their own token on a server with accounts (below), or the
 server's one token with their name in `AVP_USER` (or `AVP_PERSON`). The client sends them as a
 header, so the secret never sits in a URL that ends up in configs and logs. A name and password in

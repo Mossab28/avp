@@ -6,8 +6,8 @@ use avp::model::*;
 use avp::offline::{self, Op};
 use avp::{engine, gitbridge, mcp, server, up, view};
 
-/// What `avp --version` says: an AVP Cloud build says so (tests/ci.sh needs one).
-const VERSION: &str = if cfg!(feature = "cloud") { concat!(env!("CARGO_PKG_VERSION"), " (AVP Cloud)") } else { env!("CARGO_PKG_VERSION") };
+/// What `avp --version` says: a build without the cloud feature says so (tests/ci.sh needs one with it).
+const VERSION: &str = if cfg!(feature = "cloud") { env!("CARGO_PKG_VERSION") } else { concat!(env!("CARGO_PKG_VERSION"), " (without the cloud feature)") };
 
 /// Version control for agents: open, write, check, land.
 #[derive(Parser)]
@@ -834,7 +834,8 @@ fn update(client: &Client) -> Result<()> {
     std::fs::write(&new, bytes)?;
     #[cfg(unix)]
     std::fs::set_permissions(&new, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-    let answers = std::process::Command::new(&new).arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).trim() == format!("avp {want}"));
+    // The version alone: a build without the cloud feature says so after it.
+    let answers = std::process::Command::new(&new).arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().take(2).eq(["avp", want.as_str()]));
     if !answers.unwrap_or(false) {
         let _ = std::fs::remove_file(&new);
         anyhow::bail!("the server's binary does not answer avp {want}: this one stays");

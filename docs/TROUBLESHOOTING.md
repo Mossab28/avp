@@ -327,6 +327,19 @@ unless something checks who asks.
 `127.0.0.1` behind a proxy that authenticates and sets `X-Avp-User`. `AVP_INSECURE=1` only when the
 network is yours alone.
 
+### A verb answers `... is left out of this avp`
+
+**What you see.** `avp approve`, `avp promote`, `avp worker` or AVP Live answer `environments are
+left out of this avp: it was built without the cloud feature`, or, from a server of 0.5.2 and
+before, `environments are part of AVP Cloud`.
+
+**Why.** The server runs an avp built without the `cloud` feature: `--no-default-features`, or a
+release from before every build carried all of AVP.
+
+**The fix.** Run the release binaries (`install.sh`) or a default `cargo build` as the server, then
+restart it: on your machine `avp down` and `avp up`, which starts the local server on the new
+binary.
+
 ### `avp land` is cut after about four minutes
 
 **What you see.** A landing from a laptop, through a load balancer, ends after 271 s with the

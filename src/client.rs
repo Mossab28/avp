@@ -41,20 +41,23 @@ pub fn unreachable(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Unreachable>() || c.downcast_ref::<reqwest::Error>().is_some_and(|r| !r.is_builder() && !r.is_status()))
 }
 
-/// What a free server answers on a route of AVP Cloud (`<what> is part of AVP Cloud`), said with
-/// what to do: the verb is AVP Cloud's, a team's hosted server.
+/// What a server built without the cloud feature answers on one of its routes (`<what> is left out
+/// of this avp`), said with what to do: run a build that carries it.
 #[derive(Debug)]
 pub struct CloudOnly(pub String);
 
 impl std::fmt::Display for CloudOnly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}\n  this server is the free AVP: AVP Cloud is a team's hosted server, point AVP_SERVER at yours for this", self.0)
+        write!(f, "{}\n  the release binaries (install.sh) and a default `cargo build` carry it: run one of them as the server", self.0)
     }
 }
 
 impl std::error::Error for CloudOnly {}
 
-/// Whether `e` is a free server saying the verb is AVP Cloud's: asking again will not change it.
+/// How a server from before every build carried the cloud said the same.
+const CLOUD_BEFORE: &str = "part of AVP Cloud";
+
+/// Whether `e` is a server built without the verb's feature: asking again will not change it.
 pub fn cloud_only(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<CloudOnly>())
 }
@@ -64,7 +67,7 @@ fn refused(status: impl std::fmt::Display + Into<u16>, msg: String) -> anyhow::E
     let shown = status.to_string();
     match status.into() {
         502..=504 => Unreachable(format!("{shown}: {msg}")).into(),
-        404 if msg.ends_with(crate::seam::CLOUD) => CloudOnly(msg).into(),
+        404 if msg.ends_with(crate::seam::CLOUD) || msg.ends_with(CLOUD_BEFORE) => CloudOnly(msg).into(),
         _ => anyhow!("{shown}: {msg}"),
     }
 }

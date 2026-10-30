@@ -379,7 +379,7 @@ async fn agents(State(e): S, P(repo): P<String>) -> R {
 }
 
 /// The person the request is known to come from (`X-Avp-User`): the one whose token it carries on a
-/// server with accounts (AVP Cloud's gate sets it), or the one the proxy in front authenticated (Caddy's
+/// server with accounts (the gate of src/cloud/auth.rs sets it), or the one the proxy in front authenticated (Caddy's
 /// basic auth), never taken from the client. It wins over the person a client declares, so a task,
 /// an approval and a promotion carry who really sent them.
 pub(crate) fn verified_person(h: &HeaderMap) -> Option<String> {
@@ -818,7 +818,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/repos/{repo}/proofs/{id}/artifacts", get(proof_artifacts))
         .merge(crate::seam::routes())
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024));
-    // Who asks and whether they may, for every route: AVP Cloud's accounts and tokens.
+    // Who asks and whether they may, for every route: accounts and tokens.
     crate::seam::access(router, &engine).with_state(engine)
 }
 
@@ -831,7 +831,7 @@ pub async fn serve(engine: Engine, addr: &str) -> anyhow::Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("avp serving on http://{addr}  data: {}", engine.data.display());
-    // What runs beside the routes: AVP Cloud's scheduled suites, deploys and GitHub bridge.
+    // What runs beside the routes: the scheduled suites, deploys and GitHub bridge.
     crate::seam::start(&engine);
     // `[git]` of avp.toml: the server reaches itself on loopback, whatever address it listens on.
     let mut local = listener.local_addr()?;
