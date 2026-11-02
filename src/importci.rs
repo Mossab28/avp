@@ -49,13 +49,19 @@ pub fn root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors().find(|d| !ci_files(d).is_empty()).map(Path::to_path_buf)
 }
 
-/// Reads the CI of the repo at `top` and proposes its avp.toml.
+/// Reads the CI of the repo at `top` and proposes its avp.toml: deploys AVP runs itself.
 pub fn import(top: &Path) -> Result<Imported> {
+    import_with(top, false)
+}
+
+/// `keep_github`: a GitHub deploy stays the workflow AVP's bridge dispatches (`github_workflow`),
+/// instead of its job's commands as a `run` AVP carries out.
+pub fn import_with(top: &Path, keep_github: bool) -> Result<Imported> {
     let files = ci_files(top);
     if files.is_empty() {
         bail!("no CI in {}: avp import-ci reads .github/workflows/*.yml and .gitlab-ci.yml", top.display());
     }
-    let mut ci = Ci::default();
+    let mut ci = Ci { keep_github, ..Default::default() };
     let mut sources = Vec::new();
     for path in &files {
         sources.push(path.strip_prefix(top).unwrap_or(path).to_string_lossy().to_string());
@@ -134,6 +140,8 @@ struct Ci {
     tools: Vec<(String, String, Vec<String>)>,
     /// A cache of Cargo's `target`: kept between proofs instead.
     keep_target: bool,
+    /// GitHub deploys stay on GitHub, dispatched by AVP's bridge (`--keep-github`).
+    keep_github: bool,
 }
 
 impl Ci {
@@ -470,8 +478,30 @@ fn github(file: &str, doc: &Yaml, ci: &mut Ci) {
                 None => env_name(&[id, job["name"].as_str().unwrap_or(""), &wf_name, &stem]),
             };
             deployed = true;
-            let inputs = dispatch_inputs(dispatch, file, ci);
-            ci.deploys.push(EnvDeploy { name, at: at.clone(), how: How::Workflow { file: file.into(), inputs }, follow: on_push });
+            // The job's own commands, which AVP runs on its server: no GitHub left in the deploy.
+            // What only GitHub runs (an action) keeps it there, dispatched by the bridge.
+            // Its notes only once it holds: a deploy left on GitHub has nothing of its own to translate.
+            let mut tried = Ci::default();
+            let run = if ci.keep_github { Err(String::new()) } else { gh_deploy_run(&at, &needed(&jobs, id), &wf_env, wf_dir, wf_shell, &mut tried) };
+            let how = match run {
+                Ok(run) => {
+                    for n in tried.notes {
+                        ci.note(&n.at, n.what, n.todo);
+                    }
+                    How::Run(run)
+                }
+                Err(why) => {
+                    if !why.is_empty() {
+                        ci.note(&at, why, format!("AVP's bridge dispatches {file} on GitHub instead: put the command it stands for in a `run` deploy to leave GitHub"));
+                    }
+                    How::Workflow { file: file.into(), inputs: dispatch_inputs(dispatch, file, ci) }
+                }
+            };
+            let bridged = matches!(how, How::Workflow { .. });
+            ci.deploys.push(EnvDeploy { name, at: at.clone(), how, follow: on_push });
+            if !bridged {
+                continue;
+            }
             if on_pr {
                 ci.note(&at, format!("deploys from {file}, beside its checks"), "dispatching the workflow would run them all: move this job to a workflow of its own (on workflow_dispatch) and point `github_workflow` at it");
             }
@@ -487,10 +517,111 @@ fn github(file: &str, doc: &Yaml, ci: &mut Ci) {
         job.clock_only = !on_pr && !on_push;
         ci.checks.push(job);
     }
-    if deploy_wf && deployed && dispatch.is_none() {
+    if deploy_wf && deployed && dispatch.is_none() && ci.deploys.iter().any(|d| d.at.starts_with(&format!("{file}, ")) && matches!(d.how, How::Workflow { .. })) {
         ci.note(file, "has no workflow_dispatch", "add `workflow_dispatch:` under `on:`: AVP's bridge starts a deploy that way");
     }
 }
+
+/// A GitHub deploy job as the `run` AVP carries out on its server: its shell steps in order, a step
+/// with a folder or variables of its own in a subshell, as GitHub gives each step its own shell; the
+/// commit as `{git}`. Err: what only GitHub runs (an action that is not a checkout, a setup or a
+/// cache, a shell that is not sh).
+fn gh_deploy_run(at: &str, jobs: &[&Yaml], wf_env: &[(String, String)], wf_dir: Option<&str>, wf_shell: Option<&str>, ci: &mut Ci) -> std::result::Result<String, String> {
+    let mut lines: Vec<String> = exports(wf_env).into_iter().collect();
+    let mut texts = wf_env.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>();
+    for job in jobs {
+        let steps = job["steps"].as_vec().cloned().unwrap_or_default();
+        let dir = job["defaults"]["run"]["working-directory"].as_str().or(wf_dir);
+        let shell = job["defaults"]["run"]["shell"].as_str().or(wf_shell);
+        let job_env = pairs(&job["env"]);
+        lines.extend(exports(&job_env));
+        texts.extend(job_env.iter().map(|(_, v)| v.clone()));
+        gh_deploy_steps(at, &steps, dir, shell, &mut lines, &mut texts, ci)?;
+    }
+    if lines.is_empty() {
+        return Err("runs no command of its own".into());
+    }
+    // What the CI keeps (`secrets.`, `vars.`) the server's environment gives a deploy, by name.
+    let mut named: Vec<String> = Vec::new();
+    for t in &texts {
+        for c in EXPR.captures_iter(t) {
+            let e = c[1].trim();
+            if let Some(k) = ["secrets.", "vars."].iter().find_map(|p| e.strip_prefix(p)) {
+                if !named.iter().any(|n| n == k) {
+                    named.push(k.to_string());
+                }
+            } else if !(GITHUB_SHA.is_match(&c[0]) || e.starts_with("matrix.") || e.starts_with("env.") || e == "github.workspace" || e == "runner.temp") {
+                ci.note(at, format!("`${{{{ {e} }}}}`"), "has no value outside GitHub: replace it in the deploy's run");
+            }
+        }
+    }
+    for k in named {
+        ci.note(at, format!("`${k}`, kept by GitHub"), format!("name {k} in AVP_DEPLOY_ENV where the server runs, its value in the server's environment"));
+    }
+    Ok(run_text(&lines))
+}
+
+/// One job's steps, added to the deploy's `lines`; the texts the CI's expressions are read from.
+fn gh_deploy_steps(at: &str, steps: &[Yaml], dir: Option<&str>, shell: Option<&str>, lines: &mut Vec<String>, texts: &mut Vec<String>, ci: &mut Ci) -> std::result::Result<(), String> {
+    for (i, step) in steps.iter().enumerate() {
+        let label = step["name"].as_str().map(|n| format!("step \"{n}\"")).unwrap_or_else(|| format!("step {}", i + 1));
+        if let Some(uses) = step["uses"].as_str() {
+            let action = uses.split('@').next().unwrap_or(uses).to_ascii_lowercase();
+            match action.as_str() {
+                "actions/checkout" | "actions/cache" | "actions/cache/restore" | "actions/cache/save" | "swatinem/rust-cache" => {}
+                a if a.contains("/setup-") || a.ends_with("/action-setup") || a == "dtolnay/rust-toolchain" => ci.note(at, format!("`{uses}`"), "a `run` deploy runs on AVP's server: install there what it sets up"),
+                _ => return Err(format!("{label} uses `{uses}`")),
+            }
+            continue;
+        }
+        let Some(run) = text(&step["run"]) else { continue };
+        if let Some(sh) = step["shell"].as_str().or(shell).filter(|s| !s.starts_with("bash") && !s.starts_with("sh")) {
+            return Err(format!("{label} runs in {sh}"));
+        }
+        if let Some(cond) = text(&step["if"]) {
+            if ["failure()", "always()", "cancelled()"].iter().any(|f| cond.contains(f)) {
+                ci.note(at, format!("{label} runs `if: {cond}`"), "left out: a deploy stops at its first red command, and its failure is told (`[notify]`)");
+                continue;
+            }
+            ci.note(at, format!("{label} runs only `if: {cond}` on GitHub"), "the deploy runs it always: drop it, or test the condition in the shell");
+        }
+        let step_env = pairs(&step["env"]);
+        texts.push(run.clone());
+        texts.extend(step_env.iter().map(|(_, v)| v.clone()));
+        let commit = |t: &str| GITHUB_SHA.replace_all(t, "{git}").into_owned();
+        let body: Vec<String> = lines_of(&commit(&expand(&run, None)));
+        let own_dir = step["working-directory"].as_str().or(dir);
+        let own_env: Vec<(String, String)> = step_env.iter().map(|(k, v)| (k.clone(), commit(&expand(v, None)))).collect();
+        let head: Vec<String> = own_dir.map(|d| format!("cd {}", shq(d))).into_iter().chain(exports(&own_env)).collect();
+        if head.is_empty() {
+            lines.extend(body);
+        } else {
+            lines.push(format!("(\n  {}\n)", head.into_iter().chain(body).collect::<Vec<_>>().join("\n  ")));
+        }
+    }
+    Ok(())
+}
+
+/// The jobs a deploy job needs (`needs:`, and theirs), then itself, in the workflow's order: what
+/// one dispatch of the workflow ran.
+fn needed<'a>(jobs: &[(String, &'a Yaml)], id: &str) -> Vec<&'a Yaml> {
+    let mut wanted = vec![id.to_string()];
+    let mut i = 0;
+    while i < wanted.len() {
+        if let Some((_, job)) = jobs.iter().find(|(j, _)| *j == wanted[i]) {
+            for n in texts(&job["needs"]) {
+                if !wanted.contains(&n) {
+                    wanted.push(n);
+                }
+            }
+        }
+        i += 1;
+    }
+    jobs.iter().filter(|(j, _)| wanted.contains(j)).map(|(_, job)| *job).collect()
+}
+
+/// The commit a deploy workflow ran on, or was given: `{git}`, the promoted position's commit.
+static GITHUB_SHA: LazyLock<Regex> = LazyLock::new(|| re(r"\$\{\{\s*(github\.sha|inputs\.(sha|ref|commit|commit_sha|git_sha|revision|rev|git_ref))\s*\}\}|\$\{GITHUB_SHA\}|\$GITHUB_SHA\b"));
 
 /// The inputs AVP's bridge gives a deploy workflow: the promoted commit where it takes one.
 fn dispatch_inputs(dispatch: Option<&Yaml>, file: &str, ci: &mut Ci) -> Vec<(String, String)> {

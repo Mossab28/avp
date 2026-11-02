@@ -158,6 +158,27 @@ fn email_of(person: &str) -> String {
     if person.contains('@') { person.to_string() } else { format!("{person}@users.avp") }
 }
 
+/// The author and message of the commit of position `entry`, landed by `task`: the mirror and the
+/// server's own clone write them alike, so the same position makes the same commit in both.
+fn commit_text(entry: &LineEntry, task: Option<&Task>, (cname, cemail): (&str, &str)) -> (String, String, String) {
+    let pos = entry.position;
+    let Some(task) = task else { return (cname.to_string(), cemail.to_string(), format!("{}\n\nAVP-Position: {pos}\n", entry.note.trim())) };
+    let person = if task.actor.person.is_empty() { "avp".to_string() } else { task.actor.person.clone() };
+    let agent = task.actor.agent.trim();
+    let mut msg = format!("{}\n\nAVP-Position: {pos}\nAVP-Task: {}\nAVP-Person: {person}\nAVP-Agent: {agent}\n", task.goal.trim(), task.id);
+    // Which instance of the agent: two Claude Code sessions are two authors.
+    if !task.actor.session.is_empty() {
+        msg.push_str(&format!("AVP-Session: {}\n", task.actor.session));
+    }
+    if let Some(p) = &entry.proof {
+        msg.push_str(&format!("AVP-Proof: {p}\n"));
+    }
+    // The agent in the author's name, so that `git blame` says it on every line; the email stays
+    // the person's.
+    let name = if agent.is_empty() || agent == "human" { person.clone() } else { format!("{person} ({agent})") };
+    (name, email_of(&person), msg)
+}
+
 /// The absolute git directory of a checkout (a worktree's own, when the checkout is one).
 fn git_dir(dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(git(dir, &["rev-parse", "--absolute-git-dir"])?.trim()))
@@ -210,26 +231,11 @@ pub fn mirror(client: &Client, dir: &Path, repo: &str, branch: &str, remote: Opt
         let _ = std::fs::remove_dir_all(wt.join(".trame"));
         // -f: the line is the truth; a file it holds goes in even if an ignore rule matches it.
         git(&wt, &["add", "-A", "-f"])?;
-        let (aname, aemail, msg) = match entry.task.as_deref() {
-            Some(t) => {
-                let s: TaskStatus = client.get(&format!("/repos/{}/tasks/{t}", r.id))?;
-                let person = if s.task.actor.person.is_empty() { "avp".to_string() } else { s.task.actor.person.clone() };
-                let agent = s.task.actor.agent.trim();
-                let mut msg = format!("{}\n\nAVP-Position: {pos}\nAVP-Task: {t}\nAVP-Person: {person}\nAVP-Agent: {agent}\n", s.task.goal.trim());
-                // Which instance of the agent: two Claude Code sessions are two authors.
-                if !s.task.actor.session.is_empty() {
-                    msg.push_str(&format!("AVP-Session: {}\n", s.task.actor.session));
-                }
-                if let Some(p) = &entry.proof {
-                    msg.push_str(&format!("AVP-Proof: {p}\n"));
-                }
-                // The agent in the author's name, so that `git blame` says it on every line; the
-                // email stays the person's.
-                let name = if agent.is_empty() || agent == "human" { person.clone() } else { format!("{person} ({agent})") };
-                (name, email_of(&person), msg)
-            }
-            None => (cname.clone(), cemail.clone(), format!("{}\n\nAVP-Position: {pos}\n", entry.note.trim())),
+        let task = match entry.task.as_deref() {
+            Some(t) => Some(client.get::<TaskStatus>(&format!("/repos/{}/tasks/{t}", r.id))?.task),
+            None => None,
         };
+        let (aname, aemail, msg) = commit_text(&entry, task.as_ref(), (&cname, &cemail));
         let date = format!("@{} +0000", entry.landed_at / 1000);
         let env = [
             ("GIT_AUTHOR_NAME", aname),
@@ -971,15 +977,7 @@ fn cat_blobs(dir: &Path, shas: &[String]) -> Result<HashMap<String, Vec<u8>>> {
 /// client does, and opens the commits' tasks in its engine, as their authors. Its log gets one line
 /// per change of what a look says.
 pub fn serve_follows(engine: crate::engine::Engine, local: String) {
-    if let Ok(token) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")) {
-        use base64::Engine as _;
-        let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", token.trim()));
-        let _ = GIT_ENV.set(vec![
-            ("GIT_CONFIG_COUNT".into(), "1".into()),
-            ("GIT_CONFIG_KEY_0".into(), "http.https://github.com/.extraheader".into()),
-            ("GIT_CONFIG_VALUE_0".into(), format!("AUTHORIZATION: basic {basic}")),
-        ]);
-    }
+    github_credentials();
     std::thread::spawn(move || {
         let client = Client::new(&local);
         // By repo: what its follow knows, when it looks next, what it said last.
@@ -1046,4 +1044,239 @@ fn server_clone(dir: &Path, remote: &str) -> Result<()> {
         git(dir, &["remote", "set-url", "origin", remote])?;
     }
     Ok(())
+}
+
+// ---- `git clone` of the line, served by the server ----
+//
+// The server keeps one bare repo per AVP repo (`<data>/git-served/<id>.git`), its branch `main` one
+// commit per position, written as the mirror writes them (`commit_text`), on top of the history
+// `avp import` brought in. `git http-backend` serves it: the smart HTTP protocol (info/refs,
+// git-upload-pack, protocol v2, gzip bodies, shallow and partial clones) is git's own, and the
+// server image carries git already (deploy/Dockerfile). Writing upload-pack ourselves would mean
+// SHA-1, zlib, delta packs and the negotiation, all to redo what that binary does correctly.
+
+/// Where the server keeps the bare repo `git clone` reads.
+pub fn served_root(data: &Path) -> PathBuf {
+    data.join("git-served")
+}
+
+/// One sync at a time: two clones at once would write the same commits twice.
+static SERVED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The bare repo of `repo`, made on first use.
+fn served_repo(data: &Path, repo: &str) -> Result<PathBuf> {
+    let dir = served_root(data).join(format!("{repo}.git"));
+    if !dir.join("HEAD").exists() {
+        std::fs::create_dir_all(&dir)?;
+        git(&dir, &["init", "-q", "--bare"]).context("`git clone` of the line needs git on the server")?;
+        git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    }
+    Ok(dir)
+}
+
+/// The position `main` was last written up to, and its commit, as the last sync left them.
+const SYNCED: &str = "avp-position";
+
+/// Takes the git history `avp import` sends (a bundle of HEAD) as the start of `main`: the
+/// positions that remember its commits then clone as those very commits.
+pub fn take_bundle(e: &crate::engine::Engine, repo: &str, bundle: &Path) -> Result<String> {
+    let _one = SERVED.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = served_repo(&e.data, repo)?;
+    let b = bundle.to_str().ok_or_else(|| anyhow!("non-UTF-8 path"))?;
+    git(&dir, &["bundle", "verify", "-q", b]).context("not a git bundle")?;
+    git(&dir, &["fetch", "-q", "--force", b, "HEAD:refs/heads/main"])?;
+    // Written from the positions again on the next clone, now from the commits just taken.
+    let _ = std::fs::remove_file(dir.join(SYNCED));
+    Ok(git(&dir, &["rev-parse", "refs/heads/main"])?.trim().to_string())
+}
+
+/// Brings `main` of the served repo up to the head of the line and returns the repo's folder:
+/// each position not written yet becomes one commit, from the last position whose commit the repo
+/// has (the imported history), or from nothing.
+pub fn sync_served(e: &crate::engine::Engine, repo: &str) -> Result<PathBuf> {
+    let _one = SERVED.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = served_repo(&e.data, repo)?;
+    let head = e.head(repo)?;
+    let synced = std::fs::read_to_string(dir.join(SYNCED)).ok().and_then(|s| {
+        let (p, sha) = s.trim().split_once(' ')?;
+        Some((p.parse::<i64>().ok()?, sha.to_string()))
+    });
+    let base = match synced.filter(|(_, sha)| has_commits(&dir, &[sha.clone()]).is_ok_and(|h| h.len() == 1)) {
+        Some(b) => Some(b),
+        None => {
+            // Newest first: the last position whose commit the repo has.
+            let line = e.db.lock().unwrap_or_else(|p| p.into_inner()).line(repo, head.position, head.position + 1)?;
+            let shas: Vec<String> = line.iter().filter_map(|l| l.git.clone()).collect();
+            let here = has_commits(&dir, &shas)?;
+            line.iter().find_map(|l| l.git.clone().filter(|s| here.contains(s)).map(|s| (l.position, s)))
+        }
+    };
+    if base.as_ref().is_some_and(|(p, _)| *p >= head.position) {
+        return Ok(dir);
+    }
+    let (cname, cemail) = parse_ident(&std::env::var("AVP_COMMITTER").unwrap_or_else(|_| "AVP <avp@users.avp>".into()))?;
+    let mut prev = match &base {
+        Some((p, _)) => e.tree_at(repo, *p)?,
+        None => Tree::new(),
+    };
+    let first = base.as_ref().map(|(p, _)| p + 1).unwrap_or(0);
+    let mut child = Command::new("git").args(["fast-import", "--quiet", "--force"]).current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+    let mut w = std::io::BufWriter::new(child.stdin.take().unwrap());
+    let todo = e.db.lock().unwrap_or_else(|p| p.into_inner()).line(repo, head.position, head.position - first + 1)?;
+    for entry in todo.into_iter().rev() {
+        let task = match entry.task.as_deref() {
+            Some(t) => Some(e.db.lock().unwrap_or_else(|p| p.into_inner()).task(t)?),
+            None => None,
+        };
+        let (aname, aemail, msg) = commit_text(&entry, task.as_ref(), (&cname, &cemail));
+        let at = entry.landed_at / 1000;
+        write!(w, "commit refs/heads/main\nauthor {aname} <{aemail}> {at} +0000\ncommitter {cname} <{cemail}> {at} +0000\ndata {}\n{msg}\n", msg.len())?;
+        if entry.position == first {
+            if let Some((_, sha)) = &base {
+                writeln!(w, "from {sha}")?;
+            }
+        }
+        // The files of the position that the last one did not have as they are; the commit it
+        // starts from keeps what the line does not carry (symlinks, submodules).
+        let tree = e.tree_at(repo, entry.position)?;
+        let carried = |p: &str| !p.starts_with(".avp/") && !p.starts_with(".trame/");
+        for path in prev.keys().filter(|p| !tree.contains_key(*p) && carried(p)) {
+            writeln!(w, "D {}", quoted(path))?;
+        }
+        for (path, f) in tree.iter().filter(|(p, f)| carried(p) && prev.get(*p) != Some(*f)) {
+            let bytes = e.objects.get(&f.blob)?;
+            let mode = if f.mode & 0o111 != 0 { "100755" } else { "100644" };
+            write!(w, "M {mode} inline {}\ndata {}\n", quoted(path), bytes.len())?;
+            w.write_all(&bytes)?;
+            w.write_all(b"\n")?;
+        }
+        w.write_all(b"\n")?;
+        prev = tree;
+    }
+    w.flush()?;
+    drop(w);
+    let out = child.wait_with_output()?;
+    anyhow::ensure!(out.status.success(), "git fast-import: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let sha = git(&dir, &["rev-parse", "refs/heads/main"])?.trim().to_string();
+    std::fs::write(dir.join(SYNCED), format!("{} {sha}\n", head.position))?;
+    Ok(dir)
+}
+
+/// Those of `shas` that are commits of the repo `dir`, asked in one `git cat-file`.
+fn has_commits(dir: &Path, shas: &[String]) -> Result<HashSet<String>> {
+    if shas.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut child = Command::new("git").args(["cat-file", "--batch-check"]).current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let input: String = shas.iter().map(|s| format!("{s}\n")).collect();
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.split_once(" commit ").map(|(s, _)| s.to_string())).collect())
+}
+
+/// A path as fast-import reads it whatever its characters: C-style quoted.
+fn quoted(path: &str) -> String {
+    let mut q = String::with_capacity(path.len() + 2);
+    q.push('"');
+    for c in path.chars() {
+        match c {
+            '"' => q.push_str("\\\""),
+            '\\' => q.push_str("\\\\"),
+            '\n' => q.push_str("\\n"),
+            c => q.push(c),
+        }
+    }
+    q.push('"');
+    q
+}
+
+// ---- `avp import`: a Git repo, from here or from a URL ----
+
+/// What `avp import` reads: a checkout on this machine, or a URL to clone (`github.com/owner/name`
+/// is GitHub's over https). Returns the folder or the URL, and the repo's name by default.
+pub fn import_source(src: &str) -> Result<(ImportFrom, String)> {
+    let local = Path::new(src);
+    let from = if local.join(".git").exists() {
+        ImportFrom::Checkout(local.to_path_buf())
+    } else if src.contains("://") || src.starts_with("git@") {
+        ImportFrom::Url(src.to_string())
+    } else if let Some(rest) = src.strip_prefix("github.com/") {
+        ImportFrom::Url(format!("https://github.com/{}.git", rest.trim_end_matches('/').trim_end_matches(".git")))
+    } else {
+        anyhow::bail!("{src}: neither a git checkout here nor a URL (https://..., git@..., github.com/owner/name)");
+    };
+    let path = match &from {
+        ImportFrom::Checkout(p) => std::fs::canonicalize(p)?.to_string_lossy().to_string(),
+        ImportFrom::Url(u) => u.clone(),
+    };
+    let name = path.trim_end_matches('/').trim_end_matches(".git").rsplit(['/', ':']).next().unwrap_or("").to_string();
+    anyhow::ensure!(!name.is_empty(), "{src}: no repo name in it, give one with --name");
+    Ok((from, name))
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ImportFrom {
+    Checkout(PathBuf),
+    Url(String),
+}
+
+/// GH_TOKEN (or GITHUB_TOKEN) as the credentials of github.com for every git command of this
+/// process, when there is one: a private repo clones, and the token is never on a command line.
+pub fn github_credentials() {
+    if let Ok(token) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")) {
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", token.trim()));
+        let _ = GIT_ENV.set(vec![
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "http.https://github.com/.extraheader".into()),
+            ("GIT_CONFIG_VALUE_0".into(), format!("AUTHORIZATION: basic {basic}")),
+        ]);
+    }
+}
+
+/// Clones `url` into `dir` with its whole history and nothing checked out, git's progress on
+/// stderr as it comes.
+pub fn clone_for_import(url: &str, dir: &Path) -> Result<()> {
+    github_credentials();
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--no-checkout", "--progress", url]).arg(dir).stdout(Stdio::null());
+    for (k, v) in GIT_ENV.get().into_iter().flatten() {
+        cmd.env(k, v);
+    }
+    let ok = cmd.status().context("git clone (is git installed?)")?.success();
+    let private = url.contains("github.com") && std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")).is_err();
+    anyhow::ensure!(ok, "git clone {url} failed{}", if private { ": a private GitHub repo needs GH_TOKEN set to a token that reads it" } else { "" });
+    Ok(())
+}
+
+/// Sends the whole history of HEAD to the server as a bundle, streamed from disk: `git clone` of
+/// the repo then gives the original commits, and the line's positions on top. Returns its size.
+pub fn upload_history(client: &Client, repo: &str, dir: &Path) -> Result<u64> {
+    let file = std::env::temp_dir().join(format!("avp-import-{}.bundle", std::process::id()));
+    let f = file.to_str().ok_or_else(|| anyhow!("non-UTF-8 path"))?;
+    git(dir, &["bundle", "create", "-q", f, "HEAD"])?;
+    let size = std::fs::metadata(&file)?.len();
+    eprintln!("sending the git history ({:.1} MB)", size as f64 / 1e6);
+    let sent = client.put_file::<serde_json::Value>(&format!("/repos/{repo}/git/history"), &file);
+    let _ = std::fs::remove_file(&file);
+    sent?;
+    Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_reads_a_url_or_github_short_form_and_names_the_repo() {
+        let (from, name) = import_source("github.com/acme/shop").unwrap();
+        assert_eq!(from, ImportFrom::Url("https://github.com/acme/shop.git".into()));
+        assert_eq!(name, "shop");
+        assert_eq!(import_source("git@github.com:acme/web.git").unwrap().1, "web");
+        assert_eq!(import_source("https://git.example.com/team/api.git/").unwrap().1, "api");
+        assert!(import_source("not-a-checkout-nor-a-url").is_err());
+    }
 }

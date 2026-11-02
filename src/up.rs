@@ -522,7 +522,7 @@ fn rule_file(a: &Agent, here: &Here) -> Option<(&'static str, &'static str)> {
 
 /// Where the rule waits when the repo has its own `file`: in AVP's home, for someone to add it.
 fn aside(here: &Here, file: &str) -> PathBuf {
-    home().join(format!("{}.{}", here.repo, file.trim_start_matches('.').replace('/', "-")))
+    home().join(format!("{}.{}", here.repo.replace('/', "-"), file.trim_start_matches('.').replace('/', "-")))
 }
 
 /// Writes `file` with the rule when the repo has none, kept out of `git status`. A repo that has
@@ -958,6 +958,41 @@ pub struct Up {
     pub checks: bool,
     /// Run a mirror from this checkout even though the server is a team's (it mirrors itself).
     pub mirror: bool,
+    /// On AVP Cloud, the organization the repo goes in (none: asked when the person has several).
+    pub org: Option<String>,
+}
+
+/// The organization a repo `avp up` brings goes in, on AVP Cloud: `--org`, else the person's only
+/// one, else asked at a terminal; none when they have none (the repo stays in their own space), or
+/// when the server has no organizations (a team server).
+pub fn org_here(client: &Client, org: Option<String>) -> Result<Option<String>> {
+    let Ok(orgs) = client.get::<Vec<Value>>("/orgs") else { return Ok(org) };
+    let names: Vec<String> = orgs.iter().filter_map(|o| o["name"].as_str().map(String::from)).collect();
+    if let Some(o) = org {
+        anyhow::ensure!(names.contains(&o), "you are in no organization {o} on {}: {}", client.shown(), if names.is_empty() { "`avp org create <name>` makes one".to_string() } else { format!("yours are {}", names.join(", ")) });
+        return Ok(Some(o));
+    }
+    match names.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        _ => {
+            use std::io::IsTerminal;
+            anyhow::ensure!(std::io::stdin().is_terminal(), "you are in {} organizations: say which with --org ({})", names.len(), names.join(", "));
+            eprintln!("Which organization does the repo go in?");
+            for (i, n) in names.iter().enumerate() {
+                eprintln!("  {}. {n}", i + 1);
+            }
+            eprint!("number (Enter: your own space): ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let line = line.trim();
+            if line.is_empty() {
+                return Ok(None);
+            }
+            let i: usize = line.parse().ok().filter(|i| (1..=names.len()).contains(i)).with_context(|| format!("{line}: a number from 1 to {}", names.len()))?;
+            Ok(Some(names[i - 1].clone()))
+        }
+    }
 }
 
 /// Whether the server is a team's, anything but this machine: it mirrors its own line.
@@ -993,6 +1028,8 @@ pub fn repo_here(client: &Client, top: &Path, name: &str, history: usize) -> Res
             let head: LineEntry = client.get(&format!("/repos/{}/head", r.id))?;
             Ok((r, format!("{name}, already on AVP (head of the line: position {})", head.position)))
         }
+        // A name of several of the person's repos (AVP Cloud): they say which.
+        Err(e) if format!("{e:#}").starts_with("409") => Err(e),
         Err(_) => {
             let (r, last) = gitbridge::import_git(client, top, name, "advisory", history)?;
             let what = if last == 0 { "the commit at HEAD is position 0".to_string() } else { format!("the last {} commits of HEAD are positions 0 to {last}", last + 1) };
@@ -1041,11 +1078,28 @@ pub fn up(client: &Client, dir: &Path, o: Up) -> Result<()> {
     let h = home();
     anyhow::ensure!(o.branch != "main" && o.branch != "master", "the mirror writes its own branch; `avp mirror --branch {}` makes it a mirror on purpose", o.branch);
 
-    // 1. The server.
-    let server_line = serve_here(client)?;
+    // 1. The server, and who it takes this machine for: on one with accounts, nobody is nothing.
+    let mut server_line = serve_here(client)?;
+    match client.get::<Value>("/me") {
+        Ok(me) if me["accounts"] == true => server_line.push_str(&format!(", as {}", me["person"].as_str().unwrap_or("its key"))),
+        Err(e) if format!("{e:#}").starts_with("401") => bail!("not logged in to {}: `avp login {}` first (AVP_TOKEN in CI)", client.shown(), client.base),
+        _ => {}
+    }
 
-    // 2. The repo, from the checkout's history.
-    let (repo, repo_line) = repo_here(client, &top, &name, o.history)?;
+    // 2. The repo, from the checkout's history, in the person's organization on AVP Cloud: with
+    // --org, `<org>/<name>`, created there when it is not yet.
+    let asked = o.org.is_some();
+    let key = o.org.as_ref().map(|org| format!("{org}/{name}")).unwrap_or_else(|| name.clone());
+    if let Some(org) = &o.org {
+        org_here(client, Some(org.clone()))?;
+    }
+    let (mut repo, mut repo_line) = repo_here(client, &top, &key, o.history)?;
+    if repo.org.is_none() && !asked {
+        if let Some(org) = org_here(client, None)? {
+            repo = client.post(&format!("/orgs/{org}/repos"), &json!({ "repo": repo.id }))?;
+            repo_line.push_str(&format!(", in {org}"));
+        }
+    }
 
     // 3. The checks its proofs run.
     let head: LineEntry = client.get(&format!("/repos/{}/head", repo.id))?;
@@ -1089,7 +1143,7 @@ pub fn up(client: &Client, dir: &Path, o: Up) -> Result<()> {
     let mirror_line = mirror_here(client, &top, &name, &o.branch, o.push, o.mirror)?;
 
     // 5. The agents: each one installed here, wired through its own config in this checkout.
-    let seen = wire_here(client, &top, &name)?;
+    let seen = wire_here(client, &top, &repo.full_name())?;
 
     println!("AVP is on for {}", top.display());
     println!("  server   {server_line}");
@@ -1123,6 +1177,7 @@ pub fn up(client: &Client, dir: &Path, o: Up) -> Result<()> {
 /// wired for it as `up` wires a checkout, the files that takes kept out of the task's writes
 /// (.avp/exclude), and what `avp mcp` needs kept as for a checkout (`keep`).
 pub fn clone(client: &Client, repo: &str, into: Option<PathBuf>, cwd: &Path, as_json: bool) -> Result<()> {
+    // `<space>/<repo>` on AVP Cloud: the server finds it in that space alone.
     let r: Repo = client.get(&format!("/repos/{repo}")).with_context(|| format!("no repo {repo} on {}", client.shown()))?;
     let dir = into.unwrap_or_else(|| cwd.join(&r.name));
     anyhow::ensure!(std::fs::read_dir(&dir).map_or(true, |mut d| d.next().is_none()), "{} is not empty: clone into a new folder", dir.display());
@@ -1134,15 +1189,15 @@ pub fn clone(client: &Client, repo: &str, into: Option<PathBuf>, cwd: &Path, as_
     let n = view::lay_out(client, &tree, &dir, &mut state, &[])?;
     // The replica too: offline, the clone reads the line as any view does.
     crate::offline::refresh(client, &r.id, false);
-    keep(&dir, &client.base, &r.name)?;
-    let here = Here { top: dir.clone(), repo: r.name.clone(), exe: std::env::current_exe()? };
+    keep(&dir, &client.base, &r.full_name())?;
+    let here = Here { top: dir.clone(), repo: r.full_name(), exe: std::env::current_exe()? };
     let failed: BTreeMap<&str, String> = AGENTS.iter().filter(|a| installed(a)).filter_map(|a| wire(a, &here, &client.base).err().map(|e| (a.id, format!("{e:#}")))).collect();
     let seen = agents_of(&here, &failed);
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&json!({ "repo": r.name, "position": head.position, "dir": dir, "files": n, "agents": seen }))?);
+        println!("{}", serde_json::to_string_pretty(&json!({ "repo": r.full_name(), "id": r.id, "position": head.position, "dir": dir, "files": n, "agents": seen }))?);
         return Ok(());
     }
-    println!("{} cloned into {} at position {} ({n} files): a view of the line, no git", r.name, dir.display(), head.position);
+    println!("{} cloned into {} at position {} ({n} files): a view of the line, no git", r.full_name(), dir.display(), head.position);
     for (i, line) in listed(&seen).iter().enumerate() {
         println!("  {}{line}", if i == 0 { "agents   " } else { "         " });
     }

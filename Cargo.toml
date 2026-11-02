@@ -1,6 +1,6 @@
 [package]
 name = "avp"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "AVP, agent versioning protocol: version control for agents. A server that holds the truth, tasks instead of branches, proofs instead of CI."
 license = "Elastic-2.0"
@@ -15,7 +15,7 @@ path = "src/main.rs"
 # is on by default, in `cargo build` and the release binaries. `--no-default-features` builds the
 # small avp without it.
 default = ["cloud"]
-cloud = ["dep:chacha20poly1305"]
+cloud = ["dep:chacha20poly1305", "dep:argon2"]
 
 [dependencies]
 anyhow = "1"
@@ -38,6 +38,8 @@ toml = "0.8"
 ulid = "1"
 yaml-rust2 = { version = "0.13", default-features = false }
 chacha20poly1305 = { version = "0.11.0", optional = true }
+# AVP Cloud's passwords (sign-up by email): argon2id.
+argon2 = { version = "0.5", optional = true }
 
 [profile.release]
 lto = true

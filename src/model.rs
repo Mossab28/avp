@@ -51,6 +51,23 @@ pub struct Repo {
     #[serde(default = "default_landing")]
     pub landing: LandingRule,
     pub created_at: i64,
+    /// The organization it belongs to on AVP Cloud; none: a person's own, or a team server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+    /// On AVP Cloud, whose name it lives under: its organization, else the person whose own it is.
+    /// Its name is unique there, and said `<space>/<name>`. None: a team server's, named alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+}
+
+impl Repo {
+    /// How it is said: `acme/shop` on AVP Cloud, `shop` on a team server.
+    pub fn full_name(&self) -> String {
+        match &self.space {
+            Some(s) => format!("{s}/{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 pub fn default_landing() -> LandingRule {
@@ -167,6 +184,26 @@ pub struct Proof {
     /// Files the failure names, with the open task that holds each (if any).
     pub blamed: Vec<(String, Option<String>)>,
     pub created_at: i64,
+    /// Where its time went beside the steps: the wait for a machine, the preparation. None for a
+    /// proof from before AVP 0.6.1, or one that ran nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ProofTiming>,
+}
+
+/// A proof's time end to end. Its parts run side by side: each figure is its slowest part's.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProofTiming {
+    /// Queued until a machine took it: a worker's claim, or a slot on the server.
+    pub wait_s: f64,
+    /// Taken until its first step: the blobs a worker lacked, the setup, the tree laid out.
+    pub prep_s: f64,
+    /// Of the preparation, the setup: zero when its cache held this fingerprint.
+    pub setup_s: f64,
+    /// The setup's cache missed in at least one part: dependencies installed from scratch.
+    pub setup_ran: bool,
+    /// From the start of the proof to its verdict: what the agent waited.
+    pub total_s: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

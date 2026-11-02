@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn a_red_names_the_open_task_holding_what_failed() {
         let (a, b) = (task("task_a", "invoices", &["src/invoices.ts"]), task("task_b", "docs", &[]));
-        let proof = Proof { id: "proof_1".into(), task: Some("task_me".into()), base_position: 1, candidate_tree: String::new(), files: vec![], steps: vec![], verdict: Verdict::Red, blamed: vec![("src/me.ts".into(), None), ("src/invoices.ts".into(), Some("task_a".into()))], created_at: 0 };
+        let proof = Proof { id: "proof_1".into(), task: Some("task_me".into()), base_position: 1, candidate_tree: String::new(), files: vec![], steps: vec![], verdict: Verdict::Red, blamed: vec![("src/me.ts".into(), None), ("src/invoices.ts".into(), Some("task_a".into()))], created_at: 0, timing: None };
         let h = red_hint(&[&a, &b], Some(&proof));
         assert!(h.starts_with("The proof fails on src/invoices.ts, which task task_a holds: invoices\n"), "{h}");
         assert!(h.contains("`avp wait --task task_a`"), "{h}");

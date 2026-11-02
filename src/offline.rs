@@ -366,6 +366,7 @@ fn proof_of(p: &Pos) -> Option<Proof> {
         verdict: p.verdict.unwrap_or(Verdict::Green),
         blamed: vec![],
         created_at: p.entry.landed_at,
+        timing: None,
     })
 }
 
@@ -867,6 +868,7 @@ pub fn prove(server: &str, dir: &Path, state: &ViewState) -> Result<Proof> {
         files,
         steps,
         created_at: now_ms(),
+        timing: None,
     };
     write_json(&dir.join(".avp").join("local-proof.json"), &proof)?;
     Ok(proof)

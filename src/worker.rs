@@ -42,12 +42,23 @@ pub struct Claimed {
     pub job: Job,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: BTreeMap<String, String>,
+    /// What the job may use of a sandboxed worker (AVP_SANDBOX): the server's say, before the
+    /// worker's own. A worker without a sandbox runs the steps as they are.
+    #[serde(default, skip_serializing_if = "crate::check::Limits::is_empty")]
+    pub limits: crate::check::Limits,
 }
 
 /// `avp worker`: claim a proof, fetch the blobs this machine lacks, run it with the same code
 /// the server would, send the steps back, again. Errors become a failed step, never a lost job.
 pub fn work(client: &Client, data: &Path) -> Result<()> {
     let objects = Objects::open(&data.join("objects"))?;
+    // AVP_SANDBOX: strangers' code runs here. All of the sandbox, its firewall checked, or nothing.
+    let sandbox = crate::check::Sandbox::from_env(data)?;
+    if let Some(sb) = &sandbox {
+        sb.sweep();
+        sb.probe(data)?;
+        eprintln!("avp worker: each proof in a {} sandbox of its own, from {} unless avp.toml names an image", sb.tool, sb.image);
+    }
     eprintln!("avp worker: claiming proofs from {}", client.shown());
     // Asked to stop (a scale-down, a deploy): the file $AVP_WORKER_STOP appears, the worker claims
     // nothing more and leaves once the proof in hand is delivered. A container's stop hook turns
@@ -68,21 +79,27 @@ pub fn work(client: &Client, data: &Path) -> Result<()> {
                 continue;
             }
         };
-        let Some(Claimed { job, secrets }) = claimed else { continue };
+        let Some(Claimed { job, secrets, limits }) = claimed else { continue };
         let started = Instant::now();
+        let fetched = std::cell::Cell::new(0.0f64);
+        let prep = std::cell::Cell::new(None);
         let run = || -> Result<Vec<Step>> {
             // A worker that just started (a node scaled up) lacks the whole tree: by batches.
             let missing: Vec<String> = job.tree.values().map(|e| e.blob.clone()).filter(|b| !objects.has(b)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
             for chunk in missing.chunks(200) {
-                for bytes in client.get_objects(&job.repo, chunk)? {
+                for bytes in fetch_objects(client, &job.repo, chunk)? {
                     objects.put(&bytes)?;
                 }
             }
             if !missing.is_empty() {
                 eprintln!("{}: {} blobs fetched", job.id, missing.len());
             }
-            let ws = Workspace::new(data, &job.repo).with_secrets(secrets.clone());
-            Ok(ws.check(&objects, &job.tree, &job.tree_hash, &job.name, &job.files, job.steps_override.as_deref(), job.part.as_ref())?.0)
+            fetched.set(started.elapsed().as_secs_f64());
+            let ws = Workspace::new(data, &job.repo).with_secrets(secrets.clone()).with_sandbox(sandbox.as_ref().map(|s| s.for_job(limits.clone())));
+            let steps = ws.check(&objects, &job.tree, &job.tree_hash, &job.name, &job.files, job.steps_override.as_deref(), job.part.as_ref())?.0;
+            let p = crate::check::take_prep();
+            prep.set(Some(crate::check::Prep { prep_s: p.prep_s + fetched.get(), ..p }));
+            Ok(steps)
         };
         let done = std::sync::atomic::AtomicBool::new(false);
         let steps = std::thread::scope(|scope| {
@@ -112,9 +129,28 @@ pub fn work(client: &Client, data: &Path) -> Result<()> {
         let verdict = if steps.iter().any(|s| s.exit == crate::check::CANCELLED) { "cancelled" } else if steps.iter().any(|s| s.exit != 0) { "red" } else { "green" };
         // Out of this machine's store before it is sent: the server keeps them from now on.
         let kept: BTreeMap<String, KeptStep> = steps.iter().map(crate::check::kept_key).filter_map(|k| Kept::new(data).take(&k).map(|s| (k, s))).collect();
-        if let Err(e) = client.post::<serde_json::Value>(&format!("/work/{}/result", job.id), &serde_json::json!({ "steps": steps, "kept": kept })) {
+        if let Err(e) = client.post::<serde_json::Value>(&format!("/work/{}/result", job.id), &serde_json::json!({ "steps": steps, "kept": kept, "prep": prep.get() })) {
             eprintln!("{}: result not delivered: {e:#}", job.id);
         }
         eprintln!("{} {verdict} in {:.0}s", job.id, started.elapsed().as_secs_f64());
     }
+}
+
+/// A batch of blobs, asked again when the answer does not arrive whole. A connection cut in the
+/// middle of a download (a proxy, a server restarting, the network) is the machine, not the tree:
+/// on Murmell's line, 1/11, it turned two shards of position 633 red before their retry, which
+/// read as a flaky test that did not exist. Four tries over about 15 s; what still fails is red.
+fn fetch_objects(client: &Client, repo: &str, hashes: &[String]) -> Result<Vec<Vec<u8>>> {
+    let mut wait = Duration::from_secs(1);
+    for _ in 0..3 {
+        match client.get_objects(repo, hashes) {
+            Ok(blobs) => return Ok(blobs),
+            Err(e) => {
+                eprintln!("objects: {e:#}, asked again in {}s", wait.as_secs());
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+        }
+    }
+    client.get_objects(repo, hashes)
 }

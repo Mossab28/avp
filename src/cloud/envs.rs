@@ -16,6 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn routes() -> Router<Engine> {
@@ -355,13 +356,24 @@ impl Engine {
             let dir = self.data.join("deploy").join(repo).join(name);
             crate::check::materialize(&self.objects, &tree, &dir, &keep)?;
             say(format!("runs {run}"));
+            let heard = AtomicI64::new(now_ms());
+            let last = Mutex::new(format!("runs {run}"));
+            let over = AtomicBool::new(false);
             let mut watch = |line: &str| {
                 let line = colors.replace_all(line, "");
                 if !line.trim().is_empty() {
-                    say(line.trim().chars().take(200).collect());
+                    let line: String = line.trim().chars().take(200).collect();
+                    heard.store(now_ms(), Ordering::Relaxed);
+                    *last.lock().unwrap_or_else(|e| e.into_inner()) = line.clone();
+                    say(line);
                 }
             };
-            Ok(crate::check::run_deploy(&dir, &run, &mut watch))
+            Ok(std::thread::scope(|s| {
+                s.spawn(|| self.watch_stall(d, entry.task.as_deref(), &heard, &last, &over));
+                let step = crate::check::run_deploy(&dir, &run, &mut watch);
+                over.store(true, Ordering::Relaxed);
+                step
+            }))
         };
         let mut step = ran().unwrap_or_else(|e| Step { name: String::new(), command: command.to_string(), exit: -1, seconds: 0.0, output: format!("{e:#}") });
         step.name = format!("deploy {name}");
@@ -369,7 +381,7 @@ impl Engine {
         let plain = colors.replace_all(&step.output, "");
         let tail = plain.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         let last = tail.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(200).collect::<String>();
-        let proof = Proof { id: new_id("proof"), task: None, base_position: p.position, candidate_tree: entry.tree.clone(), files: vec![], steps: vec![step], verdict: if exit == 0 { Verdict::Green } else { Verdict::Red }, blamed: vec![], created_at: now_ms() };
+        let proof = Proof { id: new_id("proof"), task: None, base_position: p.position, candidate_tree: entry.tree.clone(), files: vec![], steps: vec![step], verdict: if exit == 0 { Verdict::Green } else { Verdict::Red }, blamed: vec![], created_at: now_ms(), timing: None };
         let db = self.db();
         db.insert_proof(repo, &proof)?;
         let rollback = Self::rollback_from(&db, repo, name, p.position)?;
@@ -388,6 +400,35 @@ impl Engine {
         self.emit_told(&db, repo, "env.moved", entry.task.as_deref(), rolled_back(serde_json::json!({ "env": name, "position": p.position, "by": p.by, "proof": proof.id }), rollback))?;
         self.cloud.deploys.progress.lock().unwrap_or_else(|e| e.into_inner()).remove(&(repo.to_string(), name.to_string()));
         Ok(env)
+    }
+}
+
+impl Engine {
+    /// A deploy AVP runs that prints nothing for AVP_DEPLOY_STALL_S (default 900) is said stalled,
+    /// once until it speaks again: in its progress (`avp envs`, AVP Live) and to the webhooks
+    /// (`env.stalled`), as a GitHub deploy that never comes is. It goes on: only a person knows
+    /// whether a silent migration is stuck.
+    fn watch_stall(&self, d: &DeployRun, task: Option<&str>, heard: &AtomicI64, last: &Mutex<String>, over: &AtomicBool) {
+        let stall_ms = std::env::var("AVP_DEPLOY_STALL_S").ok().and_then(|v| v.parse::<i64>().ok()).filter(|s| *s > 0).unwrap_or(900) * 1000;
+        let tick = std::time::Duration::from_millis((stall_ms / 5).clamp(100, 5000) as u64);
+        let mut told = None;
+        while !over.load(Ordering::Relaxed) {
+            std::thread::sleep(tick);
+            let at = heard.load(Ordering::Relaxed);
+            let silent = now_ms() - at;
+            if silent < stall_ms || told == Some(at) || over.load(Ordering::Relaxed) {
+                continue;
+            }
+            told = Some(at);
+            let line = last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let step = format!("stalled? nothing printed for {}, last: {line}", crate::stats::duration(Some(silent as f64 / 1000.0)));
+            let p = &d.promotion;
+            let db = self.db();
+            let _ = db.deploy_step(&d.id, &step);
+            let _ = self.emit_told(&db, &d.repo, "env.stalled", task, serde_json::json!({ "env": d.env, "position": p.position, "by": p.by, "silent_s": silent / 1000, "step": line }));
+            drop(db);
+            let _ = self.deploy_progress(&d.repo, &d.env, DeployProgress { position: p.position, step, since: now_ms(), url: None, at: 0 });
+        }
     }
 }
 

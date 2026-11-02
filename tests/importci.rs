@@ -61,19 +61,51 @@ fn a_node_monorepo_brings_its_proof_its_services_its_matrix_and_its_deploys() {
     assert!(pg.env.contains(&("DATABASE_URL".into(), "postgres://postgres:postgres@127.0.0.1:{port}/shop_test".into())), "{:?}", pg.env);
     assert!(c.services.iter().any(|s| s.name == "redis"));
 
+    // Staging's deploy takes its AWS credentials from an action only GitHub runs: it stays there,
+    // dispatched by AVP's bridge, and the list says why.
     let staging = &cfg.envs["staging"];
     assert_eq!(staging.follow.as_deref(), Some("full"), "it deployed on every push");
     let gh = staging.deploy.as_ref().and_then(Deploy::github).unwrap();
     assert_eq!((gh.github_workflow.as_str(), gh.inputs.get("sha").map(String::as_str)), ("deploy-staging.yml", Some("{git}")));
+    assert!(noted(&i, "deploy-staging.yml, job deploy", "uses `aws-actions/configure-aws-credentials@v4`"), "{:?}", i.not_translated);
+    // Production's is commands: AVP runs them itself, the build job it needs first.
     let production = &cfg.envs["production"];
     assert_eq!((production.after.as_deref(), production.follow.as_deref()), (Some("staging"), None));
-    assert_eq!(production.deploy.as_ref().and_then(Deploy::github).unwrap().github_workflow, "deploy-production.yml");
+    let Some(Deploy::Run(run)) = &production.deploy else { panic!("{:?}", production.deploy) };
+    assert_eq!(run, "docker build -t shop . && ./scripts/deploy.sh production");
+    assert!(!noted(&i, "deploy-production.yml", "workflow_dispatch") && !noted(&i, "deploy-production.yml", "takes no commit"), "{:?}", i.not_translated);
 
     assert!(noted(&i, "ci.yml, job test", "matrix `node`"));
     assert!(noted(&i, "ci.yml, job e2e", "actions/upload-artifact"));
     assert!(noted(&i, "ci.yml, job e2e", "slackapi/slack-github-action"));
-    // A deploy runs in GitHub: its actions and secrets stay there, nothing to translate.
+}
+
+#[test]
+fn keep_github_leaves_every_deploy_to_the_bridge() {
+    let i = avp::importci::import_with(&fixture("node-monorepo"), true).unwrap();
+    let cfg: AvpConfig = toml::from_str(&i.toml).unwrap();
+    assert_eq!(cfg.envs["production"].deploy.as_ref().and_then(Deploy::github).unwrap().github_workflow, "deploy-production.yml");
+    assert!(cfg.envs["staging"].deploy.as_ref().and_then(Deploy::github).is_some());
+    // On GitHub, its actions and secrets stay there: nothing to translate.
     assert!(!i.not_translated.iter().any(|n| n.at.starts_with("deploy-")), "{:?}", i.not_translated);
+}
+
+#[test]
+fn a_github_deploy_job_becomes_the_commands_avp_runs() {
+    let dir = std::env::temp_dir().join(format!("avp-importci-run-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(
+        dir.join(".github/workflows/deploy.yml"),
+        "on:\n  push:\n    branches: [main]\njobs:\n  ship:\n    environment: staging\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v4\n      - run: npm run build\n        working-directory: web\n        env:\n          API_KEY: ${{ secrets.API_KEY }}\n      - run: ./deploy.sh ${{ github.sha }}\n      - if: failure()\n        run: ./page-someone.sh\n",
+    )
+    .unwrap();
+    let (i, cfg) = import(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(Deploy::Run(run)) = &cfg.envs["staging"].deploy else { panic!("{}", i.toml) };
+    // `API_KEY=${API_KEY}` says nothing: the server's environment gives it (AVP_DEPLOY_ENV).
+    assert_eq!(run, "set -e\n(\n  cd web\n  npm run build\n)\n./deploy.sh {git}\n");
+    assert!(noted(&i, "deploy.yml, job ship", "`$API_KEY`, kept by GitHub") && noted(&i, "deploy.yml, job ship", "actions/setup-node"), "{:?}", i.not_translated);
+    assert!(!noted(&i, "deploy.yml", "workflow_dispatch"), "AVP runs it: no dispatch needed");
 }
 
 #[test]

@@ -19,6 +19,7 @@ pub mod offline;
 pub mod seam;
 pub mod server;
 pub mod stats;
+pub mod testcost;
 pub mod up;
 pub mod view;
 pub mod wait;

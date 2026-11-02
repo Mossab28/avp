@@ -17,11 +17,13 @@ has what a team leans on, each in its section:
 |---|---|
 | Proof workers on your own runners (`avp worker`, `AVP_WORKERS=1`) and the drain before an update | [Your checks, your environments](#your-checks-your-environments), [A team server](#a-team-server) |
 | The full suite after each landing, its flaky reruns and reverts, `avp full` | [Your checks, your environments](#your-checks-your-environments), [Scheduled suites](#scheduled-suites) |
-| Environments: `avp envs`, `avp promote`, `avp rollback`, deploys, the GitHub bridge | [Your checks, your environments](#your-checks-your-environments), [Rollback](#rollback) |
+| Environments: `avp envs`, `avp promote`, `avp rollback`, deploys AVP runs, the GitHub bridge | [Your checks, your environments](#your-checks-your-environments), [Rollback](#rollback) |
 | A person in the loop: `avp approve`, `avp refuse`, `avp landing`, `avp guard` | [A person in the loop](#a-person-in-the-loop) |
 | Secrets for tests: `avp secret` | [Secrets for tests](#secrets-for-tests) |
+| Proofs of strangers' code in a throwaway container: `AVP_SANDBOX` | [Proofs in a sandbox](#proofs-in-a-sandbox) |
 | `avp stats` and the before and after, AVP Live | [Measure it](#measure-it) |
 | Accounts and tokens: `avp user`, `avp token`, `avp whoami` | [A team server](#a-team-server) |
+| Sign-up, organizations, plans and proof minutes: `avp org` (`AVP_CLOUD=1`) | [AVP Cloud: organizations and plans](#avp-cloud-organizations-and-plans) |
 
 AVP Cloud is the same AVP, hosted: we run the server, its storage and the runners for a team.
 Nothing in this guide needs it. Offering AVP to others that way is the one thing the license
@@ -46,9 +48,11 @@ setup_links = ["node_modules"]
 name = "typecheck"
 run = "node_modules/.bin/tsc --noEmit -p ."
 
+auto_skip = { after = 100, min_seconds = 5 }   # the default; `false` turns it off
+
 [[check.steps]]
 name = "tests"
-run = "node_modules/.bin/vitest related --run --passWithNoTests --shard={shard} {files}"
+run = "node_modules/.bin/vitest related --run --passWithNoTests --shard={shard} $(for f in {skip_files}; do printf -- '--exclude %s ' $f; done) {files}"
 needs_files = true
 split = 40                     # about 40 related test files per job, the jobs side by side
 
@@ -63,28 +67,40 @@ ports = [5432]                 # each mapped to a free port of the machine, for 
 ready = "pg_isready -U postgres"   # inside the container; or a port: ready = 5432
 env = { POSTGRES_PASSWORD = "avp", DATABASE_URL = "postgres://postgres:avp@127.0.0.1:{port}/postgres" }
 
-[github]
-repo = "acme/shop"             # where AVP's bridge dispatches deploys and writes avp/full
-
 [envs.staging]
 follow = "full"                # AVP promotes each position whose whole suite is green
-deploy = { github_workflow = "deploy-staging.yml", inputs = { sha = "{git}" } }
-serves = "https://staging.acme.com/release.json"   # answers the commit it serves: it moves then
+deploy = { run = "./scripts/deploy.sh staging {git}" }   # AVP runs it itself, on the server
 
 [envs.production]
 after = "staging"              # only what staging serves
 approvers = ["alice", "bob"]   # their promotion is the approval
-deploy = { github_workflow = "deploy-production.yml", approve_environment = "production" }
+deploy = { run = "./scripts/deploy.sh production {git}" }
 
-[envs.preview]
+[envs.preview]                 # or, while a team moves over, a workflow GitHub runs:
 follow = "full"
-deploy = { run = "./scripts/deploy.sh preview {position}" }   # AVP runs it itself
+deploy = { github_workflow = "deploy-preview.yml", inputs = { sha = "{git}" } }
+
+[github]
+repo = "acme/shop"             # where AVP's bridge dispatches that workflow and writes avp/full
 ```
 
 A step with `split` runs as several jobs when the task reaches more related tests than one job's
 share: AVP counts them through the imports, runs that many shares side by side with `{shard}` as
 `i/n`, beside one job for the other steps, and stops every part as soon as one is red. The test
 runner still decides which tests are related, so the proof runs the same tests, sooner.
+
+Slow test files that never fail leave the proofs by themselves: a test file green in each of its
+last `after` runs (proofs and full suites alike, 100 by default) whose median run takes
+`min_seconds` or more (5) is left out of the proofs, and the step gets it in `{skip_files}`, the
+paths space separated, as `{files}`: vitest takes each after `--exclude`, pytest after
+`--deselect`, a script of yours reads them as arguments. The full suite still runs it. Red once in
+a full suite (flaky included), it is back in the next proof, and leaves again only after `after`
+green runs more. A task that writes the file itself runs it, however long it never failed. AVP
+reads that from the lines test runners print for a file (vitest's `✓ path 340ms`, jest's `PASS
+path (1.2 s)`); without a step that takes `{skip_files}`, nothing is left out. `avp tests` says
+which files are out and since when; `avp stats` keeps watch ([Measure it](#measure-it)).
+`auto_skip = false` turns it off. A server that starts reads the last 30 days of proofs again, in
+the background: until then, every test runs.
 
 Services are what the tests talk to: a database, a cache. AVP starts each `[[check.services]]`
 before the steps of a proof or of a shard of the whole suite, on the machine that runs them (the
@@ -158,6 +174,10 @@ its agent while it waits, and asks again once the server answers, and a deploy t
 the server that starts. The drain lifts with `DELETE /drain`, at its bound (`?minutes=`, 10 by
 default, 60 at most) and with the process.
 
+A deploy is `run`, a command AVP carries out itself, or, as an option while a team moves over,
+`github_workflow`, a workflow AVP's bridge dispatches on GitHub (below). With `run`, nothing of the
+deploy needs GitHub: `avp import-ci` writes the commands of a CI's deploy job as one.
+
 A `run` deploy, AVP carries out itself, on the server: it lays the promoted
 position out in the environment's own folder (what `keep` names stays from one deploy to the next)
 and runs the command there as it runs a proof's steps, `{position}` and `{git}` filled in. It sees
@@ -173,7 +193,11 @@ like it keeps the connection alive, so a proxy in between does not cut a long de
 kept as a proof (`avp proof <id>`, the id is in the event). One deploy runs at a time per
 environment: a promotion made while a deploy waits for its turn goes instead of it, so an
 environment that follows the full suite is promoted at once to each newest green position, and
-deploys the newest when the deploy before it is over.
+deploys the newest when the deploy before it is over. A deploy that prints nothing for
+`AVP_DEPLOY_STALL_S` (15 minutes by default) is said stalled: its progress in `avp envs` and AVP
+Live reads `stalled? nothing printed for 15 min, last: <its last line>`, and `env.stalled` goes to
+the webhooks ([Notifications](#notifications)). It goes on: only a person knows whether a silent
+migration is stuck.
 
 A deploy's state lives in the server's database, so a restart of the server does not lose it. A
 deploy that waited for its turn runs once the server is back. One that was running is cut: the
@@ -183,7 +207,8 @@ promote again. **A deploy command must be safe to run twice**: the server may st
 it, and the second run starts on whatever the first one left (what `kubectl apply`, `helm upgrade
 --install` or `terraform apply` do, and what a script that creates without checking does not).
 
-A `github_workflow` deploy is carried out by AVP's bridge to GitHub, inside `avp serve` when the
+A `github_workflow` deploy keeps GitHub for the deploy alone, for a team that does not move its
+deploy yet: it is carried out by AVP's bridge to GitHub, inside `avp serve` when the
 server has `AVP_GITHUB_BRIDGE=1` and a `GH_TOKEN` (or `GITHUB_TOKEN`) that may run the workflows,
 approve their environments and write commit statuses. `[github] repo` names the repo on GitHub, and
 `branch` the one workflows are dispatched on (the mirror's, `main` by default). Every 30 seconds,
@@ -301,6 +326,75 @@ refused here too (`AVP_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `AWS_*`, `CLAUDE_*`, 
 `OPENAI_*`), and so are `AVP_*` and what AVP gives every step (`PATH`, `HOME`, `CI`...). The events
 `secret.set` and `secret.removed` say who changed which name.
 
+## Proofs in a sandbox
+
+A worker that runs the code of strangers (AVP Cloud, or a server shared by several teams) starts
+with `AVP_SANDBOX=docker` (or `podman`): each job, its setup and its steps run in a container of
+their own, removed with all it holds when the job ends. Without `AVP_SANDBOX`, steps run on the
+machine as they always did: a team's own runners need nothing of this.
+
+```sh
+AVP_SANDBOX=docker AVP_SANDBOX_IMAGE=node:22-bookworm \
+AVP_SANDBOX_CPUS=2 AVP_SANDBOX_MEMORY=4g AVP_SANDBOX_PIDS=1024 AVP_SANDBOX_DISK=20g \
+AVP_SERVER=https://avp.example.com AVP_TOKEN=... avp worker --data /srv/avp/w1/data
+```
+
+What a job gets:
+
+- Its folder, read-write, and nothing else of the machine: no other job's folder, not the worker's
+  objects, its token or its variables. The repo's setup cache (`setup_links`, `node_modules`) and its
+  home (cargo's registry, pnpm's store, corepack) are mounted too, kept per repo, never shared with
+  another repo. Each is mounted at its path on the machine, so the setup's links resolve.
+- A read-only root, a `/tmp` of its own (a tmpfs, `AVP_SANDBOX_DISK` in size), a user that is not
+  root (the worker's own uid, or `AVP_SANDBOX_USER=uid:gid`), no capability, no new privilege.
+- The image `[check] image` names in avp.toml, else the worker's `AVP_SANDBOX_IMAGE`. Its `PATH` and
+  tools are the image's: the worker's `PATH`, `HOME` or `CARGO_TARGET_DIR` mean nothing there, and
+  `AVP_PROOF_ENV` passes only what it lists.
+- Limits: `AVP_SANDBOX_CPUS`, `AVP_SANDBOX_MEMORY` (swap included), `AVP_SANDBOX_PIDS`,
+  `AVP_SANDBOX_DISK` (its folder, measured every 15 s, and its `/tmp`), and the job's time,
+  `AVP_WORKER_RUN_S` (2400 s by default). The server's values come with each job it hands over and
+  come first; the worker's fill what the server leaves unsaid. A step that hits one fails and says
+  which: `sandbox: the step was killed (SIGKILL), most likely at the job's memory limit,
+  AVP_SANDBOX_MEMORY=4g`.
+- Its secrets (`[check] secrets`, a step's `secrets`) only in the steps that name them, as without a
+  sandbox: passed to the container by name, their values never on a command line.
+- Its services (`[[check.services]]`) in its own network: a service's container joins the job's
+  container's network, so `localhost:{port}` reaches it from a step as on a machine, and nothing is
+  published on the worker. `{port}` is the service's own port there (two services of one job each
+  need their own). A service's image runs as it wants (a database starts as root), with no new
+  privilege and the job's limits.
+- The internet (installs need it), and nothing else: never the cloud's metadata (169.254.169.254),
+  the private ranges (10/8, 172.16/12, 192.168/16, 100.64/10), nor the worker's machine.
+
+The network is the machine's to close, once, as root: each job's network is a bridge named `avpj`
+and 11 characters, and these rules drop what leaves one for a private address or the machine
+itself, DNS aside (docker's resolver answers inside the container, podman's on the bridge):
+
+```sh
+iptables -t mangle -N AVP-SANDBOX 2>/dev/null; iptables -t mangle -F AVP-SANDBOX
+iptables -t mangle -A AVP-SANDBOX -p udp --dport 53 -j RETURN
+iptables -t mangle -A AVP-SANDBOX -p tcp --dport 53 -j RETURN
+for net in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8; do
+  iptables -t mangle -A AVP-SANDBOX -d $net -j DROP
+done
+iptables -t mangle -C PREROUTING -i avpj+ -j AVP-SANDBOX 2>/dev/null || iptables -t mangle -I PREROUTING -i avpj+ -j AVP-SANDBOX
+iptables -C INPUT -i avpj+ -j DROP 2>/dev/null || iptables -I INPUT -i avpj+ -j DROP
+iptables -C INPUT -i avpj+ -p udp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -i avpj+ -p udp --dport 53 -j ACCEPT
+```
+
+In `mangle PREROUTING` they come before docker's and podman's own chains, which neither rewrites.
+The networks are made without IPv6. As it starts, a sandboxed worker removes the containers and
+networks an earlier run of it left, then starts a job's container and tries 169.254.169.254:80 from
+it (and each `host:port` of `AVP_SANDBOX_PROBE`, comma separated: the server's private address); if
+one answers, or the image has neither curl nor bash to try, it does not start. Nor does it start
+without `AVP_SANDBOX_IMAGE`, as root without `AVP_SANDBOX_USER`, or when docker does not answer.
+`tests/sandbox.sh`, run on a worker (Linux, docker, a user of the docker group), proves that a job
+cannot read another's folder, cannot reach 169.254.169.254, and leaves no container.
+
+A worker that runs in a container itself (AVP Cloud's, `deploy/aws/files/scripts/worker-up.sh`)
+reaches the machine's docker through its socket, and has its data folder mounted at the same path,
+since the jobs' mounts name the machine's paths.
+
 ## Rollback
 
 `avp rollback <env>` (`POST /repos/<repo>/envs/<env>/rollback`) takes an environment back to the
@@ -320,7 +414,7 @@ webhooks = ["$AVP_NOTIFY_SLACK", "https://hooks.internal.example/avp"]
 
 AVP posts a short JSON to each webhook when the full suite is red (on its retry too), a position is
 reverted (by AVP, or by the landing of a person's `avp revert`), a task waits for a person's
-approval, a deploy is done or failed (an environment with no deploy moves without a word):
+approval, a deploy is done, failed or stalled (an environment with no deploy moves without a word):
 
 ```json
 {"text": "app: the full suite is red on position 12 (Add Apple Pay), on its retry too. `avp proof proof_01...` says why.",
@@ -365,6 +459,7 @@ and proposes the avp.toml that does its work:
 ```sh
 avp import-ci            # prints it, then what it could not translate (--json for an agent)
 avp import-ci --write    # writes avp.toml, or avp.imported.toml beside the one there is
+avp import-ci --keep-github   # GitHub's deploy workflows stay there, dispatched by the bridge
 ```
 
 - Each job a push or a pull request runs becomes a `[[check.full_shards]]`: its commands, its
@@ -375,10 +470,15 @@ avp import-ci --write    # writes avp.toml, or avp.imported.toml beside the one 
 - From those jobs, the install becomes the setup, and the typecheck, the lint and the tests the
   proof, as `avp up` would write them: vitest and jest run the tests related to the task's files,
   Python tools run from the setup's virtualenv. End-to-end tests stay in the full suite.
-- A deploy job (an `environment:`, or a name that says deploy) becomes `[envs.<name>]`: a GitHub
-  workflow, which AVP's bridge dispatches with the promoted commit as its `sha` input, or a GitLab
-  job's commands as a `run` deploy. One that ran on every push follows the full suite; production
-  comes after staging.
+- A deploy job (an `environment:`, or a name that says deploy) becomes `[envs.<name>]` with a `run`
+  deploy AVP carries out itself: the job's shell steps in order, after those of the jobs it
+  `needs`, a step with its own `working-directory` or `env` in a subshell, `${{ github.sha }}` (or
+  a `sha` input) as `{git}`. The checkout, a runtime's setup and the caches need nothing there. A
+  deploy job that uses another action (`aws-actions/configure-aws-credentials`, say) only GitHub
+  runs it: it stays a `github_workflow` AVP's bridge dispatches with the promoted commit as its `sha`
+  input, and the list names the action. `--keep-github` keeps every GitHub deploy so. A GitLab
+  job's commands become a `run` deploy. One that ran on every push follows the full suite;
+  production comes after staging.
 - What a job reads that the CI keeps (`secrets.X` and `vars.X` on GitHub, a CI/CD variable on
   GitLab) becomes `secrets = ["X"]` on the shard and the step that read it
   ([Secrets for tests](#secrets-for-tests)). The values stay in the CI: what it prints ends with the
@@ -658,6 +758,98 @@ a session of its own for 14 days, until Sign out), or with GitHub when the serve
 `https://<server>/auth/github/callback` as the app's callback URL. A GitHub login signs in the person
 added with `--github <login>`.
 
+## The website
+
+The server serves a website of its own, from ui/ compiled into the binary: open its address in a
+browser (`http://127.0.0.1:7117/` for `avp up`'s). On a server with accounts it asks a person to
+sign up or sign in (email and password, GitHub, or a token), then shows:
+
+| Page | What it shows |
+|---|---|
+| `/` | your organizations and repos; with none yet, the three commands (install, login, `avp up`) with this server filled in, as `/new` does |
+| `/o/<org>` | an organization's repos, members and invitations, its plan, its proof minutes this month against the cap |
+| `/r/<repo>` | the code at the head (`?at=<position>` for another), a file, its blame (`?view=blame`) and its history; a line number says why it is what it is |
+| `/r/<repo>/line`, `/r/<repo>/p/<n>` | the line, and a position: goal, person, agent, proof, diff |
+| `/r/<repo>/tasks`, `/r/<repo>/proofs` | open tasks, and the proofs with their steps, logs and timing |
+| `/r/<repo>/envs`, `/r/<repo>/settings` | environments and deploys; roles, guarded paths, secrets' names, checks, the `git clone` URL |
+| `/settings` | your roles and your tokens: make one for each machine, revoke one |
+
+Every page reads the same routes the CLI and the agents do, behind the same gate: what a page shows,
+`avp log`, `avp show`, `avp blame`, `avp why` and `avp tasks` say too, with `--json`. The site shows
+the line and adds no verbs; AVP Live (`/live`) still shows it as it moves. A brand's design replaces
+the one block of `--avp-*` tokens at the top of ui/site.css, nothing else.
+
+## AVP Cloud: organizations and plans
+
+`AVP_CLOUD=1` makes one server host many organizations that do not know each other: anyone may
+make an account, an organization holds its repos and its members, and its plan says how many proof
+minutes a month its repos may use. A team server without `AVP_CLOUD=1` has none of this and works as
+in [A team server](#a-team-server).
+
+```sh
+AVP_CLOUD=1 AVP_SIGNUP=open AVP_TOKEN=... AVP_WORKERS=1 avp serve --listen 0.0.0.0:7117 --data /srv/avp
+avp user add ops --admin           # from the server's own machine: an admin, before anyone signs up
+```
+
+**Accounts.** With `AVP_SIGNUP=open`, anyone signs up with a name, an email and a password (kept as
+argon2id, 10 characters at least), or with GitHub when the server has an OAuth app (the GitHub login
+becomes the account's name). One who signs up is never an admin of the server. An address may sign
+up 5 times an hour and try 10 sign-ins in 10 minutes, then gets 429. Email addresses are not
+verified yet: an invitation by email goes to whoever signed up with that address, so invite by name
+where it matters.
+
+```sh
+avp user signup ada --email ada@example.com   # the password on stdin, or typed unseen: prints a token
+avp user login ada                            # name or email, and the password: a token of 90 days
+```
+
+**Organizations.** A repo is its creator's own until they bring it into an organization; either way
+it is private, reached only by those with a role on it. An org role gives the role on every repo of
+the organization (`member`: write, `admin` and `owner`: admin), unless a role given on the repo
+itself (`avp user role`) says otherwise.
+
+```sh
+avp org create acme                  # you are its owner, on the free plan
+avp org invite acme bob              # by name or by email; --role member|admin|owner
+avp org invites                      # bob: the invitations waiting for him
+avp org accept inv_01...             # bob joins (--decline refuses)
+avp org repo acme shop               # an admin of both brings the repo in: ada/shop becomes acme/shop
+avp up --org acme                    # from a checkout: the repo acme/<folder name>, created there
+avp org role acme bob admin          # member, admin, owner, or none (out)
+avp org show acme                    # plan, members, repos, invitations unanswered
+avp org log acme                     # every change: members, invitations, plan, repos
+```
+
+Only an owner makes an owner, and an organization keeps one at least. An organization's name is no
+person's: a repo's space is named by one or the other, and a repo is said `<space>/<name>`, as on
+GitHub. Its name is unique in its space alone: ada and bob may each have a `hello` (`ada/hello`,
+`bob/hello`), and a second `hello` in one organization is refused (`acme/hello already exists`).
+`--repo acme/shop`, `avp clone acme/shop`, `git clone https://<server>/acme/shop.git` and the routes
+(`/repos/acme/shop/...`) all take that form, or the repo's id; a name alone is the person's repo of
+that name when they have one, else the answer lists theirs to choose from. A view remembers the id.
+A team server without `AVP_CLOUD=1` has no spaces: its repos keep their bare names, unique on it. A person sees, lists and reaches only the
+repos and organizations they belong to, the rest answers as missing; objects too: one store holds
+every organization's, and a hash known is no right to read one (a repo gives the objects it was
+sent, its tasks wrote, or its line holds). The workers' queue (`/work`) is a server admin's.
+
+**Plans and proof minutes.** An organization is on `free`, `team` or `enterprise`; a server admin
+changes it (`avp org plan acme team`). Each calendar month (UTC), AVP meters the machine time of
+every proof and full suite of the space's repos, as `avp stats` counts it: an organization's, or a
+person's own space. `free` stops at `AVP_FREE_MINUTES` (2000 unless set): past it, a new proof
+(`avp check`, `avp land`, `avp full`) is refused with 402 and what to do, the month's usage and cap
+in the message, until the month ends or the plan changes. `avp status` says it while it lasts, so
+landing never waits silently.
+
+```sh
+avp org usage acme      # the month's minutes, of proofs and of full suites, the cap, the seats
+avp org usage           # the space of this view's repo
+avp stats               # its last line: the same month and cap
+```
+
+Every change is an event: `org.created`, `org.member`, `org.invited`, `org.joined`, `org.declined`,
+`org.plan`, `org.repo`, `user.password` (`avp org log`, and every organization's in `avp user log`).
+The routes and their JSON, for a web page or an agent: [API.md](API.md).
+
 ## Diff, clone, save points
 
 ```sh
@@ -666,6 +858,7 @@ avp diff --head src/         # against the head of the line, only what is under 
 avp diff --stat              # each file with the lines it adds and removes
 avp diff 41 42               # from position 41 to 42; `avp diff 41`: from 41 to this task
 avp clone https://avp.example.com/shop   # the head in a new folder, on a machine with no checkout
+avp clone acme/shop                      # AVP Cloud: the repo shop of acme, on the server logged in to
 avp save "parser done, tests green"      # a save point in the task
 avp saves                                # its save points
 avp undo --to 1                          # back to one, or forward, by number or message
@@ -772,6 +965,16 @@ last as long, "more" and "less" compare per day. `--save` keeps that before on t
 numbers, never the token; a new save replaces it): AVP Live's Overview and Stats compare to it,
 labeled "before AVP", `avp stats` adds it as a last row, and `GET /repos/{repo}/before` reads it.
 Without it, AVP Live compares to the same window just before.
+
+"Missed by the proof" counts the full suites red in the window: positions whose proof was green and
+whose whole suite was not. It is the guard of `[check] auto_skip`: when it grows from the window as
+long just before, `avp stats` says so, with how many test files are out of the proofs, and `avp
+tests` names them.
+
+`avp tests` (`GET /repos/{repo}/tests`, `--since` and `--until` as above, `--json`) lists the test
+files that cost the most machine time, those red then green again (flaky), those that never failed
+in 20 runs or more, and the files `auto_skip` leaves out of the proofs now, each with the time it
+left and its green runs since.
 
 AVP Live and agents read the same numbers: `GET /repos/{repo}/stats?since=&until=` (each an RFC3339
 time, a date, or `48h`) and the MCP tool `avp_stats`.
@@ -917,7 +1120,8 @@ arm64), or builds it with cargo when there is no release for your machine. From 
   Secure behind HTTPS), never the token.
 - A proof runs the steps and the services of the `avp.toml` in the task's tree, on the machine that proves it, like
   a CI configuration in a pull request. On a shared server, `avp guard avp.toml` makes any task
-  that changes it wait for a person.
+  that changes it wait for a person. Workers that prove the code of people you do not trust run each job
+  in a container of its own (`AVP_SANDBOX`, Proofs in a sandbox, above).
 - A step runs without the machine's secrets: it sees only what a build needs (`PATH`, `HOME`,
   `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `SHELL`, `CARGO_HOME`, `RUSTUP_HOME`,
   `CARGO_TARGET_DIR`, `XDG_CACHE_HOME`, `COREPACK_HOME`, `npm_config_store_dir`), plus `CI=true`.

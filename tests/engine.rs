@@ -602,6 +602,28 @@ fn a_split_step_runs_side_by_side_and_stops_at_the_first_red() {
     assert!(p.steps[0].output.contains("boom"));
 }
 
+/// A step with `own_job` runs beside the other steps instead of after them: two steps of 2 s take
+/// about 2 s, and the proof keeps them in avp.toml's order.
+#[test]
+fn a_step_on_its_own_job_runs_beside_the_others() {
+    let (e, _d) = engine();
+    let r = e.create_repo("alone", LeasePolicy::Advisory).unwrap().id;
+    let toml = "[check]\n[[check.steps]]\nname = \"typecheck\"\nrun = \"sleep 2; echo typed\"\nown_job = true\n[[check.steps]]\nname = \"scan\"\nrun = \"sleep 2; echo scanned\"\n";
+    let mut entries = vec![];
+    for (p, c) in [("avp.toml", toml), ("src/a.ts", "export const a = 1;\n")] {
+        entries.push(ImportEntry { path: p.into(), blob: e.objects.put(c.as_bytes()).unwrap(), mode: 0o100644 });
+    }
+    e.import(&r, &entries, "imported").unwrap();
+    let t = open(&e, &r, "touch a", &[]);
+    put(&e, &t.id, "src/a.ts", "export const a = 2;\n");
+    let started = Instant::now();
+    let p = e.check(&t.id).unwrap();
+    assert_eq!(p.verdict, Verdict::Green, "{:?}", p.steps);
+    assert_eq!(p.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["typecheck", "scan"]);
+    assert!(p.steps[0].output.contains("typed") && p.steps[1].output.contains("scanned"));
+    assert!(started.elapsed().as_secs_f64() < 3.5, "side by side, not one after the other: {:?}", started.elapsed());
+}
+
 /// A task is proven by its own avp.toml, a change to its checks included, but its steps get no
 /// secret the line's checks do not give: it does not hand itself one before a person reads it.
 /// Landed, the checks give it.
@@ -684,4 +706,27 @@ fn a_position_reads_as_its_diff() {
     assert!(err.contains("where the line starts"), "{err}");
     let err = client.get::<Vec<FileDiff>>("/repos/toy/line/9/diff").unwrap_err().to_string();
     assert!(err.starts_with("404") && err.contains("no position 9"), "{err}");
+}
+
+/// A conflict an earlier replay left stays a conflict when the line moves again on other files:
+/// the land refuses it, and the green proof made before it is not reused (position 115 of AVP's
+/// own line landed markers that way).
+#[test]
+fn a_conflict_left_by_a_refresh_never_lands() {
+    let (e, _d) = engine();
+    let r = repo(&e, LeasePolicy::Advisory);
+    let mine = open(&e, &r, "second line, mine", &[]);
+    put(&e, &mine.id, "src/a.txt", "a1\nmine\na3\n");
+    assert_eq!(e.check(&mine.id).unwrap().verdict, Verdict::Green);
+    let theirs = open(&e, &r, "second line, theirs", &[]);
+    put(&e, &theirs.id, "src/a.txt", "a1\ntheirs\na3\n");
+    assert!(matches!(e.land(&theirs.id).unwrap(), LandOutcome::Landed(_)));
+    assert_eq!(e.catch_up(&mine.id).unwrap().conflicts, vec!["src/a.txt".to_string()]);
+    let other = open(&e, &r, "elsewhere", &[]);
+    put(&e, &other.id, "src/b.txt", "B\n");
+    assert!(matches!(e.land(&other.id).unwrap(), LandOutcome::Landed(_)));
+    match e.land(&mine.id).unwrap() {
+        LandOutcome::NotLanded(n) => assert_eq!((n.reason.as_str(), n.conflicts), ("conflict", vec!["src/a.txt".to_string()])),
+        LandOutcome::Landed(l) => panic!("landed markers at position {}", l.position),
+    }
 }

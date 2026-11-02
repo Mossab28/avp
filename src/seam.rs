@@ -95,6 +95,12 @@ pub fn line_secrets(e: &Engine, task: &Task, tree: &Tree) -> Result<Option<Vec<S
     side::line_secrets(e, task, tree)
 }
 
+/// The test files `[check] auto_skip` leaves out of a task's proof now (`{skip_files}`): the small
+/// avp keeps no record of past proofs to read, and leaves none out.
+pub fn left_out(e: &Engine, repo: &str, rule: &crate::check::AutoSkip) -> Vec<String> {
+    side::left_out(e, repo, rule)
+}
+
 /// What holds back a task whose proof is done: a person's approval (the landing rule and guarded
 /// paths). None: it lands when green.
 pub fn landing_gate(e: &Engine, task: &Task, writes: &[Write], candidate: &Tree, proof: &Proof) -> Result<Option<NotLanded>> {
@@ -192,6 +198,10 @@ mod small {
 
     pub(super) fn line_secrets(_: &Engine, _: &Task, _: &Tree) -> Result<Option<Vec<String>>> {
         Ok(None)
+    }
+
+    pub(super) fn left_out(_: &Engine, _: &str, _: &crate::check::AutoSkip) -> Vec<String> {
+        vec![]
     }
 
     pub(super) fn landing_gate(_: &Engine, _: &Task, _: &[Write], _: &Tree, _: &Proof) -> Result<Option<NotLanded>> {

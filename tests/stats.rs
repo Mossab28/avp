@@ -63,7 +63,7 @@ run = "! grep -rq FORBIDDEN src"
         // A split step's output holds its shares' times: kept. Any other output stays in the database.
         let split = "2 jobs side by side (2 shares of the related tests)\n\n== share 1/2, 30s, exit 0\nok\n\n== share 2/2, 12s, exit 0\nok\n";
         let steps = vec![Step { name: "build".into(), command: "make".into(), exit: 0, seconds: 5.0, output: "a long log".into() }, Step { name: "tests".into(), command: "t".into(), exit: 0, seconds: 30.0, output: split.into() }];
-        e.db.lock().unwrap().insert_proof(&r, &Proof { id: new_id("proof"), task: Some("task_x".into()), base_position: 0, candidate_tree: String::new(), files: vec!["src/a.txt".into()], steps, verdict: Verdict::Green, blamed: vec![], created_at: now_ms() }).unwrap();
+        e.db.lock().unwrap().insert_proof(&r, &Proof { id: new_id("proof"), task: Some("task_x".into()), base_position: 0, candidate_tree: String::new(), files: vec!["src/a.txt".into()], steps, verdict: Verdict::Green, blamed: vec![], created_at: now_ms(), timing: None }).unwrap();
         let read = e.db.lock().unwrap().proof_times(&r, start, now_ms() + 1).unwrap();
         let mine = read.iter().find(|p| p.task.as_deref() == Some("task_x")).unwrap();
         assert_eq!((mine.steps[0].output.as_str(), mine.steps[1].output.as_str(), mine.steps[1].seconds), ("", split, 30.0));

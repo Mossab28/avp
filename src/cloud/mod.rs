@@ -1,17 +1,20 @@
 //! What a team's server adds to the core: proof workers, accounts and tokens, the full suite,
-//! approvals, secrets, environments, stats, AVP Live. The `cloud` feature, on in every default
-//! build and release binary; `--no-default-features` leaves it out. The core reaches it through
-//! `crate::seam` alone, and this module is that seam's cloud side: the core never names what is in
-//! this folder, so the folder moves as one.
+//! approvals, secrets, environments, stats, AVP Live, AVP Cloud's organizations and plans. The
+//! `cloud` feature, on in every default build and release binary; `--no-default-features` leaves
+//! it out. The core reaches it through `crate::seam` alone, and this module is that seam's cloud
+//! side: the core never names what is in this folder, so the folder moves as one.
 
 pub mod approvals;
 pub mod auth;
 pub mod envs;
 pub mod full;
 pub mod github;
+pub mod orgs;
 pub mod secrets;
 pub mod stats;
 pub mod workers;
+
+pub(crate) use stats::left_out;
 
 use crate::db::Db;
 use crate::engine::Engine;
@@ -41,6 +44,7 @@ pub(crate) fn routes() -> Router<Engine> {
         .merge(envs::routes())
         .merge(stats::routes())
         .merge(auth::routes())
+        .merge(orgs::routes())
 }
 
 /// Who asks and whether they may, for every route (see auth::gate): with no user on the server,
@@ -60,6 +64,9 @@ pub(crate) fn may_listen(addr: &str) -> Result<()> {
 }
 
 pub(crate) fn opened(engine: &Engine) {
+    if let Err(e) = orgs::settle_spaces(&engine.db.lock().unwrap()) {
+        eprintln!("repos from before spaces left in none: {e:#}");
+    }
     if let Err(e) = engine.resume_deploys() {
         eprintln!("deploys left unfinished: {e:#}");
     }

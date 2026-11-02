@@ -14,7 +14,7 @@ const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS repos (
-  id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, policy TEXT NOT NULL, created_at INTEGER NOT NULL
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, policy TEXT NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS line (
   repo TEXT NOT NULL, position INTEGER NOT NULL, task TEXT, tree TEXT NOT NULL,
@@ -90,6 +90,28 @@ CREATE INDEX IF NOT EXISTS tokens_person ON tokens (person);
 CREATE TABLE IF NOT EXISTS roles (
   repo TEXT NOT NULL, person TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (repo, person)
 );
+-- AVP Cloud (AVP_CLOUD=1): passwords of who signed up by email, organizations, their members and
+-- invitations, and the objects each repo is known to hold (one store serves every organization).
+CREATE TABLE IF NOT EXISTS passwords (
+  person TEXT PRIMARY KEY, hash TEXT NOT NULL, set_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orgs (
+  name TEXT PRIMARY KEY, plan TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS members (
+  org TEXT NOT NULL, person TEXT NOT NULL, role TEXT NOT NULL, since INTEGER NOT NULL, PRIMARY KEY (org, person)
+);
+CREATE INDEX IF NOT EXISTS members_person ON members (person);
+CREATE TABLE IF NOT EXISTS invites (
+  id TEXT PRIMARY KEY, org TEXT NOT NULL, person TEXT, email TEXT, role TEXT NOT NULL, by TEXT NOT NULL,
+  at INTEGER NOT NULL, answered_at INTEGER, accepted INTEGER
+);
+CREATE TABLE IF NOT EXISTS repo_objects (
+  repo TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (repo, hash)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS repo_trees (
+  repo TEXT NOT NULL, tree TEXT NOT NULL, PRIMARY KEY (repo, tree)
+) WITHOUT ROWID;
 "#;
 
 /// A name for a position of the line (`v1.2`): what a release is called, shown by `avp log` and AVP
@@ -262,9 +284,16 @@ fn proof_row(r: &Row) -> rusqlite::Result<Proof> {
         verdict: verdict_of(&r.get::<_, String>(6)?),
         blamed: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
         created_at: r.get(8)?,
+        timing: r.get::<_, Option<String>>(9)?.and_then(|t| serde_json::from_str(&t).ok()),
     })
 }
-const PROOF_COLS: &str = "id, task, base_position, candidate_tree, files, steps, verdict, blamed, created_at";
+const PROOF_COLS: &str = "id, task, base_position, candidate_tree, files, steps, verdict, blamed, created_at, timing";
+
+fn repo_row(r: &Row) -> rusqlite::Result<Repo> {
+    Ok(Repo { id: r.get(0)?, name: r.get(1)?, policy: policy_of(&r.get::<_, String>(2)?), created_at: r.get(3)?, landing: landing_of(&r.get::<_, String>(4)?), org: r.get(5)?, space: r.get(6)? })
+}
+/// A repo's space is its organization, else the person whose own it is (AVP Cloud's alone).
+const REPO_COLS: &str = "id, name, policy, created_at, landing, org, COALESCE(org, owner)";
 
 fn line_row(r: &Row) -> rusqlite::Result<LineEntry> {
     Ok(LineEntry {
@@ -293,9 +322,29 @@ impl Db {
         let _ = conn.execute("ALTER TABLE tasks ADD COLUMN transcript TEXT", []);
         // Older databases: what took a position back, when AVP reverted it.
         let _ = conn.execute("ALTER TABLE line ADD COLUMN reverted TEXT", []);
+        let _ = conn.execute("ALTER TABLE proofs ADD COLUMN timing TEXT", []);
         // Older databases: the task a task is stacked on.
         let _ = conn.execute("ALTER TABLE tasks ADD COLUMN on_task TEXT", []);
         conn.execute("CREATE INDEX IF NOT EXISTS tasks_on ON tasks (on_task)", [])?;
+        // Older databases: the organization a repo belongs to, or the person whose own it is (AVP Cloud).
+        let _ = conn.execute("ALTER TABLE repos ADD COLUMN org TEXT", []);
+        let _ = conn.execute("ALTER TABLE repos ADD COLUMN owner TEXT", []);
+        // Older databases: a repo's name was the server's alone. It is its space's now, so the
+        // table is laid again without the UNIQUE SQLite cannot drop in place, and one index keeps
+        // a name unique in its space. A team server's repos have no space: their names stay
+        // unique on the server, as before.
+        let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repos'", [], |r| r.get(0))?;
+        if sql.contains("name TEXT UNIQUE NOT NULL") {
+            let columns = &sql[sql.find('(').unwrap_or(0)..];
+            let laid = format!("CREATE TABLE repos_spaced {}", columns.replacen("name TEXT UNIQUE NOT NULL", "name TEXT NOT NULL", 1));
+            conn.execute_batch(&format!(
+                "BEGIN; DROP TABLE IF EXISTS repos_spaced; {laid}; INSERT INTO repos_spaced SELECT * FROM repos; DROP TABLE repos; ALTER TABLE repos_spaced RENAME TO repos; COMMIT;"
+            ))?;
+        }
+        conn.execute("CREATE INDEX IF NOT EXISTS repos_name ON repos (name)", [])?;
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS repos_space_name ON repos (COALESCE(org, owner, ''), name)", [])?;
+        // Which repo knows a blob (AVP Cloud's objects, one store for organizations that do not know each other).
+        conn.execute("CREATE INDEX IF NOT EXISTS writes_blob ON writes (blob)", [])?;
         Ok(Self { conn })
     }
 
@@ -375,29 +424,57 @@ impl Db {
 
     // ---- repos ----
     pub fn create_repo(&self, name: &str, policy: LeasePolicy) -> Result<Repo> {
-        let repo = Repo { id: new_id("repo"), name: name.to_string(), policy, landing: LandingRule::Proof, created_at: now_ms() };
+        self.create_repo_in(name, policy, None, None)
+    }
+
+    /// A repo in its space (AVP Cloud): an organization's, or a person's own. Its name is unique
+    /// there; with neither, on the server.
+    pub fn create_repo_in(&self, name: &str, policy: LeasePolicy, org: Option<&str>, owner: Option<&str>) -> Result<Repo> {
+        let space = org.or(owner).map(String::from);
+        let said = space.as_ref().map(|s| format!("{s}/{name}")).unwrap_or_else(|| name.to_string());
+        anyhow::ensure!(!name.is_empty() && !name.contains('/'), "{name:?} is no repo name: a name has no `/` (on AVP Cloud, `<space>/<name>` says whose it is)");
+        anyhow::ensure!(self.repo_in(space.as_deref(), name)?.is_none(), "{said} already exists: choose another name");
+        let repo = Repo { id: new_id("repo"), name: name.to_string(), policy, landing: LandingRule::Proof, created_at: now_ms(), org: org.map(String::from), space };
         self.conn.execute(
-            "INSERT INTO repos (id, name, policy, landing, created_at) VALUES (?1, ?2, ?3, 'proof', ?4)",
-            params![repo.id, repo.name, policy_str(policy), repo.created_at],
+            "INSERT INTO repos (id, name, policy, landing, created_at, org, owner) VALUES (?1, ?2, ?3, 'proof', ?4, ?5, ?6)",
+            params![repo.id, repo.name, policy_str(policy), repo.created_at, org, owner],
         )?;
         Ok(repo)
     }
 
-    /// By id or by name.
+    /// The id of the repo `name` in `space` (None: a repo of no space).
+    pub fn repo_in(&self, space: Option<&str>, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM repos WHERE COALESCE(org, owner, '') = ?1 AND name = ?2", params![space.unwrap_or(""), name], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// By id, by `<space>/<name>`, or by its name alone when no other space has one of that name.
     pub fn repo(&self, key: &str) -> Result<Repo> {
-        self.conn
-            .query_row(
-                "SELECT id, name, policy, created_at, landing FROM repos WHERE id = ?1 OR name = ?1",
-                params![key],
-                |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, policy: policy_of(&r.get::<_, String>(2)?), created_at: r.get(3)?, landing: landing_of(&r.get::<_, String>(4)?) }),
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("no repo {key}"))
+        let (space, name) = key.split_once('/').unwrap_or(("", key));
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {REPO_COLS} FROM repos WHERE id = ?1 OR name = ?1 OR (?2 != '' AND COALESCE(org, owner, '') = ?2 AND name = ?3) ORDER BY id = ?1 DESC, name = ?1 DESC, COALESCE(org, owner)"
+        ))?;
+        let found = st.query_map(params![key, space, name], repo_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        match found.as_slice() {
+            [] => Err(anyhow!("no repo {key}")),
+            [one] => Ok(one.clone()),
+            [first, ..] if first.id == key => Ok(first.clone()),
+            many => Err(anyhow!("{key} names {} repos: {}. Say which, as `<space>/{key}`", many.len(), many.iter().map(Repo::full_name).collect::<Vec<_>>().join(", "))),
+        }
+    }
+
+    /// The repos of this name, in every space.
+    pub fn repos_named(&self, name: &str) -> Result<Vec<Repo>> {
+        let mut st = self.conn.prepare(&format!("SELECT {REPO_COLS} FROM repos WHERE name = ?1 ORDER BY COALESCE(org, owner)"))?;
+        let rows = st.query_map(params![name], repo_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn repos(&self) -> Result<Vec<Repo>> {
-        let mut st = self.conn.prepare("SELECT id, name, policy, created_at, landing FROM repos ORDER BY created_at")?;
-        let rows = st.query_map([], |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, policy: policy_of(&r.get::<_, String>(2)?), created_at: r.get(3)?, landing: landing_of(&r.get::<_, String>(4)?) }))?;
+        let mut st = self.conn.prepare(&format!("SELECT {REPO_COLS} FROM repos ORDER BY created_at"))?;
+        let rows = st.query_map([], |r| repo_row(r))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -583,8 +660,8 @@ impl Db {
     // ---- proofs ----
     pub fn insert_proof(&self, repo: &str, proof: &Proof) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO proofs (repo, {PROOF_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
-            params![repo, proof.id, proof.task, proof.base_position, proof.candidate_tree, serde_json::to_string(&proof.files)?, serde_json::to_string(&proof.steps)?, verdict_str(proof.verdict), serde_json::to_string(&proof.blamed)?, proof.created_at],
+            &format!("INSERT INTO proofs (repo, {PROOF_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            params![repo, proof.id, proof.task, proof.base_position, proof.candidate_tree, serde_json::to_string(&proof.files)?, serde_json::to_string(&proof.steps)?, verdict_str(proof.verdict), serde_json::to_string(&proof.blamed)?, proof.created_at, proof.timing.as_ref().map(serde_json::to_string).transpose()?],
         )?;
         Ok(())
     }
@@ -632,12 +709,19 @@ impl Db {
 
     /// The proofs made in [since, until), for what they cost: each step's name, exit and seconds,
     /// read inside SQLite without its output (a full suite's weighs megabytes), save a split step's,
+    /// The ids of the repo's proofs made in [since, until), oldest first: read one at a time after.
+    pub fn proof_ids_between(&self, repo: &str, since: i64, until: i64) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT id FROM proofs WHERE repo = ?1 AND created_at >= ?2 AND created_at < ?3 ORDER BY created_at")?;
+        let rows = st.query_map(params![repo, since, until], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// which holds the time of each of its shares. Files and blame come back empty.
     pub fn proof_times(&self, repo: &str, since: i64, until: i64) -> Result<Vec<Proof>> {
         let mut st = self.conn.prepare(
             "SELECT id, task, base_position, verdict, created_at, (SELECT json_group_array(json_object('name', json_extract(s.value, '$.name'), 'command', '', \
              'exit', json_extract(s.value, '$.exit'), 'seconds', json_extract(s.value, '$.seconds'), 'output', \
-             CASE WHEN json_extract(s.value, '$.output') GLOB '[0-9]* jobs side by side*' THEN json_extract(s.value, '$.output') ELSE '' END)) FROM json_each(proofs.steps) s) \
+             CASE WHEN json_extract(s.value, '$.output') GLOB '[0-9]* jobs side by side*' THEN json_extract(s.value, '$.output') ELSE '' END)) FROM json_each(proofs.steps) s), timing \
              FROM proofs WHERE repo = ?1 AND created_at >= ?2 AND created_at < ?3 ORDER BY created_at",
         )?;
         let rows = st.query_map(params![repo, since, until], |r| {
@@ -651,6 +735,7 @@ impl Db {
                 verdict: verdict_of(&r.get::<_, String>(3)?),
                 blamed: vec![],
                 created_at: r.get(4)?,
+                timing: r.get::<_, Option<String>>(6)?.and_then(|t| serde_json::from_str(&t).ok()),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

@@ -14,11 +14,13 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 pub(crate) fn routes() -> Router<Engine> {
     Router::new()
         .route("/repos/{repo}/stats", get(stats_route))
         .route("/repos/{repo}/before", get(before).post(save_before))
+        .route("/repos/{repo}/tests", get(tests_route))
 }
 
 /// The events the numbers come from.
@@ -45,8 +47,28 @@ pub fn stats(e: &Engine, repo: &str, since: i64, until: i64) -> Result<Stats> {
     }
     let records = Records { landings, proofs: db.proof_times(repo, since, until)?, events: db.events_of(repo, &KINDS, since)? };
     let before = db.before(repo)?;
+    let head = db.head(repo)?;
+    // The window as long before this one: whether what the proofs miss grows.
+    let missed_before = db.events_of(repo, &["line.red"], since - (until - since))?.iter().filter(|e| e.at < since).count();
     drop(db);
-    Ok(Stats { before, ..compute(&name, since, until, &records) })
+    let cfg = head.and_then(|h| e.objects.get_tree(&h.tree).ok()).and_then(|t| crate::check::read_config(&t, &e.objects).ok());
+    // The price avp.toml gives at the head of the line, or the server's (AVP_MACHINE_HOUR_USD).
+    let price = cfg.as_ref().and_then(|c| c.stats.machine_hour_usd).or_else(|| std::env::var("AVP_MACHINE_HOUR_USD").ok().and_then(|v| v.parse().ok()));
+    let left_out = cfg.as_ref().filter(|c| takes_skip_files(&c.check)).and_then(|c| c.check.auto_skip).map(|rule| left_out(e, repo, &rule).len()).unwrap_or(0);
+    let mut s = Stats { before, full_red_before: Some(missed_before), tests_left_out: left_out, ..compute(&name, since, until, &records) };
+    if let Some(rate) = price.filter(|r: &f64| *r > 0.0) {
+        let cost = s.machine_minutes.total / 60.0 * rate;
+        s.cost_usd = Some((cost * 100.0).round() / 100.0);
+        s.cost_per_landing_usd = (s.landings > 0).then(|| (cost / s.landings as f64 * 100.0).round() / 100.0);
+    }
+    Ok(s)
+}
+
+/// What a repo's proofs and full suites cost the machines over [since, until), as `avp stats` counts
+/// it (a deploy's run is not proof time): what AVP Cloud meters on an organization's plan.
+pub fn machine_minutes(db: &crate::db::Db, repo: &str, since: i64, until: i64) -> Result<MachineMinutes> {
+    let records = Records { landings: vec![], proofs: db.proof_times(repo, since, until)?, events: db.events_of(repo, &KINDS, since)? };
+    Ok(compute(repo, since, until, &records).machine_minutes)
 }
 
 pub fn compute(repo: &str, since: i64, until: i64, r: &Records) -> Stats {
@@ -100,6 +122,7 @@ pub fn compute(repo: &str, since: i64, until: i64, r: &Records) -> Stats {
     // A proof with no task is a full suite's, or a deploy's: the deploy's event names it.
     let deploys: BTreeSet<&str> = events.iter().filter(|e| e.kind.starts_with("env.")).filter_map(|e| e.data["proof"].as_str()).collect();
     let (mut durations, mut proof_s, mut full_s) = (vec![], 0.0, 0.0);
+    let (mut total, mut wait, mut prep) = (vec![], vec![], vec![]);
     for p in &r.proofs {
         if p.task.is_none() {
             if !deploys.contains(p.id.as_str()) {
@@ -116,8 +139,15 @@ pub fn compute(repo: &str, since: i64, until: i64, r: &Records) -> Stats {
         if took > 0.0 {
             durations.push(took);
         }
+        if let Some(t) = p.timing.as_ref().filter(|_| took > 0.0) {
+            total.push(t.total_s);
+            wait.push(t.wait_s);
+            prep.push(t.prep_s);
+            s.setup_misses += usize::from(t.setup_ran);
+        }
     }
     s.proof_duration = Spread::of(durations);
+    (s.proof_total, s.proof_wait, s.proof_prep) = (Spread::of(total), Spread::of(wait), Spread::of(prep));
     s.machine_minutes = MachineMinutes { proofs: tenth(proof_s / 60.0), full_suites: tenth(full_s / 60.0), total: tenth((proof_s + full_s) / 60.0) };
 
     let replayed: Vec<&Event> = events.iter().filter(kind("task.replayed")).filter(in_window).copied().collect();
@@ -177,6 +207,124 @@ async fn stats_route(State(e): S, P(repo): P<String>, Query(q): Query<StatsQuery
     .await?)
 }
 
+/// What each test file cost and caught over a window (default: 7 days): `avp tests`. The proofs
+/// are read one at a time, the lock let go between two: a full suite's output weighs megabytes.
+async fn tests_route(State(e): S, P(repo): P<String>, Query(q): Query<StatsQuery>) -> R {
+    ok(blocking(move || {
+        let r = rid(&e, &repo)?;
+        let (since, until) = crate::stats::window(q.since.as_deref(), q.until.as_deref(), now_ms())?;
+        let (name, ids, head) = {
+            let db = e.db.lock().unwrap_or_else(|p| p.into_inner());
+            (db.repo(&r)?.name, db.proof_ids_between(&r, since, until)?, db.head(&r)?)
+        };
+        let mut tally = crate::testcost::Tally::default();
+        for id in ids {
+            let p = e.db.lock().unwrap_or_else(|p| p.into_inner()).proof(&id)?;
+            if let Some(p) = p {
+                tally.add(p.steps.iter().map(|s| s.output.as_str()), matches!(p.verdict, Verdict::Green | Verdict::Flaky));
+            }
+        }
+        let check = head.and_then(|h| e.objects.get_tree(&h.tree).ok()).and_then(|t| crate::check::read_config(&t, &e.objects).ok()).map(|c| c.check).unwrap_or_default();
+        let mut report = tally.report(&name, rfc3339(since), rfc3339(until));
+        report.auto_skip = check.auto_skip;
+        report.skip_files_taken = takes_skip_files(&check);
+        if let Some(rule) = check.auto_skip {
+            report.left_out = read_ledger(&e, &r, true, |l| l.left_out(&rule))?.unwrap_or_default();
+        }
+        Ok(report)
+    })
+    .await?)
+}
+
+// ---- [check] auto_skip ----
+
+/// How far back a server that starts reads the proofs: a file left out runs in every full suite,
+/// which gives it its `after` green runs well within this.
+const LEDGER_DAYS: i64 = 30;
+/// Proofs are written as they end, their time the moment they are: read again this far back, a
+/// proof written while the last reading went on is not missed.
+const LEDGER_OVERLAP_MS: i64 = 60_000;
+
+/// Each repo's ledger of test runs, kept up as proofs come.
+struct Kept {
+    ledger: crate::testcost::Ledger,
+    read_until: i64,
+    /// The proofs read in the overlap: not read twice.
+    seen: Vec<(i64, String)>,
+}
+
+static LEDGERS: Mutex<BTreeMap<String, Kept>> = Mutex::new(BTreeMap::new());
+static BUILDING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Whether a step of the checks takes the files left out: without one, none is.
+pub fn takes_skip_files(check: &crate::check::CheckConfig) -> bool {
+    check.steps.iter().any(|s| s.run.contains("{skip_files}"))
+}
+
+/// The test files `rule` leaves out of a proof of `repo` now. While the server reads the proofs a
+/// first time (in the background), none: every test runs, as before.
+pub fn left_out(e: &Engine, repo: &str, rule: &crate::check::AutoSkip) -> Vec<String> {
+    match read_ledger(e, repo, false, |l| l.left_out(rule)) {
+        Ok(out) => out.unwrap_or_default().into_iter().map(|f| f.path).collect(),
+        Err(err) => {
+            eprintln!("auto_skip of {repo}: {err:#}");
+            vec![]
+        }
+    }
+}
+
+/// `f` of the repo's ledger, brought up to the last proof. A first reading runs here when `wait`,
+/// in the background otherwise (and the answer is None until it is done).
+fn read_ledger<T>(e: &Engine, repo: &str, wait: bool, f: impl FnOnce(&crate::testcost::Ledger) -> T) -> Result<Option<T>> {
+    let mut all = LEDGERS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(k) = all.get_mut(repo) {
+        catch_up(e, repo, k)?;
+        return Ok(Some(f(&k.ledger)));
+    }
+    drop(all);
+    if !wait {
+        if BUILDING.lock().unwrap_or_else(|p| p.into_inner()).insert(repo.to_string()) {
+            let (e, repo) = (e.clone(), repo.to_string());
+            std::thread::spawn(move || {
+                if let Err(err) = build_ledger(&e, &repo) {
+                    eprintln!("auto_skip of {repo}: {err:#}");
+                }
+                BUILDING.lock().unwrap_or_else(|p| p.into_inner()).remove(&repo);
+            });
+        }
+        return Ok(None);
+    }
+    build_ledger(e, repo)?;
+    let mut all = LEDGERS.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(all.get_mut(repo).map(|k| f(&k.ledger)))
+}
+
+/// The first reading, outside the lock of every ledger: a month of proofs takes a while.
+fn build_ledger(e: &Engine, repo: &str) -> Result<()> {
+    let mut k = Kept { ledger: Default::default(), read_until: now_ms() - LEDGER_DAYS * 24 * 3_600_000, seen: vec![] };
+    catch_up(e, repo, &mut k)?;
+    LEDGERS.lock().unwrap_or_else(|p| p.into_inner()).entry(repo.to_string()).or_insert(k);
+    Ok(())
+}
+
+/// Feeds the ledger the proofs written since it last read, oldest first, one at a time.
+fn catch_up(e: &Engine, repo: &str, k: &mut Kept) -> Result<()> {
+    let now = now_ms();
+    let from = k.read_until - LEDGER_OVERLAP_MS;
+    let ids = e.db.lock().unwrap_or_else(|p| p.into_inner()).proof_ids_between(repo, from, now + 1)?;
+    k.seen.retain(|(at, _)| *at >= from);
+    for id in ids {
+        if k.seen.iter().any(|(_, s)| *s == id) {
+            continue;
+        }
+        let Some(p) = e.db.lock().unwrap_or_else(|p| p.into_inner()).proof(&id)? else { continue };
+        k.ledger.add(p.created_at, p.steps.iter().map(|s| s.output.as_str()));
+        k.seen.push((p.created_at, id));
+    }
+    k.read_until = now;
+    Ok(())
+}
+
 /// The before AVP a person saved (`avp stats --github --before --save`): GitHub's numbers only, read
 /// where the token is; the server never sees the token. Each save replaces the one before it.
 async fn before(State(e): S, P(repo): P<String>) -> R {
@@ -217,7 +365,7 @@ mod tests {
     }
 
     fn proof(id: &str, task: Option<&str>, verdict: Verdict, steps: Vec<Step>) -> Proof {
-        Proof { id: id.into(), task: task.map(String::from), base_position: 0, candidate_tree: String::new(), files: vec![], steps, verdict, blamed: vec![], created_at: T0 }
+        Proof { id: id.into(), task: task.map(String::from), base_position: 0, candidate_tree: String::new(), files: vec![], steps, verdict, blamed: vec![], created_at: T0, timing: None }
     }
 
     #[test]

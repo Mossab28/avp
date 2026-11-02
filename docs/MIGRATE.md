@@ -93,7 +93,8 @@ avp import-ci --write    # avp.imported.toml beside the avp.toml avp up landed, 
 `avp import-ci` reads `.github/workflows/*.yml` (and `.gitlab-ci.yml`). The jobs a push or a pull
 request runs become the full suite, one shard each, with their matrix; their install, typecheck,
 lint and tests become the proof (`[check]`, the tests related to the task's files); their
-`services:` become `[[check.services]]`; their deploy workflows become `[envs]`. It lists the tools
+`services:` become `[[check.services]]`; their deploy jobs become `[envs]`, each with a `run`
+deploy made of the job's commands, which AVP runs without GitHub. It lists the tools
 the CI set up on its runners (a Node version, pnpm): the machines that prove, the server and the
 workers, need them, and docker or podman for the services. Each thing it could not translate is a
 line with what to do. Carry what you keep into `avp.toml`, delete `avp.imported.toml`, then
@@ -196,10 +197,19 @@ A `run` deploy is carried out by AVP on the server: it lays the promoted positio
 environment's own folder and runs the command there, `{git}` and `{position}` filled in. Its
 credentials are named in `AVP_DEPLOY_ENV` on the server (`AVP_DEPLOY_ENV=KUBECONFIG,REGISTRY_TOKEN`),
 and reach deploys only, never a proof. Exit 0 moves the environment. The command must be safe to run
-twice: a restart of the server runs a cut deploy again from the start.
+twice: a restart of the server runs a cut deploy again from the start. One that fails says why in
+`avp envs` and to the webhooks; one silent for 15 minutes (`AVP_DEPLOY_STALL_S`) is said stalled
+there too.
 
-`avp import-ci` writes deploys as `github_workflow`, the workflow dispatched with the promoted
-commit. AVP's bridge to GitHub carries them out, inside the server: start `avp serve` with
+`avp import-ci` writes deploys as `run`: the shell steps of the workflow's deploy job, after those
+of the jobs it `needs`, the commit as `{git}`. What the job read from `secrets.` is named in the list,
+for `AVP_DEPLOY_ENV`. A deploy job that uses an action only GitHub runs (cloud credentials, say)
+stays a `github_workflow`, and the list names the action: put the command it stands for in the `run`
+to leave GitHub for good.
+
+**Option: keep GitHub for the deploys.** `avp import-ci --keep-github` writes every GitHub deploy
+as `github_workflow`, the workflow dispatched with the promoted commit. AVP's bridge to GitHub
+carries them out, inside the server: start `avp serve` with
 `AVP_GITHUB_BRIDGE=1` and a `GH_TOKEN` that may run the workflows, approve their environments and
 write commit statuses, and name the repo in avp.toml:
 
@@ -231,7 +241,8 @@ bridge takes the run of the workflow started since the promotion rather than dis
 One older than 30 minutes with no run (a deploy that failed before the switch) is not dispatched
 again: promote it again if it is still wanted.
 
-Either way, take `push:` out of the deploy workflows' triggers. At Murmell, the CI kept starting
+Either way, `run` or the bridge, take `push:` out of the deploy workflows' triggers (or delete those
+workflows once their deploy is a `run`). At Murmell, the CI kept starting
 staging too, took the place of AVP's deploy in GitHub's queue, and AVP's was cancelled.
 
 ```sh
@@ -276,3 +287,51 @@ does not read deploy runs per pull request. [CASE-MURMELL.md](CASE-MURMELL.md) s
 were taken.
 
 **Go back.** Nothing to undo: it only reads.
+
+## Come in from Git, leave with Git
+
+Nobody moves their code to a host they cannot leave. Both doors stay open, and both speak Git.
+
+**In.** `avp import` creates the repo on the server with its history, from a checkout here or from a
+URL it clones itself:
+
+```sh
+avp import .                                   # a checkout on this machine
+avp import github.com/acme/shop                # GitHub over https; GH_TOKEN for a private repo
+avp import https://git.example.com/shop.git --name shop --history 500
+```
+
+Each first-parent commit of HEAD becomes a position, oldest first, with a progress line (`--history
+N` keeps the last N; all of them by default). Then the whole history goes to the server as one
+bundle, streamed from disk, so a clone from AVP later gives the very same commits. The token of a
+private GitHub repo is read from `GH_TOKEN` (or `GITHUB_TOKEN`) and handed to git as a header, never
+on a command line. A name already taken is refused: bring the new commits of a repo that exists in
+with `avp import-git <name>` from its checkout. `--json` says the repo, its head and the `git clone`
+line.
+
+**Out.** Any Git client clones the line, read only:
+
+```sh
+git clone https://<server>/acme/shop.git       # its organization (or owner) in front, or just /shop.git
+```
+
+One branch, `main`: the head of the line, one commit per position, on top of the imported history
+(written as `avp mirror` writes them: the task's goal, its person and agent as author, the
+`AVP-Position`, `AVP-Task` and `AVP-Proof` trailers). The server keeps a bare repo of each line
+(`<data>/git-served/`) and brings it up to the head as a clone asks; `git http-backend` serves it,
+so the server needs git (the image has it). Shallow clones and later fetches work as with any Git
+host. A line created without `avp import` clones too, from its first position.
+
+On a server with accounts, the password is a token of a person with a role on the repo (any name):
+`git clone https://ada:$AVP_TOKEN@<server>/shop.git`, or let a credential helper keep it. Without a
+token, or with the token of a person who has no role on the repo, the clone is refused. A server
+without accounts and without `AVP_TOKEN` serves anyone who reaches it.
+
+A push is refused, with a message that says to land through AVP: the line moves by tasks proven on
+its head, nothing else.
+
+**Check.** `git clone` of the repo, then `diff -r -x .git -x .avp` against a view of the head: no
+difference. `git log` shows the original commits under the landed positions.
+
+**Go back.** Nothing to undo: the import adds a repo, the clone only reads. Leaving AVP is that
+clone, pushed to any Git host.

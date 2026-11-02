@@ -741,6 +741,121 @@ async fn proof_artifacts(State(e): S, P((repo, id)): P<(String, String)>, Query(
     Ok(([(axum::http::header::CONTENT_TYPE, "application/gzip".to_string()), (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))], bytes).into_response())
 }
 
+/// The git history `avp import` sends, streamed to disk (it may be bigger than memory), then taken
+/// as the start of what `git clone` of the repo gives.
+async fn git_history(State(e): S, P(repo): P<String>, body: axum::body::Body) -> R {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let r = { let e = e.clone(); blocking(move || rid(&e, &repo)).await? };
+    let dir = crate::gitbridge::served_root(&e.data);
+    tokio::fs::create_dir_all(&dir).await.map_err(|x| err(x.into()))?;
+    let file = dir.join(format!("{}.bundle.{}", r, ulid::Ulid::new()));
+    let mut out = tokio::fs::File::create(&file).await.map_err(|x| err(x.into()))?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|x| err(anyhow::anyhow!(x)))?;
+        out.write_all(&chunk).await.map_err(|x| err(x.into()))?;
+    }
+    out.flush().await.map_err(|x| err(x.into()))?;
+    let taken = blocking(move || {
+        let sha = crate::gitbridge::take_bundle(&e, &r, &file);
+        let _ = std::fs::remove_file(&file);
+        sha
+    })
+    .await?;
+    ok(serde_json::json!({ "main": taken }))
+}
+
+fn git_said(code: StatusCode, msg: String) -> Response {
+    // Plain text: git shows such a body to the person, each line after `remote:`.
+    (code, [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], format!("{msg}\n")).into_response()
+}
+
+/// `git clone https://<server>/<repo>.git`, read only: the smart HTTP protocol on the server's own
+/// bare repo of the line (gitbridge::sync_served), answered by `git http-backend`. The gate let
+/// through only the repo's readers. A push is refused: the line moves by landing, nothing else.
+async fn git_http(State(e): S, method: axum::http::Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let Some((key, rest)) = path.split_once(".git/") else { return git_said(StatusCode::NOT_FOUND, format!("no repo at /{path}")) };
+    // `<space>/<repo>.git` on AVP Cloud reaches that space's repo alone.
+    let query = uri.query().unwrap_or("").to_string();
+    if rest == "git-receive-pack" || query.contains("service=git-receive-pack") {
+        return git_said(StatusCode::FORBIDDEN, format!("AVP takes no push: the line of {key} moves by landing tasks, each proven on its head.\nOpen a task and land it: `avp open --repo {key} --goal \"...\"`, write, then `avp land`."));
+    }
+    let (key, rest) = (key.to_string(), rest.to_string());
+    let advert = rest == "info/refs";
+    let synced = blocking(move || {
+        let r = rid(&e, &key)?;
+        // The refs are read once, at info/refs: the upload-pack that follows reads the same.
+        if advert { crate::gitbridge::sync_served(&e, &r) } else { Ok(crate::gitbridge::served_root(&e.data).join(format!("{r}.git"))) }
+    })
+    .await;
+    let dir = match synced {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let (Some(root), Some(name)) = (dir.parent(), dir.file_name()) else { return git_said(StatusCode::NOT_FOUND, "no served repo".into()) };
+    let header = |h: &str| headers.get(h).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("http-backend")
+        .env("GIT_PROJECT_ROOT", root)
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("PATH_INFO", format!("/{}/{rest}", name.to_string_lossy()))
+        .env("REQUEST_METHOD", method.as_str())
+        .env("QUERY_STRING", query)
+        .env("CONTENT_TYPE", header("content-type"))
+        .env("CONTENT_LENGTH", body.len().to_string())
+        .env("HTTP_CONTENT_ENCODING", header("content-encoding"))
+        .env("GIT_PROTOCOL", header("git-protocol"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(x) => return git_said(StatusCode::SERVICE_UNAVAILABLE, format!("this server has no git to serve clones with: {x}")),
+    };
+    let mut stdin = child.stdin.take().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(&body).await;
+    });
+    // A CGI answer: headers, a blank line, then the pack, streamed as git writes it.
+    use tokio::io::AsyncBufReadExt;
+    let mut out = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut resp = Response::builder();
+    loop {
+        let mut line = String::new();
+        match out.read_line(&mut line).await {
+            Ok(0) | Err(_) => return git_said(StatusCode::INTERNAL_SERVER_ERROR, "git http-backend gave no answer".into()),
+            Ok(_) => {}
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("status") {
+                resp = resp.status(v.split(' ').next().and_then(|c| c.parse::<u16>().ok()).unwrap_or(500));
+            } else {
+                resp = resp.header(k, v);
+            }
+        }
+    }
+    let stream = futures_util::stream::unfold((out, child), |(mut out, child)| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match out.read(&mut buf).await {
+            Ok(0) | Err(_) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(Bytes::from(buf)), (out, child)))
+            }
+        }
+    });
+    resp.body(axum::body::Body::from_stream(stream)).unwrap_or_else(|x| git_said(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()))
+}
+
 /// The binary this server runs and its hash, read once.
 fn own_binary() -> anyhow::Result<&'static (Vec<u8>, String)> {
     static BIN: std::sync::OnceLock<(Vec<u8>, String)> = std::sync::OnceLock::new();
@@ -765,9 +880,84 @@ async fn client_binary() -> R {
     Ok(([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes.clone()).into_response())
 }
 
+/// AVP's website (ui/): its files, compiled in so the one binary serves them, as it serves Live.
+const SITE_FILES: &[(&str, &str, &str)] = &[
+    ("site.css", "text/css; charset=utf-8", include_str!("../ui/site.css")),
+    ("site.js", "text/javascript; charset=utf-8", include_str!("../ui/site.js")),
+    ("repo.js", "text/javascript; charset=utf-8", include_str!("../ui/repo.js")),
+];
+const SITE_PAGE: &str = include_str!("../ui/site.html");
+/// AVP Cloud's landing page: what a browser signed out sees on `/`, and always on `/welcome`.
+const LANDING_PAGE: &str = include_str!("../ui/landing.html");
+
+fn landing_page() -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            // Its own script and styles inline, its fonts from Google Fonts; it carries no data.
+            (axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; frame-ancestors 'none'"),
+        ],
+        LANDING_PAGE,
+    )
+        .into_response()
+}
+
+/// Every address of the website answers the same page: its scripts draw the one asked for, from
+/// the API behind the gate. The page carries no data, so it needs no sign-in itself, and the sign-in
+/// page has to show to someone signed out.
+fn site_page() -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            // Scripts of this server only: a name or a goal that holds markup never runs.
+            (axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"),
+        ],
+        SITE_PAGE,
+    )
+        .into_response()
+}
+
+async fn site_file(P(name): P<String>) -> Response {
+    match SITE_FILES.iter().find(|(n, _, _)| *n == name) {
+        Some((_, kind, body)) => ([(axum::http::header::CONTENT_TYPE, *kind), (axum::http::header::CACHE_CONTROL, "no-cache")], *body).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("no file {name} in ui/")).into_response(),
+    }
+}
+
+/// `/` is the website's home for a browser (the landing page for one signed out, the app for one
+/// signed in, as its session cookie says), and still `avp` for a client or a script checking the
+/// server is up.
+async fn root(headers: HeaderMap) -> Response {
+    let html = headers.get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|a| a.contains("text/html"));
+    let signed_in = headers.get_all(axum::http::header::COOKIE).iter().filter_map(|v| v.to_str().ok()).any(|c| c.split(';').any(|kv| kv.trim().starts_with("avp_session=")));
+    match (html, signed_in) {
+        (false, _) => "avp".into_response(),
+        (true, true) => site_page(),
+        (true, false) => landing_page(),
+    }
+}
+
+/// The website, and `api` for whatever is not one of its pages: a page's path asked with another
+/// method (POST /signup) too.
+fn site(api: Router) -> Router {
+    let page = || get(|| async { site_page() }).fallback_service(api.clone());
+    Router::new()
+        .route("/", get(root).fallback_service(api.clone()))
+        .route("/ui/{file}", get(site_file).fallback_service(api.clone()))
+        .route("/welcome", get(|| async { landing_page() }).fallback_service(api.clone()))
+        .route("/signin", page())
+        .route("/signup", page())
+        .route("/new", page())
+        .route("/settings", page())
+        .route("/o/{org}", page())
+        .route("/r/{*rest}", page())
+        .fallback_service(api)
+}
+
 pub fn router(engine: Engine) -> Router {
-    let router: Router<Engine> = Router::new()
-        .route("/", get(|| async { "avp" }))
+    let router: Router = Router::<Engine>::new()
         .route("/client", get(client_info))
         .route("/client/avp", get(client_binary))
         .route("/repos", post(create_repo).get(repos))
@@ -816,10 +1006,23 @@ pub fn router(engine: Engine) -> Router {
         .route("/repos/{repo}/proofs/{id}", get(proof))
         .route("/repos/{repo}/proofs/{id}/log", get(proof_log))
         .route("/repos/{repo}/proofs/{id}/artifacts", get(proof_artifacts))
+        .route("/repos/{repo}/git/history", put(git_history))
+        // `git clone https://<server>/<repo>.git`, or `<org>/<repo>.git`.
+        .route("/{a}/info/refs", get(git_http))
+        .route("/{a}/{b}/info/refs", get(git_http))
+        .route("/{a}/git-upload-pack", post(git_http))
+        .route("/{a}/{b}/git-upload-pack", post(git_http))
+        .route("/{a}/git-receive-pack", post(git_http))
+        .route("/{a}/{b}/git-receive-pack", post(git_http))
         .merge(crate::seam::routes())
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024));
-    // Who asks and whether they may, for every route: accounts and tokens.
-    crate::seam::access(router, &engine).with_state(engine)
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
+        .with_state(engine.clone());
+    // Who asks and whether they may, for every route: accounts and tokens. The gate goes before
+    // the routes are matched, so that on AVP Cloud it may say the repo a path names by its id
+    // (`/repos/acme/shop/line`).
+    let api: Router = crate::seam::access(Router::new().fallback_service(router), &engine).with_state(engine);
+    // The website's pages and files go in before the gate: they hold no data (see site_page).
+    site(api)
 }
 
 pub async fn serve(engine: Engine, addr: &str) -> anyhow::Result<()> {
@@ -842,4 +1045,33 @@ pub async fn serve(engine: Engine, addr: &str) -> anyhow::Result<()> {
     // The peer's address: some routes are the server's own machine's (from_host).
     axum::serve(listener, router(engine).into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every page of the website is the one shell, its files are served by name, and `/` stays
+    /// `avp` for a client checking the server is up.
+    #[tokio::test]
+    async fn the_website_answers_its_pages_and_files() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, site(Router::new())).await });
+        let c = reqwest::Client::new();
+        let get = |path: &str, accept: &str| c.get(format!("{base}{path}")).header("accept", accept).send();
+        // Signed out, `/` is the landing page; signed in, the app.
+        assert!(get("/", "text/html").await.unwrap().text().await.unwrap().contains("Where Coding"));
+        for path in ["/signin", "/r/shop", "/r/shop/code/src/main.rs", "/o/acme"] {
+            let r = get(path, "text/html").await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert!(r.headers()["content-security-policy"].to_str().unwrap().contains("default-src 'self'"), "{path}");
+            assert!(r.text().await.unwrap().contains("/ui/site.js"), "{path}");
+        }
+        assert_eq!(get("/", "*/*").await.unwrap().text().await.unwrap(), "avp");
+        let css = get("/ui/site.css", "*/*").await.unwrap();
+        assert_eq!(css.headers()["content-type"], "text/css; charset=utf-8");
+        assert!(css.text().await.unwrap().contains("--avp-bg:"));
+        assert_eq!(get("/ui/nothing.js", "*/*").await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
 }

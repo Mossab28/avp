@@ -129,7 +129,7 @@ impl Engine {
                 let verdict = if red { Verdict::Red } else if flaky.is_empty() { Verdict::Green } else { Verdict::Flaky };
                 let output = steps.iter().map(|s| s.output.as_str()).collect::<Vec<_>>().join("\n");
                 let blamed = if red { failed_files(&output, &tree).into_iter().map(|f| (f, None)).collect() } else { vec![] };
-                let proof = Proof { id: new_id("proof"), task: None, base_position: position, candidate_tree: tree_hash.clone(), files: vec![], steps, verdict, blamed, created_at: now_ms() };
+                let proof = Proof { id: new_id("proof"), task: None, base_position: position, candidate_tree: tree_hash.clone(), files: vec![], steps, verdict, blamed, created_at: now_ms(), timing: None };
                 let db = engine.db();
                 db.insert_proof(&repo, &proof)?;
                 if whole || red {
@@ -222,7 +222,7 @@ impl Engine {
             proof.to_string()
         } else {
             let tree = self.objects.get_tree(&entry.tree)?;
-            let p = Proof { id: new_id("proof"), task: None, base_position: culprit, candidate_tree: entry.tree.clone(), files: vec![], steps: vec![failed.clone()], verdict: Verdict::Red, blamed: failed_files(&failed.output, &tree).into_iter().map(|f| (f, None)).collect(), created_at: now_ms() };
+            let p = Proof { id: new_id("proof"), task: None, base_position: culprit, candidate_tree: entry.tree.clone(), files: vec![], steps: vec![failed.clone()], verdict: Verdict::Red, blamed: failed_files(&failed.output, &tree).into_iter().map(|f| (f, None)).collect(), created_at: now_ms(), timing: None };
             let db = self.db();
             db.insert_proof(repo, &p)?;
             db.set_full(repo, culprit, Verdict::Red, &p.id)?;

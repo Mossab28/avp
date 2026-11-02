@@ -182,8 +182,13 @@ impl Engine {
     // ---- repos and the line ----
 
     pub fn create_repo(&self, name: &str, policy: LeasePolicy) -> Result<Repo> {
+        self.create_repo_in(name, policy, None, None)
+    }
+
+    /// A repo in an organization, or in a person's own space (AVP Cloud).
+    pub fn create_repo_in(&self, name: &str, policy: LeasePolicy, org: Option<&str>, owner: Option<&str>) -> Result<Repo> {
         let db = self.db();
-        let repo = db.create_repo(name, policy)?;
+        let repo = db.create_repo_in(name, policy, org, owner)?;
         db.emit(&repo.id, "repo.created", None, None, serde_json::json!({ "name": name }))?;
         Ok(repo)
     }
@@ -795,7 +800,9 @@ impl Engine {
             return Ok(steps);
         }
         let ws = Workspace::new(&self.data, repo);
-        Ok(ws.check(&self.objects, tree, tree_hash, name, files, steps_override, part)?.0)
+        let steps = ws.check(&self.objects, tree, tree_hash, name, files, steps_override, part)?.0;
+        crate::check::note_part(name, tree_hash, 0.0, &crate::check::take_prep());
+        Ok(steps)
     }
 
     /// A task's proof. A step with `split`, when the task reaches more related tests than one job's
@@ -805,6 +812,11 @@ impl Engine {
     fn prove_task(&self, task: &Task, tree: &Tree, tree_hash: &str, files: &[String], speculative: bool) -> Result<Vec<Step>> {
         let cfg = read_config(tree, &self.objects)?.check;
         let line_secrets = crate::seam::line_secrets(self, task, tree)?;
+        // Slow test files that never fail, left out by the step that takes them (`{skip_files}`).
+        let skip_files = match cfg.auto_skip {
+            Some(rule) if cfg.steps.iter().any(|s| s.run.contains("{skip_files}")) => crate::seam::left_out(self, &task.repo, &rule),
+            _ => vec![],
+        };
         let most = std::env::var("AVP_SPLIT_MAX").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(8);
         let splits: Vec<(String, usize)> = if cfg.steps.iter().any(|s| s.split.is_some()) {
             let related = crate::check::related_tests(&self.objects, tree, files);
@@ -812,15 +824,24 @@ impl Engine {
         } else {
             vec![]
         };
-        if splits.is_empty() {
-            let part = line_secrets.map(|s| Part { line_secrets: Some(s), ..Default::default() });
+        // Steps that run as their own job: one part each, skipped by the part of the others.
+        let alone: Vec<String> = cfg.steps.iter().filter(|s| s.own_job && !splits.iter().any(|(n, _)| *n == s.name)).map(|s| s.name.clone()).collect();
+        if splits.is_empty() && alone.is_empty() {
+            let part = (line_secrets.is_some() || !skip_files.is_empty()).then(|| Part { line_secrets, skip_files, ..Default::default() });
             return self.prove(&task.repo, tree, tree_hash, &task.id, files, None, part.as_ref(), speculative);
         }
-        let mut parts = vec![Part { skip: splits.iter().map(|(n, _)| n.clone()).collect(), line_secrets: line_secrets.clone(), ..Default::default() }];
+        let mut parts = vec![Part { skip: splits.iter().map(|(n, _)| n.clone()).chain(alone.iter().cloned()).collect(), line_secrets: line_secrets.clone(), ..Default::default() }];
+        for name in &alone {
+            let skip = cfg.steps.iter().map(|s| s.name.clone()).filter(|n| n != name).collect();
+            parts.push(Part { skip, line_secrets: line_secrets.clone(), ..Default::default() });
+        }
         for (name, n) in &splits {
             for i in 1..=*n {
                 parts.push(Part { step: Some(name.clone()), shard: Some(format!("{i}/{n}")), line_secrets: line_secrets.clone(), ..Default::default() });
             }
+        }
+        for p in &mut parts {
+            p.skip_files = skip_files.clone();
         }
         let red = |steps: &[Step]| steps.iter().any(|s| s.exit != 0 && s.exit != crate::check::CANCELLED);
         let results: Vec<Vec<Step>> = std::thread::scope(|scope| {
@@ -843,7 +864,8 @@ impl Engine {
         let mut out = Vec::new();
         for s in &cfg.steps {
             let Some((_, n)) = splits.iter().find(|(name, _)| *name == s.name) else {
-                out.extend(results[0].iter().filter(|st| st.name == s.name).cloned());
+                // From the part of the other steps, or from the step's own.
+                out.extend(parts.iter().zip(&results).filter(|(p, _)| p.step.is_none()).flat_map(|(_, r)| r.iter().filter(|st| st.name == s.name)).cloned());
                 continue;
             };
             let shares: Vec<(&str, &Step)> = parts.iter().zip(&results).filter(|(p, _)| p.step.as_deref() == Some(s.name.as_str())).filter_map(|(p, r)| r.first().map(|st| (p.shard.as_deref().unwrap_or(""), st))).collect();
@@ -871,7 +893,7 @@ impl Engine {
             out.push(merged);
         }
         // What is no step of avp.toml: a worker that could not run its part, a part stopped.
-        out.extend(results[0].iter().filter(|st| !cfg.steps.iter().any(|s| s.name == st.name)).cloned());
+        out.extend(parts.iter().zip(&results).filter(|(p, _)| p.step.is_none()).flat_map(|(_, r)| r.iter().filter(|st| !cfg.steps.iter().any(|s| s.name == st.name))).cloned());
         // Stopped because another part went red: only the red says something.
         if any_red {
             out.retain(|s| s.exit != crate::check::CANCELLED);
@@ -922,6 +944,7 @@ impl Engine {
         }
         let files: Vec<String> = Self::effective_writes(&writes).keys().cloned().collect();
         let conflicts: Vec<String> = Self::effective_writes(&writes).values().filter(|w| w.kind == WriteKind::Conflict).map(|w| w.path.clone()).collect();
+        let started = std::time::Instant::now();
         let steps = if conflicts.is_empty() {
             self.prove_task(&task, &tree, &tree_hash, &files, speculative)?
         } else if speculative {
@@ -929,6 +952,7 @@ impl Engine {
         } else {
             vec![Step { name: "conflicts".into(), command: String::new(), exit: 1, seconds: 0.0, output: format!("unsettled conflicts in:\n{}\n{}", conflicts.join("\n"), keep_both(&conflicts)) }]
         };
+        let timing = crate::check::take_timing(task_id, &tree_hash).map(|t| ProofTiming { total_s: started.elapsed().as_secs_f64(), ..t });
         anyhow::ensure!(!steps.iter().any(|s| s.exit == crate::check::CANCELLED), "cancelled: the task's files changed, a newer tree is being proven");
         let red = steps.iter().any(|s| s.exit != 0);
         let mut blamed = Vec::new();
@@ -947,7 +971,7 @@ impl Engine {
             }
         }
         let verdict = if !red { Verdict::Green } else if !waits.is_empty() && blamed.iter().all(|(f, h)| h.is_some() && !files.contains(f)) { Verdict::Blocked } else { Verdict::Red };
-        let proof = Proof { id: new_id("proof"), task: Some(task_id.into()), base_position: task.base_position, candidate_tree: tree_hash, files, steps, verdict, blamed, created_at: now_ms() };
+        let proof = Proof { id: new_id("proof"), task: Some(task_id.into()), base_position: task.base_position, candidate_tree: tree_hash, files, steps, verdict, blamed, created_at: now_ms(), timing };
         let db = self.db();
         db.insert_proof(&task.repo, &proof)?;
         // A speculative proof is the agent's business until it lands: no event for the others.
@@ -1179,7 +1203,6 @@ impl Engine {
             }
             (t.clone(), db.writes(task_id)?, db.head(&t.repo)?.ok_or_else(|| anyhow!("no line"))?)
         };
-        let old_base_tree = task.base_tree.clone();
         let mut replayed = false;
         // The tree too: a task stacked on one that was abandoned stands on that one's tree, on the
         // head, and goes back to the head's alone.
@@ -1193,6 +1216,14 @@ impl Engine {
         }
         let task = self.db().task(task_id)?;
         let writes = self.db().writes(task_id)?;
+        // A conflict an earlier replay left (a refresh, or a land that went again while this one
+        // proved) is still one: this replay only names the new ones. Position 115 of AVP's own
+        // line landed markers in src/cloud/auth.rs that way, its head no longer compiling.
+        let unsettled: Vec<String> = Self::effective_writes(&writes).values().filter(|w| w.kind == WriteKind::Conflict).map(|w| w.path.clone()).collect();
+        if !unsettled.is_empty() {
+            let note = Some(keep_both(&unsettled));
+            return Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: "conflict".into(), conflicts: unsettled, proof: None, waits_for: vec![], word: None, note, stack: vec![] }));
+        }
         if Self::effective_writes(&writes).is_empty() {
             return Ok(LandOutcome::NotLanded(NotLanded { guarded: vec![], reason: "empty".into(), conflicts: vec![], proof: None, waits_for: vec![], word: None, note: None, stack: vec![] }));
         }
@@ -1214,7 +1245,10 @@ impl Engine {
                 let old_files: BTreeSet<&String> = p.files.iter().collect();
                 let eff = Self::effective_writes(&writes);
                 let new_files: BTreeSet<&String> = eff.keys().collect();
-                old_files == new_files && self.proof_still_holds(&task, p, &old_base_tree, &head)?
+                // Against the tree the proof stood on: the task may have moved since (a replay
+                // while it proved), and the line between the two is not covered by it.
+                let proved_on = self.db().line_at(&task.repo, p.base_position)?.tree;
+                old_files == new_files && self.proof_still_holds(&task, p, &proved_on, &head)?
             }
             _ => false,
         };
@@ -1491,7 +1525,7 @@ impl Engine {
                     }
                     let outside: BTreeSet<String> = blamed.iter().filter_map(|(_, h)| h.clone()).filter(|h| !ids.contains(h)).collect();
                     let verdict = if !red { Verdict::Green } else if !outside.is_empty() && blamed.iter().all(|(_, h)| h.as_ref().is_some_and(|h| outside.contains(h))) { Verdict::Blocked } else { Verdict::Red };
-                    let proof = Proof { id: new_id("proof"), task: Some(lead.into()), base_position: head.position, candidate_tree: hash.clone(), files: files.clone(), steps, verdict, blamed, created_at: now_ms() };
+                    let proof = Proof { id: new_id("proof"), task: Some(lead.into()), base_position: head.position, candidate_tree: hash.clone(), files: files.clone(), steps, verdict, blamed, created_at: now_ms(), timing: None };
                     db.insert_proof(&repo, &proof)?;
                     db.emit(&repo, "proof", Some(lead), None, serde_json::json!({ "proof": proof.id, "verdict": verdict, "waits_for": outside, "with": others }))?;
                     proof
@@ -1766,11 +1800,11 @@ impl Engine {
 
     /// Posts what an event says to the webhooks `[notify]` names in the head's avp.toml, when a person
     /// must hear of it: the full suite red (on its retry too), a position reverted, a task waiting for
-    /// a person's approval, a deploy done or failed. On threads of their own, a few tries each: a
+    /// a person's approval, a deploy done, failed or stalled. On threads of their own, a few tries each: a
     /// webhook that does not answer never holds the line.
     fn notify(&self, repo: &str, kind: &str, task: Option<&str>, data: serde_json::Value) {
         let news = match kind {
-            "line.red" | "line.reverted" | "env.moved" | "env.failed" => true,
+            "line.red" | "line.reverted" | "env.moved" | "env.failed" | "env.stalled" => true,
             // A person's revert lands as a task like another (`avp revert`): its goal says what it
             // takes back. AVP's own is told by its `line.reverted`, which says more.
             "task.landed" => data["goal"].as_str().is_some_and(|g| g.starts_with("Revert position ")),
@@ -1858,6 +1892,7 @@ fn notice(repo: &str, kind: &str, task: Option<&str>, goal: Option<&str>, d: &se
             Some(from) => format!("{repo}: {env} is rolled back to position {position}{of}, from position {from}."),
             None => format!("{repo}: {env} serves position {position}{of}, its deploy is done."),
         },
+        "env.stalled" => format!("{repo}: the deploy of position {position} to {env} has printed nothing for {}, its last line: {}. `avp envs` follows it.", crate::stats::duration(d["silent_s"].as_f64()), d["step"].as_str().unwrap_or("-")),
         "env.failed" => {
             let what = if d["rollback"] == true { format!("the rollback of {env} to position {position}") } else { format!("the deploy of position {position} to {env}") };
             let why = match (d["exit"].as_i64(), d["reason"].as_str()) {

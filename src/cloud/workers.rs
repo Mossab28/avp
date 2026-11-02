@@ -55,6 +55,9 @@ struct Queue {
     /// Claimed jobs whose tree is no longer the task's: their worker hears it at its next sign of
     /// life and stops.
     cancelled: HashSet<String>,
+    /// When each job was queued, and first claimed: the proof's wait for a machine.
+    queued_at: HashMap<String, Instant>,
+    claimed_at: HashMap<String, Instant>,
 }
 
 /// What a proof stopped halfway gives back: one step, cancelled.
@@ -106,6 +109,7 @@ impl Dispatcher {
         {
             let mut q = self.lock();
             q.replies.insert(id.clone(), tx);
+            q.queued_at.insert(id.clone(), Instant::now());
             q.waiting.push_back(job);
         }
         self.cv.notify_all();
@@ -128,6 +132,8 @@ impl Dispatcher {
                         q.waiting.retain(|j| j.id != id);
                         q.claimed.remove(&id);
                         q.replies.remove(&id);
+                        q.queued_at.remove(&id);
+                        q.claimed_at.remove(&id);
                         return None;
                     }
                 }
@@ -178,6 +184,7 @@ impl Dispatcher {
         loop {
             if let Some(i) = q.waiting.iter().position(|j| parts || j.part.is_none()) {
                 let job = q.waiting.remove(i).unwrap();
+                q.claimed_at.entry(job.id.clone()).or_insert_with(Instant::now);
                 q.claimed.insert(job.id.clone(), (Instant::now(), job.clone()));
                 return Some(job);
             }
@@ -206,8 +213,16 @@ impl Dispatcher {
 
     /// A worker's steps for a job. False when nobody waits for it any more (the server gave up
     /// and proved it itself).
-    pub fn complete(&self, id: &str, steps: Vec<Step>) -> bool {
+    pub fn complete(&self, id: &str, steps: Vec<Step>, prep: Option<crate::check::Prep>) -> bool {
         let mut q = self.lock();
+        let (queued, claimed) = (q.queued_at.remove(id), q.claimed_at.remove(id));
+        if let Some((_, job)) = q.claimed.get(id) {
+            let wait = match (queued, claimed) {
+                (Some(a), Some(b)) => b.saturating_duration_since(a).as_secs_f64(),
+                _ => 0.0,
+            };
+            crate::check::note_part(&job.name, &job.tree_hash, wait, &prep.unwrap_or_default());
+        }
         q.claimed.remove(id);
         q.cancelled.remove(id);
         match q.replies.remove(id) {
@@ -296,7 +311,7 @@ async fn work_claim(State(e): S, Json(req): Json<Claim>) -> R {
 }
 
 /// The job with the values of the secrets its steps name, read from the store as it is handed
-/// over. A store that cannot be read sends none: the steps that name one say it did not reach them.
+/// over, and the limits of its sandbox. A store that cannot be read sends none: the steps that name one say it did not reach them.
 fn with_secrets(e: &Engine, job: Job) -> Claimed {
     let named = crate::check::read_config(&job.tree, &e.objects).map(|c| crate::check::secrets_named(&c.check, job.steps_override.as_deref(), job.part.as_ref())).unwrap_or_default();
     let secrets = if named.is_empty() {
@@ -307,7 +322,8 @@ fn with_secrets(e: &Engine, job: Job) -> Claimed {
             Default::default()
         })
     };
-    Claimed { job, secrets }
+    // A sandboxed worker's limits are the server's to say (AVP_SANDBOX_*, AVP_WORKER_RUN_S).
+    Claimed { job, secrets, limits: crate::check::Limits::from_env() }
 }
 
 /// The oldest job this worker can run, within `wait`, none while the server drains. It waits by
@@ -332,6 +348,9 @@ struct WorkResult {
     /// on, so that the proof they make has them. A worker from before sends none.
     #[serde(default)]
     kept: HashMap<String, crate::check::KeptStep>,
+    /// What the worker spent before the first step. A worker from before AVP 0.6.1 sends none.
+    #[serde(default)]
+    prep: Option<crate::check::Prep>,
 }
 async fn work_result(State(e): S, P(id): P<String>, Json(req): Json<WorkResult>) -> R {
     let Some(d) = dispatcher() else { return Err(err(anyhow::anyhow!("workers are off"))) };
@@ -342,7 +361,7 @@ async fn work_result(State(e): S, P(id): P<String>, Json(req): Json<WorkResult>)
                 eprintln!("{id}: a step's log not kept: {err:#}");
             }
         }
-        Ok(d.complete(&id, req.steps))
+        Ok(d.complete(&id, req.steps, req.prep))
     })
     .await?;
     ok(serde_json::json!({ "accepted": accepted }))

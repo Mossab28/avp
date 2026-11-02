@@ -51,6 +51,9 @@ enum Cmd {
         /// itself, and a second mirror would write the same commits twice).
         #[arg(long)]
         mirror: bool,
+        /// On AVP Cloud, the organization the repo goes in (asked when you are in several).
+        #[arg(long)]
+        org: Option<String>,
     },
     /// Stop this checkout's mirror, and the local server once no mirror is left.
     Down {
@@ -129,6 +132,22 @@ enum Cmd {
         #[arg(long, default_value_t = 60)]
         every: u64,
     },
+    /// Come in from Git: create a repo on the server from a Git repo with its history, from a
+    /// checkout here or a URL it clones (`github.com/owner/name`; GH_TOKEN for a private one).
+    /// Each first-parent commit of HEAD becomes a position, and the whole history goes to the
+    /// server, so `git clone <server>/<name>.git` gives the same commits with the line on top.
+    Import {
+        /// A git checkout, a git URL, or github.com/owner/name.
+        source: String,
+        /// The repo's name on the server (default: the source's last path segment).
+        #[arg(long)]
+        name: Option<String>,
+        /// Only the last this many first-parent commits become positions (default: all of them).
+        #[arg(long)]
+        history: Option<usize>,
+        #[arg(long, default_value = "advisory")]
+        policy: String,
+    },
     /// Create a repo from a git checkout: its last commits become the first positions of the line.
     /// For a repo that exists, the commits of HEAD (with --follow, of a branch, again and again) the
     /// line does not have yet each become a task: replayed on the head, proven, landed as their
@@ -155,12 +174,17 @@ enum Cmd {
     },
     /// Propose avp.toml from the repo's CI (.github/workflows/*.yml, .gitlab-ci.yml): its push and
     /// pull request jobs as the full suite, their install, typecheck, lint and tests as the proof,
-    /// its services and matrices, its deploys as environments, and a line for each thing it could
-    /// not translate, with what to do. Prints it; --write writes it.
+    /// its services and matrices, its deploys as environments (their commands, which AVP runs
+    /// itself), and a line for each thing it could not translate, with what to do. Prints it;
+    /// --write writes it.
     ImportCi {
         /// Write avp.toml, or avp.imported.toml beside the one there is (never over a file).
         #[arg(long)]
         write: bool,
+        /// Keep GitHub's deploy workflows, dispatched by AVP's bridge (`github_workflow`), instead
+        /// of their commands as `run` deploys.
+        #[arg(long)]
+        keep_github: bool,
     },
     /// Write the line's new positions as commits on top of the last position that has one, check
     /// the result against the head of the line, and push it to a branch (fast-forward only). Run it
@@ -274,7 +298,8 @@ enum Cmd {
     /// attached as a view, and the coding agents found here wired for it as `avp up` wires a
     /// checkout. Then start an agent there, or `avp open`.
     Clone {
-        /// `<server>/<repo>` (`https://avp.example.com/shop`), or the repo's name on --server.
+        /// `<server>/<repo>` (`https://avp.example.com/shop`), or the repo's name on --server (or the
+        /// server logged in to), `<org>/<repo>` on AVP Cloud.
         source: Option<String>,
         /// The folder to make (default: the repo's name, here).
         dir: Option<PathBuf>,
@@ -326,6 +351,16 @@ enum Cmd {
         /// With `--path`, read back from this position instead of the head.
         #[arg(long, requires = "path")]
         from: Option<i64>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Which test files cost the most machine time, which went red then passed again (flaky), which
+    /// slow ones never failed (read from every proof of the window), and which `[check] auto_skip`
+    /// leaves out of the proofs now, since when.
+    Tests {
+        /// From when: how long ago (`48h`, `7d`), a date or an RFC3339 time.
+        #[arg(long, default_value = "7d")]
+        since: String,
         #[arg(long)]
         repo: Option<String>,
     },
@@ -532,6 +567,78 @@ enum Cmd {
     },
     /// Who the server takes you for, and your role on each repo.
     Whoami,
+    /// AVP Cloud's organizations (a server with AVP_CLOUD=1): members and their org role (member:
+    /// write on its repos, admin: admin), invitations, the plan, and the month's proof minutes.
+    Org {
+        #[command(subcommand)]
+        cmd: OrgCmd,
+    },
+    /// Log this machine in to AVP Cloud (or <server>): a browser page asks you to approve it, then
+    /// every command works as you there, with no AVP_SERVER nor AVP_TOKEN to set. The token is kept
+    /// in ~/.config/avp/credentials. In CI, `--token` (or `--token -`, read from stdin).
+    Login {
+        /// The server (default: AVP Cloud, or AVP_CLOUD_URL).
+        // Not named `server`: that is the global --server's, which would fill it.
+        #[arg(value_name = "SERVER")]
+        to: Option<String>,
+        /// A token of yours to keep, with no browser: checked with the server first.
+        #[arg(long)]
+        token: Option<String>,
+        /// Print the page to open and the code, open no browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Forget this machine's login to a server (default: the last one logged in to), its token revoked.
+    Logout {
+        #[arg(value_name = "SERVER")]
+        from: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum OrgCmd {
+    /// A new organization: you are its owner, on the free plan.
+    Create { name: String },
+    /// The organizations you belong to: your role, the plan, the seats.
+    List,
+    /// An organization: its plan, members, repos, and for its admins the invitations unanswered.
+    Show { name: String },
+    /// Ask a person to join, by name or by email: they accept with `avp org accept`.
+    Invite {
+        org: String,
+        /// A person's name, or an email.
+        to: String,
+        /// member (write on its repos), admin (admin on them, members), or owner.
+        #[arg(long, default_value = "member")]
+        role: String,
+    },
+    /// The invitations waiting for your answer.
+    Invites,
+    /// Join the organization an invitation asks you into; with --decline, refuse it.
+    Accept {
+        id: String,
+        #[arg(long)]
+        decline: bool,
+    },
+    /// Change a member's org role (member, admin, owner), or take them out (none).
+    Role { org: String, person: String, role: String },
+    /// Bring a repo (none: this view's) into the organization: its members reach it by their org role.
+    Repo { org: String, repo: Option<String> },
+    /// What the organization pays for: free, team or enterprise. A server admin's.
+    Plan { org: String, plan: String },
+    /// The month's proof minutes against the plan's cap: an organization's, your own space's (your
+    /// name), or none given, the space of this view's repo.
+    Usage {
+        org: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Every change of the organization: members, invitations, plan, repos.
+    Log {
+        org: String,
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -575,6 +682,15 @@ enum UserCmd {
         #[arg(long, default_value_t = 0)]
         since: i64,
     },
+    /// Make your account on AVP Cloud (a server with AVP_SIGNUP=open): the password is read from
+    /// stdin, or typed unseen; prints your first token.
+    Signup {
+        name: String,
+        #[arg(long)]
+        email: String,
+    },
+    /// Sign in on AVP Cloud with your name (or email) and password: prints a token of 90 days.
+    Login { name: String },
 }
 
 #[derive(Subcommand)]
@@ -770,6 +886,9 @@ fn download_artifacts(client: &Client, repo: &str, id: &str, steps: &[(&Step, &s
 fn verdict_line(p: &Proof) -> String {
     let steps: Vec<String> = p.steps.iter().map(|s| format!("{} {} ({:.1}s)", if s.exit == 0 { "✓" } else { "✗" }, s.name, s.seconds)).collect();
     let mut s = format!("{:?} on position {}: {}", p.verdict, p.base_position, steps.join(", "));
+    if let Some(t) = &p.timing {
+        s.push_str(&format!("\n  {}", timing_line(t)));
+    }
     if p.verdict != Verdict::Green {
         for (f, h) in &p.blamed {
             s.push_str(&format!("\n  {f}{}", h.as_ref().map(|h| format!("  (held by {h})")).unwrap_or_default()));
@@ -781,6 +900,12 @@ fn verdict_line(p: &Proof) -> String {
         }
     }
     s
+}
+
+/// Where a proof's time went, in a line: what to fix first when proofs are slow.
+fn timing_line(t: &ProofTiming) -> String {
+    let setup = if t.setup_ran { format!(", setup ran: {:.0}s, its cache missed", t.setup_s) } else { ", setup cached".into() };
+    format!("{:.0}s in all: {:.0}s waiting for a machine, {:.0}s preparing{setup}", t.total_s, t.wait_s, t.prep_s)
 }
 
 /// A position given by its number or by a tag's name (`avp promote production v1.2`).
@@ -944,7 +1069,10 @@ fn views_dir(views: Option<PathBuf>) -> PathBuf {
 
 fn main() -> Result<()> {
     avp::legacy_env();
-    let cli = Cli::parse();
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    // A server the command names (--server, AVP_SERVER), or none: then the one logged in to.
+    let named = !matches!(matches.value_source("server"), None | Some(clap::parser::ValueSource::DefaultValue));
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
     let dir = cli.dir.clone().unwrap_or(std::env::current_dir()?);
     let json = cli.json;
 
@@ -958,13 +1086,15 @@ fn main() -> Result<()> {
     // A view's own server wins over the default, so one view talks to one server.
     let client = match view::load(&dir) {
         Ok(s) if cli.server == "http://127.0.0.1:7117" && !s.server.is_empty() => Client::new(&s.server),
+        // Logged in (`avp login`), and nothing names a server: the one logged in to last.
+        _ if !named => avp::client::logged_in().map(|s| Client::new(&s)).unwrap_or(client),
         _ => client,
     };
     // The view's outbox goes first: what was queued while the server did not answer reaches it, in
     // order, before this command adds to it. A server that still does not answer is known then, and
     // what this command changes is queued behind.
     let link = match cli.cmd {
-        Cmd::Serve { .. } | Cmd::Mcp | Cmd::Worker { .. } | Cmd::Up { .. } | Cmd::Down { .. } | Cmd::Agents | Cmd::Migrate { .. } | Cmd::Update | Cmd::Mirror { .. } | Cmd::ImportPr { .. } | Cmd::ImportGit { .. } | Cmd::ImportCi { .. } | Cmd::Init { .. } | Cmd::Attach { .. } | Cmd::Clone { .. } | Cmd::Align { .. } => offline::Link::default(),
+        Cmd::Serve { .. } | Cmd::Mcp | Cmd::Worker { .. } | Cmd::Up { .. } | Cmd::Down { .. } | Cmd::Agents | Cmd::Migrate { .. } | Cmd::Update | Cmd::Mirror { .. } | Cmd::ImportPr { .. } | Cmd::Import { .. } | Cmd::ImportGit { .. } | Cmd::ImportCi { .. } | Cmd::Init { .. } | Cmd::Attach { .. } | Cmd::Clone { .. } | Cmd::Align { .. } | Cmd::Login { .. } | Cmd::Logout { .. } => offline::Link::default(),
         // The way out of a stuck outbox: `drop` must not send first what it drops.
         Cmd::Outbox { .. } => offline::Link::default(),
         _ => offline::flush(&client, &dir, true),
@@ -976,7 +1106,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Serve { .. } => unreachable!(),
-        Cmd::Up { name, branch, no_push, history, no_checks, mirror } => up::up(&client, &dir, up::Up { name, branch, push: !no_push, history, checks: !no_checks, mirror })?,
+        Cmd::Up { name, branch, no_push, history, no_checks, mirror, org } => up::up(&client, &dir, up::Up { name, branch, push: !no_push, history, checks: !no_checks, mirror, org })?,
         Cmd::Down { name } => up::down(&dir, name)?,
         Cmd::Agents => up::agents(&dir, json)?,
         Cmd::Migrate { name, yes } => {
@@ -1031,7 +1161,7 @@ fn main() -> Result<()> {
             let tree = client.get::<Tree>(&format!("/repos/{}/tree/{}", repo.id, entry.position))?;
             state.known = tree.iter().map(|(p, e)| (p.clone(), (e.blob.clone(), e.mode))).collect();
             view::save(&dir, &state)?;
-            print(json, &repo, |r| format!("repo {} ({}) created, position {} holds {} files. This directory is now a view.", r.name, r.id, entry.position, n));
+            print(json, &repo, |r| format!("repo {} ({}) created, position {} holds {} files. This directory is now a view.", r.full_name(), r.id, entry.position, n));
         }
         Cmd::Attach { repo } => {
             let r: Repo = client.get(&format!("/repos/{repo}"))?;
@@ -1102,9 +1232,35 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(every));
             }
         }
-        Cmd::ImportCi { write } => {
+        Cmd::Import { source, name, history, policy } => {
+            let (from, default_name) = gitbridge::import_source(&source)?;
+            let name = name.unwrap_or(default_name);
+            anyhow::ensure!(client.get::<Repo>(&format!("/repos/{name}")).is_err(), "{name} is already a repo on this server: pick another with --name (to bring in new commits of a repo that exists, `avp import-git {name}` from its checkout)");
+            let cloned = std::env::temp_dir().join(format!("avp-import-{}", ulid::Ulid::new()));
+            let checkout = match &from {
+                gitbridge::ImportFrom::Checkout(p) => p.clone(),
+                gitbridge::ImportFrom::Url(url) => {
+                    gitbridge::clone_for_import(url, &cloned)?;
+                    cloned.clone()
+                }
+            };
+            let done = (|| -> Result<_> {
+                let (repo, last) = gitbridge::import_git(&client, &checkout, &name, &policy, history.unwrap_or(i32::MAX as usize))?;
+                let bytes = gitbridge::upload_history(&client, &repo.id, &checkout)?;
+                Ok((repo, last, bytes))
+            })();
+            let _ = std::fs::remove_dir_all(&cloned);
+            let (repo, last, bytes) = done?;
+            let clone = format!("git clone {}/{}.git", client.shown(), repo.name);
+            let v = serde_json::json!({
+                "repo": repo.name, "id": repo.id, "head": last, "positions": last + 1, "history_bytes": bytes, "clone": clone,
+                "next": format!("Agents work on it with `avp open --repo {} --goal \"...\"`; Git still reads it: `{clone}`.", repo.name),
+            });
+            print(json, &v, |v| format!("repo {} created: positions 0..{last} from its git history, the history itself on the server.\n{}", repo.name, v["next"].as_str().unwrap_or("")));
+        }
+        Cmd::ImportCi { write, keep_github } => {
             let top = avp::importci::root(&dir).with_context(|| format!("no CI in {} nor above it: avp import-ci reads .github/workflows/*.yml and .gitlab-ci.yml", dir.display()))?;
-            let imported = avp::importci::import(&top)?;
+            let imported = avp::importci::import_with(&top, keep_github)?;
             let written = if write { Some(avp::importci::write(&top, &imported)?) } else { None };
             let file = written.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
             let next = match file.as_deref() {
@@ -1436,6 +1592,11 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
             let mut shown = serde_json::to_value(&st)?;
             shown["outbox"] = serde_json::json!(offline::outbox(&dir).map(|o| o.queued.len()).unwrap_or_default());
             shown["saves"] = serde_json::to_value(&saves)?;
+            // On AVP Cloud, a space past its plan's cap: its proofs are refused until the month ends.
+            let capped: Option<serde_json::Value> = client.get::<serde_json::Value>(&format!("/repos/{}/usage", state.repo)).ok().filter(|u| u["over"] == true);
+            if let Some(u) = &capped {
+                shown["usage"] = u.clone();
+            }
             print(json, &shown, |_| {
                 let s = &st;
                 let live = engine::Engine::effective_writes(&s.writes);
@@ -1454,6 +1615,9 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
                 }
                 if !saves.is_empty() {
                     out.push_str(&format!("\nsave points:\n{}", engine::saves_text(&saves)));
+                }
+                if let Some(said) = capped.as_ref().and_then(|u| u["said"].as_str()) {
+                    out.push_str(&format!("\nproofs refused, landing waits: {said}"));
                 }
                 out.push_str(&format!("\nonline; {outbox}"));
                 out
@@ -1720,14 +1884,16 @@ proven on this machine (the server proves it again when the land reaches it): {}
             let (server, repo, into) = match (repo, source) {
                 (Some(r), s) => {
                     anyhow::ensure!(s.is_none() || into.is_none(), "with --repo, the only argument is the folder");
-                    (cli.server.clone(), r, s.map(PathBuf::from).or(into))
+                    (client.base.clone(), r, s.map(PathBuf::from).or(into))
                 }
                 (None, Some(s)) if s.contains("://") => {
                     let (scheme, rest) = s.split_once("://").unwrap_or_default();
-                    let (host, r) = rest.trim_end_matches('/').rsplit_once('/').filter(|(h, r)| !h.is_empty() && !r.is_empty()).with_context(|| format!("{s}: give the repo after the server, `<server>/<repo>`"))?;
+                    // `<server>/<space>/<repo>` on AVP Cloud: all that follows the host is the repo.
+                    let (host, r) = rest.trim_end_matches('/').split_once('/').filter(|(h, r)| !h.is_empty() && !r.is_empty()).with_context(|| format!("{s}: give the repo after the server, `<server>/<repo>`"))?;
                     (format!("{scheme}://{host}"), r.to_string(), into)
                 }
-                (None, Some(s)) => (cli.server.clone(), s, into),
+                // The server the command names, else the one logged in to (`avp clone shop` on AVP Cloud).
+                (None, Some(s)) => (client.base.clone(), s, into),
                 (None, None) => anyhow::bail!("which repo? `avp clone <server>/<repo> [dir]`, or `avp clone --server <url> --repo <name> [dir]`"),
             };
             up::clone(&Client::new(&server), &repo, into, &dir, json)?;
@@ -1825,6 +1991,12 @@ proven on this machine (the server proves it again when the land reaches it): {}
             offline::refresh(&client, &repo, false);
             print(json, &log, avp::blame::log_text);
         }
+        Cmd::Tests { since, repo } => {
+            let r = repo_of(&dir, repo)?;
+            let (from, to) = avp::stats::window(Some(&since), None, now_ms())?;
+            let t: avp::testcost::TestReport = client.get(&format!("/repos/{r}/tests?since={}&until={}", avp::stats::rfc3339(from), avp::stats::rfc3339(to)))?;
+            print(json, &t, avp::testcost::text);
+        }
         Cmd::Stats { since, until, github, before, save, repo } => {
             let r = repo_of(&dir, repo)?;
             let (from, to) = avp::stats::window(Some(&since), until.as_deref(), now_ms())?;
@@ -1840,7 +2012,18 @@ proven on this machine (the server proves it again when the land reaches it): {}
                     }
                     print(json, &serde_json::json!({ "github": b, "avp": s }), |_| avp::stats::side_by_side(&b, &s));
                 }
-                _ => print(json, &s, avp::stats::text),
+                _ => {
+                    // On AVP Cloud: the month's proof minutes of the repo's space, and its cap.
+                    let usage: Option<serde_json::Value> = client.get::<serde_json::Value>(&format!("/repos/{r}/usage")).ok().filter(|u| u["space"].is_string());
+                    match usage {
+                        Some(u) => {
+                            let mut v = serde_json::to_value(&s)?;
+                            v["usage"] = u.clone();
+                            print(json, &v, |_| format!("{}\n{}", avp::stats::text(&s), usage_text(&u)));
+                        }
+                        None => print(json, &s, avp::stats::text),
+                    }
+                }
             }
         }
         Cmd::Blame { path, at, repo } => {
@@ -2135,9 +2318,18 @@ proven on this machine (the server proves it again when the land reaches it): {}
             }
         }
         Cmd::User { cmd } => users(&client, &dir, cmd, json)?,
+        Cmd::Org { cmd } => orgs(&client, &dir, cmd, json)?,
         Cmd::Token { cmd } => tokens(&client, cmd, json)?,
+        Cmd::Login { to, token, no_browser } => login(to, token, no_browser, json)?,
+        Cmd::Logout { from } => logout(from, json)?,
         Cmd::Whoami => {
-            let me: serde_json::Value = client.get("/me")?;
+            let logged = std::env::var_os("AVP_TOKEN").is_none() && avp::client::Credentials::load().get(&client.base).is_some();
+            let mut me: serde_json::Value = client.get("/me").map_err(|e| match format!("{e:#}").starts_with("401") {
+                true => e.context(format!("not logged in to {}: `avp login {}`", client.shown(), client.base)),
+                false => e,
+            })?;
+            me["server"] = serde_json::json!(client.shown());
+            me["logged_in"] = serde_json::json!(logged);
             print(json, &me, |me| {
                 let person = me["person"].as_str().unwrap_or("nobody named");
                 if me["accounts"] != true {
@@ -2148,6 +2340,10 @@ proven on this machine (the server proves it again when the land reaches it): {}
                     Some("key") => format!("the server's key (AVP_TOKEN), as {person}: every right"),
                     _ => "the server's own machine: every right".into(),
                 };
+                s.push_str(&format!(" on {}", me["server"].as_str().unwrap_or_default()));
+                if me["logged_in"] == true {
+                    s.push_str(&format!(" (logged in: {})", avp::client::Credentials::path().display()));
+                }
                 for r in me["roles"].as_array().into_iter().flatten() {
                     s.push_str(&format!("\n  {}: {}", r["repo"].as_str().unwrap_or_default(), r["role"].as_str().unwrap_or_default()));
                 }
@@ -2165,6 +2361,102 @@ proven on this machine (the server proves it again when the land reaches it): {}
             });
         }
     }
+    Ok(())
+}
+
+/// `avp login`: a device code the person approves in the browser, or `--token` checked with the
+/// server; either way the token kept in the credentials file for that server, which becomes the
+/// one every command talks to when nothing names another.
+fn login(server: Option<String>, token: Option<String>, no_browser: bool, json: bool) -> Result<()> {
+    use avp::client::{server_url, Credentials, Login};
+    let server = server_url(&server.unwrap_or_else(avp::client::cloud_url));
+    let (person, token, token_id) = match token {
+        Some(t) => {
+            let t = if t == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s
+            } else {
+                t
+            };
+            let t = t.trim().to_string();
+            anyhow::ensure!(!t.is_empty(), "--token: no token given");
+            let me: serde_json::Value = Client::with_token(&server, &t).get("/me").with_context(|| format!("{server} does not take this token"))?;
+            match me["via"].as_str() {
+                Some("token") | Some("key") => (me["person"].as_str().unwrap_or("avp").to_string(), t, None),
+                _ => anyhow::bail!("{server} asks for no token: AVP_SERVER={server} is enough"),
+            }
+        }
+        None => {
+            let client = Client::new(&server);
+            let host = std::process::Command::new("hostname").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty());
+            let user = std::env::var("USER").unwrap_or_default();
+            let name = match host {
+                Some(h) if !user.is_empty() => format!("{user} on {h}"),
+                Some(h) => h,
+                None => user,
+            };
+            let start: serde_json::Value = client.post("/login/device", &serde_json::json!({ "name": name }))?;
+            let (code, page) = (start["user_code"].as_str().unwrap_or_default(), start["verification_uri_complete"].as_str().unwrap_or_default());
+            eprintln!("Open {page}\nand approve this machine: the page shows the code {code}, check it is the one here.");
+            if !no_browser {
+                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                let _ = std::process::Command::new(opener).arg(page).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+            }
+            eprintln!("Waiting for your approval (10 minutes at most)...");
+            let every = std::time::Duration::from_secs(start["interval"].as_u64().unwrap_or(2).max(1));
+            let polled = loop {
+                std::thread::sleep(every);
+                let p: serde_json::Value = client.post("/login/device/token", &serde_json::json!({ "device_code": start["device_code"] }))?;
+                if p["status"] == "approved" {
+                    break p;
+                }
+            };
+            let t: avp::model::NewToken = serde_json::from_value(polled["token"].clone())?;
+            (t.info.person, t.token, Some(t.info.id))
+        }
+    };
+    let mut creds = Credentials::load();
+    creds.set(&server, Login { person: person.clone(), token, token_id, at: now_ms() });
+    creds.save()?;
+    let path = Credentials::path();
+    print(json, &serde_json::json!({ "server": server, "person": person, "credentials": path }), |_| {
+        format!("logged in to {server} as {person}: the token is kept in {} (yours alone to read)\nnext, in a git checkout: `avp up`, then ask your agent for a change", path.display())
+    });
+    Ok(())
+}
+
+/// `avp logout`: the server's login out of the credentials file, its token revoked when `avp
+/// login` made it (one given with --token stays: it was made elsewhere, maybe for more).
+fn logout(server: Option<String>, json: bool) -> Result<()> {
+    use avp::client::{server_url, Credentials};
+    let server = server.map(|s| server_url(&s)).or_else(avp::client::logged_in).unwrap_or_else(avp::client::cloud_url);
+    let mut creds = Credentials::load();
+    let Some(login) = creds.remove(&server) else {
+        print(json, &serde_json::json!({ "server": server, "logged_out": false }), |_| format!("not logged in to {server}"));
+        return Ok(());
+    };
+    let revoked = match &login.token_id {
+        Some(id) => match Client::with_token(&server, &login.token).post::<serde_json::Value>(&format!("/tokens/{id}/revoke"), &serde_json::json!({})) {
+            Ok(_) => Some(true),
+            Err(e) => {
+                eprintln!("the token {id} could not be revoked ({e:#}): `avp token revoke {id}` once the server answers");
+                Some(false)
+            }
+        },
+        None => None,
+    };
+    creds.save()?;
+    print(json, &serde_json::json!({ "server": server, "person": login.person, "logged_out": true, "revoked": revoked, "current": creds.current }), |_| {
+        let mut s = format!("logged out of {server} ({})", login.person);
+        if revoked == Some(true) {
+            s.push_str(", its token revoked");
+        }
+        if let Some(c) = &creds.current {
+            s.push_str(&format!("\ncommands now talk to {c}, logged in there too"));
+        }
+        s
+    });
     Ok(())
 }
 
@@ -2231,6 +2523,18 @@ fn users(client: &Client, dir: &Path, cmd: UserCmd, json: bool) -> Result<()> {
             let r: serde_json::Value = client.post(&format!("/repos/{repo}/roles"), &serde_json::json!({ "person": name, "role": role }))?;
             print(json, &r, |r| format!("{name}: {} on {} (was {})", r["role"].as_str().unwrap_or_default(), r["repo"].as_str().unwrap_or_default(), r["was"].as_str().unwrap_or_default()));
         }
+        UserCmd::Signup { name, email } => {
+            let password = secret_value("password")?;
+            let made: serde_json::Value = client.post("/signup", &serde_json::json!({ "name": name, "email": email, "password": password }))?;
+            let token: avp::model::NewToken = serde_json::from_value(made["token"].clone())?;
+            print(json, &made, |_| format!("{name} signed up: your repos are your own until you bring them into an organization (`avp org create`)\n{}", token_text(&token)));
+        }
+        UserCmd::Login { name } => {
+            let password = secret_value("password")?;
+            let got: serde_json::Value = client.post("/session", &serde_json::json!({ "name": name, "password": password }))?;
+            let token: avp::model::NewToken = serde_json::from_value(got["token"].clone())?;
+            print(json, &got, |_| token_text(&token));
+        }
         UserCmd::Log { since } => {
             let evs: Vec<Event> = client.get(&format!("/accounts/events?since={since}&limit=10000"))?;
             print(json, &evs, |evs| {
@@ -2248,12 +2552,132 @@ fn users(client: &Client, dir: &Path, cmd: UserCmd, json: bool) -> Result<()> {
                             "token.created" => format!("token {} for {} ({})", s("id"), s("person"), s("name")),
                             "token.revoked" => format!("revoked token {} of {} ({})", s("id"), s("person"), s("name")),
                             "role.set" => format!("{} {} on {} (was {})", s("person"), s("role"), s("repo"), s("was")),
-                            _ => format!("{} {}", e.kind, e.data),
+                            _ => org_event_text(e),
                         };
                         format!("#{:<6} {} UTC  {what}, by {}", e.id, avp::blame::utc(e.at), s("by"))
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
+            });
+        }
+    }
+    Ok(())
+}
+
+/// What an organization's event says (`avp org log`, `avp user log`).
+fn org_event_text(e: &Event) -> String {
+    let d = &e.data;
+    let s = |k: &str| d[k].as_str().unwrap_or_default().to_string();
+    match e.kind.as_str() {
+        "org.created" => format!("created {}", s("org")),
+        "org.member" => format!("{} {} in {} (was {})", s("person"), s("role"), s("org"), s("was")),
+        "org.invited" => format!("invited {} into {} as {} ({})", d["person"].as_str().or(d["email"].as_str()).unwrap_or_default(), s("org"), s("role"), s("id")),
+        "org.joined" => format!("{} joined {} as {}", s("person"), s("org"), s("role")),
+        "org.declined" => format!("{} declined {}", s("person"), s("org")),
+        "org.plan" => format!("{} on the {} plan (was {})", s("org"), s("plan"), s("was")),
+        "org.repo" => format!("{} brought into {}", s("repo"), s("org")),
+        "user.password" => format!("{} set a password", s("name")),
+        _ => format!("{} {}", e.kind, e.data),
+    }
+}
+
+/// A space's month of proof minutes, as `avp org usage` and `avp stats` say it.
+fn usage_text(u: &serde_json::Value) -> String {
+    let cap = match u["cap"].as_f64() {
+        Some(c) => format!("of {c} ({} plan, until {})", u["plan"].as_str().unwrap_or_default(), &u["resets_at"].as_str().unwrap_or_default().get(..10).unwrap_or_default()),
+        None => format!("({} plan, no cap)", u["plan"].as_str().unwrap_or_default()),
+    };
+    let mut out = format!(
+        "{} {}: {} proof minutes {cap}: {} of proofs, {} of full suites; {} seat{}",
+        u["space"].as_str().unwrap_or_default(),
+        u["month"].as_str().unwrap_or_default(),
+        u["minutes"],
+        u["proof_minutes"],
+        u["full_minutes"],
+        u["seats"],
+        if u["seats"] == 1 { "" } else { "s" }
+    );
+    if let Some(said) = u["said"].as_str() {
+        out.push_str(&format!("\nproofs refused: {said}"));
+    }
+    out
+}
+
+fn orgs(client: &Client, dir: &Path, cmd: OrgCmd, json: bool) -> Result<()> {
+    match cmd {
+        OrgCmd::Create { name } => {
+            let o: serde_json::Value = client.post("/orgs", &serde_json::json!({ "name": name }))?;
+            print(json, &o, |_| format!("{name} created, on the free plan: you are its owner. `avp org invite {name} <name or email>` asks others in, `avp org repo {name}` brings this repo in"));
+        }
+        OrgCmd::List => {
+            let os: Vec<serde_json::Value> = client.get("/orgs")?;
+            print(json, &os, |os| {
+                if os.is_empty() {
+                    return "no organization: `avp org create <name>` makes one, `avp org invites` shows those asking you in".into();
+                }
+                os.iter().map(|o| format!("{:<20} {:<8} {:<10} {} seat{}", o["name"].as_str().unwrap_or_default(), o["role"].as_str().unwrap_or("-"), o["plan"].as_str().unwrap_or_default(), o["seats"], if o["seats"] == 1 { "" } else { "s" })).collect::<Vec<_>>().join("\n")
+            });
+        }
+        OrgCmd::Show { name } => {
+            let o: serde_json::Value = client.get(&format!("/orgs/{name}"))?;
+            print(json, &o, |o| {
+                let mut out = format!("{name}: {} plan, {} seat{}, you are {}", o["plan"].as_str().unwrap_or_default(), o["seats"], if o["seats"] == 1 { "" } else { "s" }, o["role"].as_str().unwrap_or("no member (server admin)"));
+                for m in o["members"].as_array().into_iter().flatten() {
+                    out.push_str(&format!("\n  {:<20} {}", m["person"].as_str().unwrap_or_default(), m["role"].as_str().unwrap_or_default()));
+                }
+                let repos: Vec<&str> = o["repos"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
+                out.push_str(&format!("\nrepos: {}", if repos.is_empty() { "none yet (`avp org repo <org> <repo>`)".to_string() } else { repos.join(", ") }));
+                for i in o["invites"].as_array().into_iter().flatten() {
+                    out.push_str(&format!("\ninvited, unanswered: {} as {} ({})", i["person"].as_str().or(i["email"].as_str()).unwrap_or_default(), i["role"].as_str().unwrap_or_default(), i["id"].as_str().unwrap_or_default()));
+                }
+                out
+            });
+        }
+        OrgCmd::Invite { org, to, role } => {
+            let i: serde_json::Value = client.post(&format!("/orgs/{org}/invites"), &serde_json::json!({ "to": to, "role": role }))?;
+            print(json, &i, |i| format!("{to} invited into {org} as {role} ({}): they answer with `avp org accept {}`", i["id"].as_str().unwrap_or_default(), i["id"].as_str().unwrap_or_default()));
+        }
+        OrgCmd::Invites => {
+            let is: Vec<serde_json::Value> = client.get("/invites")?;
+            print(json, &is, |is| {
+                if is.is_empty() {
+                    return "no invitation waits for you".into();
+                }
+                is.iter().map(|i| format!("{}  {} as {}, by {}: `avp org accept {}`", i["id"].as_str().unwrap_or_default(), i["org"].as_str().unwrap_or_default(), i["role"].as_str().unwrap_or_default(), i["by"].as_str().unwrap_or_default(), i["id"].as_str().unwrap_or_default())).collect::<Vec<_>>().join("\n")
+            });
+        }
+        OrgCmd::Accept { id, decline } => {
+            let a: serde_json::Value = client.post(&format!("/invites/{id}"), &serde_json::json!({ "accept": !decline }))?;
+            let org = a["org"].as_str().unwrap_or_default().to_string();
+            print(json, &a, |a| if decline { format!("{org}: declined") } else { format!("you are {} of {org}: its repos are yours to reach (`avp org show {org}`)", a["role"].as_str().unwrap_or_default()) });
+        }
+        OrgCmd::Role { org, person, role } => {
+            let r: serde_json::Value = client.post(&format!("/orgs/{org}/members"), &serde_json::json!({ "person": person, "role": role }))?;
+            print(json, &r, |r| format!("{person}: {} in {org} (was {})", r["role"].as_str().unwrap_or_default(), r["was"].as_str().unwrap_or_default()));
+        }
+        OrgCmd::Repo { org, repo } => {
+            let repo = repo_of(dir, repo)?;
+            let r: Repo = client.post(&format!("/orgs/{org}/repos"), &serde_json::json!({ "repo": repo }))?;
+            print(json, &r, |r| format!("{} is {org}'s: its members reach it by their org role, its proof minutes are {org}'s", r.name));
+        }
+        OrgCmd::Plan { org, plan } => {
+            let o: serde_json::Value = client.post(&format!("/orgs/{org}/plan"), &serde_json::json!({ "plan": plan }))?;
+            print(json, &o, |o| format!("{org} is on the {} plan", o["plan"].as_str().unwrap_or_default()));
+        }
+        OrgCmd::Usage { org, repo } => {
+            let u: serde_json::Value = match org {
+                Some(o) => client.get(&format!("/orgs/{o}/usage"))?,
+                None => client.get(&format!("/repos/{}/usage", repo_of(dir, repo)?))?,
+            };
+            print(json, &u, |u| if u["space"].is_string() { usage_text(u) } else { "this repo is no organization's and no person's: its proofs are not metered".into() });
+        }
+        OrgCmd::Log { org, since } => {
+            let evs: Vec<Event> = client.get(&format!("/orgs/{org}/events?since={since}&limit=10000"))?;
+            print(json, &evs, |evs| {
+                if evs.is_empty() {
+                    return format!("no change of {org} yet");
+                }
+                evs.iter().map(|e| format!("#{:<6} {} UTC  {}, by {}", e.id, avp::blame::utc(e.at), org_event_text(e), e.data["by"].as_str().unwrap_or_default())).collect::<Vec<_>>().join("\n")
             });
         }
     }

@@ -218,7 +218,8 @@ pub struct CheckConfig {
     #[serde(default)]
     pub keep: Vec<String>,
     /// Steps run on every candidate, in order. `{files}` expands to the task's code files,
-    /// `{all_files}` to every file the task leaves in the tree.
+    /// `{all_files}` to every file the task leaves in the tree, `{skip_files}` to the test files
+    /// `auto_skip` leaves out of the proofs.
     #[serde(default)]
     pub steps: Vec<ConfiguredStep>,
     /// The whole suite, run after a landing, never before.
@@ -238,6 +239,55 @@ pub struct CheckConfig {
     /// The whole suite on the head at set times of the day, whatever landed (`[[check.schedule]]`).
     #[serde(default)]
     pub schedule: Vec<Schedule>,
+    /// The image a sandboxed worker (AVP_SANDBOX) runs the setup and the steps in, e.g.
+    /// "node:22-bookworm": its own default (AVP_SANDBOX_IMAGE) when unset. A worker without a
+    /// sandbox, and the server, run them on the machine and do not read it.
+    pub image: Option<String>,
+    /// Slow test files that never fail leave the proofs by themselves (the full suite still runs
+    /// them): on unless `auto_skip = false`. A step takes them as `{skip_files}`.
+    #[serde(default = "auto_skip_on", deserialize_with = "auto_skip")]
+    pub auto_skip: Option<AutoSkip>,
+}
+
+/// `[check] auto_skip = { after = 100, min_seconds = 5 }`: a test file green in each of its last
+/// `after` runs (proofs and full suites alike) whose median run takes `min_seconds` or more is left
+/// out of the proofs; red once in a full suite, it is back in.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoSkip {
+    pub after: usize,
+    pub min_seconds: f64,
+}
+
+impl Default for AutoSkip {
+    fn default() -> Self {
+        Self { after: 100, min_seconds: 5.0 }
+    }
+}
+
+/// What AVP remembers of a test file's runs, at most: `after` cannot ask for more.
+pub const AUTO_SKIP_MAX_AFTER: usize = 1000;
+
+fn auto_skip_on() -> Option<AutoSkip> {
+    Some(AutoSkip::default())
+}
+
+/// `true`, `false`, or the rule's table (what it leaves out keeps its default).
+fn auto_skip<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<AutoSkip>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field {
+        On(bool),
+        Rule(AutoSkip),
+    }
+    let rule = match Field::deserialize(d).map_err(|_| serde::de::Error::custom("auto_skip is true, false or { after = 100, min_seconds = 5 }"))? {
+        Field::On(on) => on.then(AutoSkip::default),
+        Field::Rule(r) => Some(r),
+    };
+    if let Some(r) = rule.filter(|r| r.after == 0 || r.after > AUTO_SKIP_MAX_AFTER || r.min_seconds < 0.0) {
+        return Err(serde::de::Error::custom(format!("auto_skip: after = {} is 1 to {AUTO_SKIP_MAX_AFTER} runs, min_seconds = {} is 0 or more", r.after, r.min_seconds)));
+    }
+    Ok(rule)
 }
 
 impl CheckConfig {
@@ -477,6 +527,10 @@ pub struct ConfiguredStep {
     /// still decides which tests are related, so a proof runs the same tests, sooner.
     #[serde(default)]
     pub split: Option<usize>,
+    /// Runs as its own job, beside the job of the other steps instead of after them: a long
+    /// typecheck stops waiting for a scan. It costs a machine more for the proof's length.
+    #[serde(default)]
+    pub own_job: bool,
     /// Secrets this step gets beside `[check] secrets`: no other step sees them.
     #[serde(default)]
     pub secrets: Vec<String>,
@@ -484,6 +538,57 @@ pub struct ConfiguredStep {
     /// kept with the proof for 14 days: a coverage report, Playwright's traces, screenshots.
     #[serde(default)]
     pub artifacts: Vec<String>,
+}
+
+/// What one part spent before its first step, as `check_steps` measured it on this thread: the
+/// worker sends it with its steps, the server notes it for the proof (see `note_part`).
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Prep {
+    /// Waiting for a slot on this machine.
+    pub slot_s: f64,
+    /// From the slot to the first step: config, setup, the tree laid out, its links.
+    pub prep_s: f64,
+    pub setup_s: f64,
+    pub setup_ran: bool,
+}
+
+thread_local! {
+    static PREP: std::cell::Cell<Prep> = std::cell::Cell::new(Prep::default());
+}
+
+/// The preparation of the last part this thread ran, and forgets it.
+pub fn take_prep() -> Prep {
+    PREP.with(|p| p.replace(Prep::default()))
+}
+
+/// The timing of the proofs being made, by (task or shard, tree): each part adds its own.
+static TIMINGS: Mutex<Vec<((String, String), ProofTiming)>> = Mutex::new(Vec::new());
+
+/// One part of the proof of `name` on `tree_hash` waited `wait_s` for a machine and prepared as
+/// `prep` says: the proof keeps its slowest part's figures.
+pub fn note_part(name: &str, tree_hash: &str, wait_s: f64, prep: &Prep) {
+    let mut all = TIMINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (name.to_string(), tree_hash.to_string());
+    let i = match all.iter().position(|(k, _)| *k == key) {
+        Some(i) => i,
+        None => {
+            all.push((key, ProofTiming::default()));
+            all.len() - 1
+        }
+    };
+    let t = &mut all[i].1;
+    t.wait_s = t.wait_s.max(wait_s + prep.slot_s);
+    t.prep_s = t.prep_s.max(prep.prep_s);
+    t.setup_s = t.setup_s.max(prep.setup_s);
+    t.setup_ran |= prep.setup_ran;
+}
+
+/// What the parts of this proof noted, forgotten here: the proof keeps it.
+pub fn take_timing(name: &str, tree_hash: &str) -> Option<ProofTiming> {
+    let mut all = TIMINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = all.iter().position(|((n, t), _)| n == name && t == tree_hash)?;
+    Some(all.remove(i).1)
 }
 
 /// What to show of a red step: a split step lists its shares failures first, so the first share,
@@ -521,6 +626,10 @@ pub struct Part {
     /// What a shard keeps of what it makes (its `artifacts`). A worker from before ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// The test files `[check] auto_skip` leaves out of this proof: `{skip_files}`. A worker from
+    /// before ignores it, and runs them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip_files: Vec<String>,
 }
 
 impl Part {
@@ -539,6 +648,9 @@ pub struct AvpConfig {
     pub envs: std::collections::BTreeMap<String, EnvConfig>,
     #[serde(default)]
     pub line: LineConfig,
+    /// What `avp stats` needs beside the records: the price of the machines.
+    #[serde(default)]
+    pub stats: StatsConfig,
     /// Where AVP tells people what needs them.
     #[serde(default)]
     pub notify: NotifyConfig,
@@ -619,6 +731,15 @@ pub struct NotifyConfig {
     /// a URL that carries a token stays out of the tree, its mirror and AVP Live.
     #[serde(default)]
     pub webhooks: Vec<String>,
+}
+
+/// `[stats]` in avp.toml.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct StatsConfig {
+    /// What one hour of a proof machine costs, in dollars (a 4-vCPU spot machine: about 0.10).
+    /// With it, `avp stats` says what the machine time cost, in all and per landing.
+    #[serde(default)]
+    pub machine_hour_usd: Option<f64>,
 }
 
 /// `[line]` in avp.toml: what AVP does to the line by itself.
@@ -865,6 +986,13 @@ fn step_env(vars: impl Iterator<Item = (OsString, OsString)>, listed: &str, depl
         .collect()
 }
 
+/// What a step in a sandbox gets of the worker's environment: the names `listed` gives, never a
+/// secret nor a deploy's, nor `STEP_ENV`: the worker's PATH, HOME or CARGO_TARGET_DIR name its own
+/// folders, which the container does not have. The image says those, the sandbox the rest.
+fn sandbox_env(vars: impl Iterator<Item = (OsString, OsString)>, listed: &str, deploy: &str) -> Vec<(OsString, OsString)> {
+    step_env(vars, listed, deploy).into_iter().filter(|(k, _)| k.to_str().is_some_and(|k| !STEP_ENV.contains(&k) && !k.starts_with("LC_"))).collect()
+}
+
 /// What a deploy gets beside what a step sees: the variables of `vars` `listed` names
 /// (AVP_DEPLOY_ENV, comma separated), a cloud's or the forge's credentials included, since listing
 /// them there is how the server's owner hands a deploy what it needs. AVP's own secret, never: with
@@ -920,26 +1048,32 @@ pub struct SecretInfo {
     pub set_at: i64,
 }
 
-fn run(dir: &Path, command: &str, cancel: &AtomicBool) -> Step {
-    run_with(dir, command, cancel, &[], &[], None).0
+fn run(dir: &Path, command: &str, cancel: &AtomicBool, jail: Option<&Jail>) -> Step {
+    run_with(dir, command, cancel, &[], &[], None, jail).0
 }
 
 /// `sh -c command` in `dir` as a step runs: from a scrubbed environment, `env` beside it (a shard's
-/// matrix, the services' `env`), in a process group of its own.
-fn shell(dir: &Path, command: &str, env: &[(OsString, OsString)]) -> Command {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(dir)
-        // Not the environment AVP runs in: what an agent wrote never reads the machine's secrets.
-        .env_clear()
-        .envs(step_env(std::env::vars_os(), &std::env::var("AVP_PROOF_ENV").unwrap_or_default(), &std::env::var("AVP_DEPLOY_ENV").unwrap_or_default()))
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .env("CI", "true")
-        .env("AVP", "1")
-        .env("TRAME", "1")
-        // The same locale as a CI runner: a test that formats money must not depend on the host.
-        .env("LANG", "en_US.UTF-8")
-        .env("LC_ALL", "en_US.UTF-8")
-        .stdin(Stdio::null());
+/// matrix, the services' `env`), in a process group of its own. In a sandbox, the same command in
+/// the job's container (`Jail::exec`): the image's environment, and only what AVP names beside it.
+fn shell(dir: &Path, command: &str, env: &[(OsString, OsString)], jail: Option<&Jail>) -> Command {
+    let (listed, deploy) = (std::env::var("AVP_PROOF_ENV").unwrap_or_default(), std::env::var("AVP_DEPLOY_ENV").unwrap_or_default());
+    // Not the environment AVP runs in: what an agent wrote never reads the machine's secrets.
+    let mut vars = match jail {
+        None => step_env(std::env::vars_os(), &listed, &deploy),
+        Some(_) => sandbox_env(std::env::vars_os(), &listed, &deploy),
+    };
+    vars.extend(env.iter().cloned());
+    // The same locale as a CI runner: a test that formats money must not depend on the host.
+    vars.extend([("CI", "true"), ("AVP", "1"), ("TRAME", "1"), ("LANG", "en_US.UTF-8"), ("LC_ALL", "en_US.UTF-8")].map(|(k, v)| (OsString::from(k), OsString::from(v))));
+    let mut cmd = match jail {
+        None => {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(command).current_dir(dir).env_clear();
+            cmd
+        }
+        Some(jail) => jail.exec(dir, command, &vars),
+    };
+    cmd.envs(vars).stdin(Stdio::null());
     // Its own process group, so that stopping it stops what it started (test runners fork).
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -952,12 +1086,13 @@ fn shell(dir: &Path, command: &str, env: &[(OsString, OsString)]) -> Command {
 /// `watch` is told and in the output kept, which events, `avp proof` and AVP Live show.
 pub fn run_deploy(dir: &Path, command: &str, watch: &mut dyn FnMut(&str)) -> Step {
     let given = deploy_env(std::env::vars_os(), &std::env::var("AVP_DEPLOY_ENV").unwrap_or_default());
-    run_with(dir, command, &AtomicBool::new(false), &[], &given, Some(watch)).0
+    run_with(dir, command, &AtomicBool::new(false), &[], &given, Some(watch), None).0
 }
 
 /// `run`, `env` and `given` beside what a step sees, the values of `given` masked in the output and
-/// in its whole log, each line dated.
-fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, OsString)], given: &[(OsString, OsString)], mut watch: Option<&mut dyn FnMut(&str)>) -> (Step, Log) {
+/// in its whole log, each line dated. In a sandbox, stopped at the job's time or disk limit, and a
+/// step that hit one says which.
+fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, OsString)], given: &[(OsString, OsString)], mut watch: Option<&mut dyn FnMut(&str)>, jail: Option<&Jail>) -> (Step, Log) {
     let start = Instant::now();
     let mut capture = Capture::new(start);
     let hidden = hidden(given);
@@ -974,7 +1109,7 @@ fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, Os
         Ok(f) => f,
         Err(e) => return failed(e),
     };
-    let mut cmd = shell(dir, command, &[env, given].concat());
+    let mut cmd = shell(dir, command, &[env, given].concat(), jail);
     match file.try_clone() {
         Ok(f) => cmd.stdout(f).stderr(file),
         Err(e) => return failed(e),
@@ -1002,6 +1137,8 @@ fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, Os
         }
         partial = rest;
     };
+    let mut measured = Instant::now();
+    let mut over = None;
     let exit = loop {
         tell(false);
         match child.try_wait() {
@@ -1009,7 +1146,12 @@ fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, Os
             Ok(None) => {}
             Err(_) => break -1,
         }
-        if cancel.load(Ordering::Relaxed) {
+        over = jail.and_then(|j| j.over(&mut measured));
+        if cancel.load(Ordering::Relaxed) || over.is_some() {
+            // What runs in a container is not the client's child: the container goes with it.
+            if let Some(j) = jail {
+                j.kill();
+            }
             // The whole group, what the step started with it, by kill(2) itself: procps 4.0.2 (Debian
             // bookworm, the server's and the workers' image) reads `kill -KILL -<group>` as every
             // process of the user, and stopping a superseded proof killed the server or the worker
@@ -1020,7 +1162,7 @@ fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, Os
             }
             let _ = child.kill();
             let _ = child.wait();
-            break CANCELLED;
+            break if over.is_some() { 1 } else { CANCELLED };
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -1030,6 +1172,11 @@ fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, Os
     let _ = fs::remove_file(&log);
     if exit == CANCELLED {
         text.push_str("\ncancelled: the task's files changed, a newer tree is being proven");
+    }
+    // A limit says itself: a step killed for its memory reads as a crash otherwise.
+    let hit = over.or_else(|| jail.filter(|_| exit != 0 && exit != CANCELLED).and_then(|j| limit_hit(exit, &text, &j.limits)));
+    if let Some(hit) = &hit {
+        text.push_str(&format!("\nsandbox: {hit}"));
     }
     if text.len() > 60_000 {
         let (mut a, mut b) = (20_000, text.len() - 40_000);
@@ -1044,6 +1191,9 @@ fn run_with(dir: &Path, command: &str, cancel: &AtomicBool, env: &[(OsString, Os
     let mut log = capture.end();
     if exit == CANCELLED {
         log.lines.push((start.elapsed().as_millis() as u64, "cancelled: the task's files changed, a newer tree is being proven".into()));
+    }
+    if let Some(hit) = hit {
+        log.lines.push((start.elapsed().as_millis() as u64, format!("sandbox: {hit}")));
     }
     (Step { name: String::new(), command: command.to_string(), exit, seconds: start.elapsed().as_secs_f64(), output: text }, log)
 }
@@ -1544,7 +1694,8 @@ impl Drop for Up {
 impl Up {
     /// Starts `services` for the candidate laid out in `dir`, their data and logs in `folder`, all
     /// at once, and waits until each is ready. Err: the step that says which one never was, and why.
-    fn start(services: &[&Service], dir: &Path, folder: &Path, env: &[(OsString, OsString)], cancel: &AtomicBool) -> std::result::Result<Up, Step> {
+    /// In a sandbox, they live in the job's network (`Jail::service_args`): each on its own port.
+    fn start(services: &[&Service], dir: &Path, folder: &Path, env: &[(OsString, OsString)], cancel: &AtomicBool, jail: Option<&Jail>) -> std::result::Result<Up, Step> {
         let began = Instant::now();
         let failed = |s: &Service, exit: i32, output: String| Step {
             name: format!("service {}", s.name),
@@ -1557,8 +1708,11 @@ impl Up {
             output,
         };
         let mut up = Up { running: vec![], ports: vec![], folder: folder.to_path_buf(), env: vec![] };
-        // What an earlier check in this slot left, cut before its end (the server stopped).
-        let _ = remove_all(folder);
+        // What an earlier check in this slot left, cut before its end (the server stopped): emptied,
+        // not removed, since a sandbox has it mounted already.
+        for old in fs::read_dir(folder).into_iter().flatten().flatten() {
+            let _ = remove_all(&old.path());
+        }
         if let Err(e) = fs::create_dir_all(folder) {
             return Err(failed(services[0], 1, format!("the services' folder {}: {e}", folder.display())));
         }
@@ -1568,7 +1722,10 @@ impl Up {
             Err(e) => return Err(failed(services[0], 1, format!("no free port on this machine: {e}"))),
         };
         up.ports = free.clone();
-        let tool = container_tool();
+        let tool = match jail {
+            Some(j) => Some(j.tool),
+            None => container_tool(),
+        };
         if let Some(tool) = tool.filter(|_| services.iter().any(|s| matches!(s.kind, ServiceKind::Image { .. }))) {
             // Containers of an earlier check in this slot, cut before it could remove them.
             let label = format!("label=avp.folder={}", folder.display());
@@ -1581,6 +1738,7 @@ impl Up {
         let mut started = Vec::new();
         for s in services {
             let (ports, data): (Vec<(u16, u16)>, Option<PathBuf>) = match &s.kind {
+                ServiceKind::Image { ports, .. } if jail.is_some() => (ports.iter().map(|p| (*p, *p)).collect(), None),
                 ServiceKind::Image { ports, .. } => (ports.iter().map(|p| (*p, free.remove(0))).collect(), None),
                 ServiceKind::Run(_) => {
                     let port = free.remove(0);
@@ -1594,8 +1752,13 @@ impl Up {
                     let Some(tool) = tool else { return Err(failed(s, 1, format!("the service {} is a container, and this machine has neither docker nor podman: the steps did not run", s.name))) };
                     let name = format!("avp-{}-{}", s.name, ulid::Ulid::new().to_string().to_lowercase());
                     let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), name.clone(), "--label".into(), format!("avp.folder={}", folder.display())];
-                    for (inner, host) in &ports {
-                        args.extend(["-p".into(), format!("127.0.0.1:{host}:{inner}")]);
+                    match jail {
+                        Some(j) => args.extend(j.service_args()),
+                        None => {
+                            for (inner, host) in &ports {
+                                args.extend(["-p".into(), format!("127.0.0.1:{host}:{inner}")]);
+                            }
+                        }
                     }
                     for (k, v) in &own {
                         args.extend(["-e".into(), format!("{}={}", k.to_string_lossy(), v.to_string_lossy())]);
@@ -1613,7 +1776,7 @@ impl Up {
                 ServiceKind::Run(run) => {
                     let data = data.as_ref().unwrap();
                     let out = fs::create_dir_all(data).and_then(|_| fs::File::create(&log)).and_then(|f| Ok((f.try_clone()?, f)));
-                    let child = out.and_then(|(o, e)| shell(dir, &fill(run, &ports, Some(data)), &[env, own.as_slice()].concat()).stdout(o).stderr(e).spawn());
+                    let child = out.and_then(|(o, e)| shell(dir, &fill(run, &ports, Some(data)), &[env, own.as_slice()].concat(), jail).stdout(o).stderr(e).spawn());
                     match child {
                         Ok(c) => up.running.push(Running::Process(c)),
                         Err(e) => return Err(failed(s, 1, format!("the service {} did not start: {e}: the steps did not run", s.name))),
@@ -1626,6 +1789,11 @@ impl Up {
         // All of them starting side by side, each one waited for in turn, from now: the first pull
         // of an image takes what it takes.
         let launched = Instant::now();
+        // A port of the job's network is seen from inside it: the worker's own localhost is not it.
+        let reached = |port: u16| match jail {
+            Some(j) => j.listening(port),
+            None => answers(port),
+        };
         for (i, st) in started.iter().enumerate() {
             let s = st.service;
             let deadline = launched + Duration::from_secs(s.ready_s);
@@ -1641,9 +1809,9 @@ impl Up {
                 }
                 let ready = match (&s.ready, &up.running[i]) {
                     (Some(Ready::Command(c)), Running::Container(tool, name)) => succeeds(Command::new(*tool).args(["exec", name.as_str(), "sh", "-c", c.as_str()]), Duration::from_secs(10)),
-                    (Some(Ready::Command(c)), Running::Process(_)) => succeeds(&mut shell(dir, &fill(c, &st.ports, Some(&up.folder.join(&s.name))), &[env, st.env.as_slice()].concat()), Duration::from_secs(10)),
-                    (Some(Ready::Port(p)), _) => st.ports.iter().find(|(inner, _)| inner == p).is_some_and(|(_, host)| answers(*host)),
-                    (None, _) => first.is_none_or(answers),
+                    (Some(Ready::Command(c)), Running::Process(_)) => succeeds(&mut shell(dir, &fill(c, &st.ports, Some(&up.folder.join(&s.name))), &[env, st.env.as_slice()].concat(), jail), Duration::from_secs(10)),
+                    (Some(Ready::Port(p)), _) => st.ports.iter().find(|(inner, _)| inner == p).is_some_and(|(_, host)| reached(*host)),
+                    (None, _) => first.is_none_or(reached),
                 };
                 if ready {
                     break;
@@ -1676,6 +1844,370 @@ impl Up {
 /// What a container printed, stdout and stderr.
 fn logs(tool: &str, name: &str) -> String {
     Command::new(tool).args(["logs", "--tail", "30", name]).output().map(|o| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))).unwrap_or_default()
+}
+
+/// What a job may use of its worker in a sandbox. The server sends them with each job it hands over
+/// (its own AVP_SANDBOX_CPUS, _MEMORY, _PIDS, _DISK, and AVP_WORKER_RUN_S, past which it gives up on
+/// the job anyway); what it leaves unsaid, the worker's own variables say.
+#[derive(Clone, Debug, Default, serde::Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Limits {
+    /// CPUs, as docker's `--cpus` reads them: "2", "1.5".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
+    /// Memory, swap included: "4g".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// Processes and threads at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids: Option<u64>,
+    /// What the job may write: its folder, and as much again in /tmp. "20g".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<String>,
+    /// The whole job, from its slot: setup, services and steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
+}
+
+impl Limits {
+    pub fn from_env() -> Limits {
+        let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Limits {
+            cpus: var("AVP_SANDBOX_CPUS"),
+            memory: var("AVP_SANDBOX_MEMORY"),
+            pids: var("AVP_SANDBOX_PIDS").and_then(|v| v.parse().ok()),
+            disk: var("AVP_SANDBOX_DISK"),
+            timeout_s: Some(var("AVP_WORKER_RUN_S").and_then(|v| v.parse().ok()).unwrap_or(2400)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Limits::default()
+    }
+
+    /// These, what they leave unsaid taken from `other`: the server's, then the worker's.
+    pub fn or(self, other: Limits) -> Limits {
+        Limits { cpus: self.cpus.or(other.cpus), memory: self.memory.or(other.memory), pids: self.pids.or(other.pids), disk: self.disk.or(other.disk), timeout_s: self.timeout_s.or(other.timeout_s) }
+    }
+}
+
+/// "20g", "512m", "1048576": bytes, as docker reads a size.
+fn bytes(size: &str) -> Option<u64> {
+    let s = size.trim().to_ascii_lowercase();
+    let s = s.strip_suffix('b').unwrap_or(&s);
+    let (digits, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => s.split_at(i),
+        None => (s, ""),
+    };
+    let unit: u64 = match unit {
+        "" => 1,
+        "k" => 1 << 10,
+        "m" => 1 << 20,
+        "g" => 1 << 30,
+        "t" => 1 << 40,
+        _ => return None,
+    };
+    digits.parse::<u64>().ok()?.checked_mul(unit)
+}
+
+/// Why a step that failed in a sandbox may have failed: the limit it hit, by name, when its exit
+/// or its output says so. The kernel says none of it in words a test runner prints.
+fn limit_hit(exit: i32, output: &str, limits: &Limits) -> Option<String> {
+    let named = |var: &str, value: Option<String>| value.map(|v| format!("{var}={v}")).unwrap_or_else(|| var.to_string());
+    if output.contains("No space left on device") {
+        Some(format!("the job ran out of disk: its limit is {} (its folder, and /tmp)", named("AVP_SANDBOX_DISK", limits.disk.clone())))
+    } else if limits.pids.is_some() && ["fork: Resource temporarily unavailable", "fork: retry", "Cannot fork", "Resource temporarily unavailable (os error 11)", "pthread_create failed", "EAGAIN: resource temporarily unavailable, spawn"].iter().any(|m| output.contains(m)) {
+        Some(format!("the job could not start another process: its limit is {} processes and threads", named("AVP_SANDBOX_PIDS", limits.pids.map(|p| p.to_string()))))
+    } else if exit == 137 && limits.memory.is_some() {
+        Some(format!("the step was killed (SIGKILL), most likely at the job's memory limit, {}", named("AVP_SANDBOX_MEMORY", limits.memory.clone())))
+    } else {
+        None
+    }
+}
+
+/// Bytes under `dir`, links not followed.
+fn size_of(dir: &Path) -> u64 {
+    let mut size = 0;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let Ok(m) = e.metadata() else { continue };
+            if m.is_dir() {
+                todo.push(e.path());
+            } else {
+                size += m.len();
+            }
+        }
+    }
+    size
+}
+
+/// AVP_SANDBOX=docker (or podman): a worker that runs strangers' code runs each job in a container
+/// of its own, removed when the job ends. Only the job's folders are mounted (at the same path, so
+/// that the setup's links and `{data}` still resolve), the root is read-only, /tmp a tmpfs of its
+/// own, the user not root, no capability, no new privilege, and its network is its own: a bridge
+/// named `avpj*` that the machine's firewall keeps from the cloud's metadata, the private ranges
+/// and the host (docs/GUIDE.md, "Proofs in a sandbox"). A worker that cannot have all of it does
+/// not start.
+#[derive(Clone, Debug)]
+pub struct Sandbox {
+    pub tool: &'static str,
+    /// The image when avp.toml names none (AVP_SANDBOX_IMAGE).
+    pub image: String,
+    /// uid:gid the steps run as: the worker's own, so that the job's folder is theirs.
+    pub user: String,
+    pub limits: Limits,
+    /// What labels this worker's containers and networks (its data folder): a worker that starts
+    /// again removes what it left, and only that.
+    pub owner: String,
+}
+
+/// The networks' bridges are named `avpj` and 11 characters: the firewall's rules match `avpj+`.
+pub const BRIDGE_PREFIX: &str = "avpj";
+
+/// Whether the job's network keeps what it must out: run in the job's container, it tries each
+/// `host:port` of $AVP_PROBE with curl, or bash and timeout, and says what answered.
+const PROBE: &str = r#"for t in $AVP_PROBE; do
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -o /dev/null -m 4 "http://$t/"; c=$?
+    [ $c = 7 ] || [ $c = 28 ] || echo "reached $t"
+  elif command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    timeout 4 bash -c "exec 3<>/dev/tcp/${t%:*}/${t##*:}" 2>/dev/null && echo "reached $t"
+  else
+    echo "no probe"; exit 0
+  fi
+done
+echo probed"#;
+
+impl Sandbox {
+    /// AVP_SANDBOX, AVP_SANDBOX_IMAGE, AVP_SANDBOX_USER and the limits. None: no sandbox asked.
+    pub fn from_env(data: &Path) -> Result<Option<Sandbox>> {
+        let asked = std::env::var("AVP_SANDBOX").unwrap_or_default();
+        let tool = match asked.trim() {
+            "" => return Ok(None),
+            "docker" => "docker",
+            "podman" => "podman",
+            other => anyhow::bail!("AVP_SANDBOX={other}: docker or podman"),
+        };
+        let answers = Command::new(tool).arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        anyhow::ensure!(answers, "AVP_SANDBOX={tool}: `{tool} version` does not answer on this machine");
+        let image = std::env::var("AVP_SANDBOX_IMAGE").ok().filter(|i| !i.trim().is_empty()).context("AVP_SANDBOX_IMAGE: the image a job runs in when its avp.toml names none ([check] image)")?;
+        #[cfg(unix)]
+        let own = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
+        #[cfg(not(unix))]
+        let own = String::new();
+        let user = std::env::var("AVP_SANDBOX_USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or(own);
+        anyhow::ensure!(!["", "0", "root"].contains(&user.split(':').next().unwrap_or("")), "the sandbox runs steps as a user other than root: a worker started as root names one, AVP_SANDBOX_USER=uid:gid, who owns its data folder");
+        Ok(Some(Sandbox { tool, image: image.trim().to_string(), user, limits: Limits::from_env(), owner: data.to_string_lossy().to_string() }))
+    }
+
+    /// This sandbox for one job: the server's limits first.
+    pub fn for_job(&self, limits: Limits) -> Sandbox {
+        Sandbox { limits: limits.or(self.limits.clone()), ..self.clone() }
+    }
+
+    /// Removes the containers and networks an earlier run of this worker left (it was killed).
+    pub fn sweep(&self) {
+        let label = format!("label=avp.sandbox={}", self.owner);
+        for (list, rm) in [(&["ps", "-aq", "--filter"][..], &["rm", "-f", "-v"][..]), (&["network", "ls", "-q", "--filter"][..], &["network", "rm"][..])] {
+            let Ok(out) = Command::new(self.tool).args(list).arg(&label).stderr(Stdio::null()).output() else { continue };
+            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = Command::new(self.tool).args(rm).arg(id).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
+        }
+    }
+
+    /// Refuses a sandbox whose network reaches the cloud's metadata (169.254.169.254) or what
+    /// AVP_SANDBOX_PROBE adds (`host:port`, comma separated: the server's private address): the
+    /// firewall's rules are not set on this machine. Run once, as the worker starts.
+    pub fn probe(&self, data: &Path) -> Result<()> {
+        let dir = data.join("sandbox-probe");
+        fs::create_dir_all(&dir)?;
+        let jail = Jail::start(self, &self.image, &[&dir], &dir, None, &dir)?;
+        let mut targets = vec!["169.254.169.254:80".to_string()];
+        targets.extend(names_in(&std::env::var("AVP_SANDBOX_PROBE").unwrap_or_default()).into_iter().map(String::from));
+        let out = jail.exec(&dir, PROBE, &[("AVP_PROBE".into(), targets.join(" ").into())]).env("AVP_PROBE", targets.join(" ")).stdin(Stdio::null()).output()?;
+        drop(jail);
+        let _ = remove_all(&dir);
+        probed(&String::from_utf8_lossy(&out.stdout), &self.image).map_err(|e| anyhow::anyhow!("{e}\n{}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+
+    /// `run -d` of a job's container, as `jail.exec` then runs its steps in it: what makes it a
+    /// sandbox is here, in one place.
+    fn run_args(&self, image: &str, name: &str, mounts: &[&Path], home: &Path) -> Vec<String> {
+        let mut a: Vec<String> = ["run", "-d", "--name", name, "--label"].map(String::from).to_vec();
+        a.push(format!("avp.sandbox={}", self.owner));
+        a.extend(["--network".into(), name.into(), "--init".into(), "--user".into(), self.user.clone()]);
+        // Rootless podman maps the worker's own uid into the container, or the job's folder would
+        // belong to nobody there.
+        if self.tool == "podman" {
+            a.push("--userns=keep-id".into());
+        }
+        a.extend(["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only"].map(String::from));
+        let size = self.limits.disk.as_ref().map(|d| format!(",size={d}")).unwrap_or_default();
+        a.extend(["--tmpfs".into(), format!("/tmp:rw,nosuid,nodev,mode=1777{size}")]);
+        a.extend(limit_args(&self.limits));
+        for m in mounts {
+            a.extend(["-v".into(), format!("{0}:{0}", m.display())]);
+        }
+        // The caches a build keeps (cargo's registry, pnpm's store, corepack's pnpm) under the repo's
+        // own home, never another repo's.
+        let home = home.display();
+        for (k, v) in [("HOME", format!("{home}")), ("XDG_CACHE_HOME", format!("{home}/.cache")), ("CARGO_HOME", format!("{home}/.cargo")), ("COREPACK_HOME", format!("{home}/.corepack")), ("npm_config_store_dir", format!("{home}/.pnpm-store")), ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0".into()), ("TMPDIR", "/tmp".into())] {
+            a.extend(["-e".into(), format!("{k}={v}")]);
+        }
+        // Whatever the image's entrypoint, the container waits for the steps `exec` brings it.
+        a.extend(["--entrypoint".into(), "sh".into(), image.into(), "-c".into(), "trap 'exit 0' TERM; while :; do sleep 3600; done".into()]);
+        a
+    }
+
+    /// `network create` of a job's own network, its bridge named for the firewall's rules.
+    fn network_args(&self, name: &str, bridge: &str) -> Vec<String> {
+        let mut a: Vec<String> = ["network", "create", "--label"].map(String::from).to_vec();
+        a.push(format!("avp.sandbox={}", self.owner));
+        match self.tool {
+            "podman" => a.extend(["--interface-name".into(), bridge.into()]),
+            _ => a.extend(["--driver".into(), "bridge".into(), "-o".into(), format!("com.docker.network.bridge.name={bridge}")]),
+        }
+        a.push(name.into());
+        a
+    }
+}
+
+/// A job's limits, as `run` reads them: its services' containers get them too.
+fn limit_args(limits: &Limits) -> Vec<String> {
+    let mut a = vec![];
+    if let Some(c) = &limits.cpus {
+        a.extend(["--cpus".into(), c.clone()]);
+    }
+    // The same for swap: a job past its memory is killed, not slowed into the next one's.
+    if let Some(m) = &limits.memory {
+        a.extend(["--memory".into(), m.clone(), "--memory-swap".into(), m.clone()]);
+    }
+    if let Some(p) = limits.pids {
+        a.extend(["--pids-limit".into(), p.to_string()]);
+    }
+    a
+}
+
+/// What the probe said: Err when something answered that must not, or when it could not tell.
+fn probed(out: &str, image: &str) -> std::result::Result<(), String> {
+    let reached: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("reached ")).collect();
+    if !reached.is_empty() {
+        Err(format!("a sandboxed job reaches {}: the firewall's rules for the avpj+ bridges are not set on this machine (docs/GUIDE.md, \"Proofs in a sandbox\"), the worker does not start", reached.join(", ")))
+    } else if out.lines().any(|l| l == "no probe") {
+        Err(format!("the image {image} has neither curl nor bash and timeout: the worker cannot check that a job does not reach the cloud's metadata, and does not start"))
+    } else if !out.lines().any(|l| l == "probed") {
+        Err(format!("the sandbox's network could not be checked in {image}: the worker does not start"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether /proc/net/tcp (and tcp6) lists `port` listening: how a sandboxed service is seen ready,
+/// from inside the job's network, whatever the image has.
+fn listens(table: &str, port: u16) -> bool {
+    table.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() > 3 && f[3] == "0A" && f[1].rsplit(':').next().and_then(|p| u16::from_str_radix(p, 16).ok()) == Some(port)
+    })
+}
+
+/// One job's container and its network, up. Dropped, whatever ended the job, both are removed with
+/// all they hold: what a step started, what it wrote outside its folder.
+pub struct Jail {
+    tool: &'static str,
+    name: String,
+    limits: Limits,
+    deadline: Option<Instant>,
+    /// What the disk limit measures.
+    dir: PathBuf,
+}
+
+impl Jail {
+    /// The job's network, then its container from `image`, `mounts` read-write at the same path
+    /// and `home` the repo's caches. Err says why: the job runs nothing outside its sandbox.
+    fn start(sb: &Sandbox, image: &str, mounts: &[&Path], home: &Path, deadline: Option<Instant>, dir: &Path) -> Result<Jail> {
+        let id = ulid::Ulid::new().to_string().to_lowercase();
+        let jail = Jail { tool: sb.tool, name: format!("avp-job-{id}"), limits: sb.limits.clone(), deadline, dir: dir.to_path_buf() };
+        fs::create_dir_all(home)?;
+        let bridge = format!("{BRIDGE_PREFIX}{}", &id[id.len() - 11..]);
+        let mut mounts = mounts.to_vec();
+        mounts.push(home);
+        for args in [sb.network_args(&jail.name, &bridge), sb.run_args(image, &jail.name, &mounts, home)] {
+            // Pulls the image the first time: as long as it takes.
+            let out = Command::new(sb.tool).args(&args).stdin(Stdio::null()).output().with_context(|| format!("{} {}", sb.tool, args[0]))?;
+            anyhow::ensure!(out.status.success(), "the job's sandbox did not start ({} {} {image}): {}", sb.tool, args[0], tail(&String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(jail)
+    }
+
+    /// `sh -c command` in the container, in `dir`: `vars` passed by name only, the client takes
+    /// their values from its own environment (a secret never shows in a process list).
+    fn exec(&self, dir: &Path, command: &str, vars: &[(OsString, OsString)]) -> Command {
+        let mut cmd = Command::new(self.tool);
+        cmd.args(exec_args(&self.name, dir, vars, command));
+        cmd
+    }
+
+    /// Stops what runs in it, at once: a cancelled step, or one past a limit.
+    fn kill(&self) {
+        let _ = Command::new(self.tool).args(["kill", self.name.as_str()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+
+    /// The limit the job went past, if it did: its time, or its folder's size (measured every 15 s
+    /// at most, `measured` the last time).
+    fn over(&self, measured: &mut Instant) -> Option<String> {
+        if let (Some(deadline), Some(t)) = (self.deadline, self.limits.timeout_s) {
+            if Instant::now() >= deadline {
+                return Some(format!("the job ran past its time limit, {t}s (AVP_WORKER_RUN_S): stopped"));
+            }
+        }
+        let max = self.limits.disk.as_deref().and_then(bytes)?;
+        if measured.elapsed() < Duration::from_secs(15) {
+            return None;
+        }
+        *measured = Instant::now();
+        (size_of(&self.dir) > max).then(|| format!("the job's folder went past its disk limit, AVP_SANDBOX_DISK={}: stopped", self.limits.disk.as_deref().unwrap_or_default()))
+    }
+
+    /// Whether something listens on `port` in the job's network.
+    fn listening(&self, port: u16) -> bool {
+        let out = Command::new(self.tool).args(["exec", self.name.as_str(), "cat", "/proc/net/tcp", "/proc/net/tcp6"]).stdin(Stdio::null()).stderr(Stdio::null()).output();
+        out.is_ok_and(|o| listens(&String::from_utf8_lossy(&o.stdout), port))
+    }
+
+    /// What a service's container adds to `run`: the job's network itself, so that `localhost:{port}`
+    /// reaches it from a step as it does on a machine, nothing published on the host, and the job's
+    /// limits. Its image runs as it wants (a database starts as root) but gains no privilege.
+    fn service_args(&self) -> Vec<String> {
+        let mut a = vec!["--network".into(), format!("container:{}", self.name), "--security-opt".into(), "no-new-privileges".into()];
+        a.extend(limit_args(&self.limits));
+        a
+    }
+}
+
+impl Drop for Jail {
+    fn drop(&mut self) {
+        let quiet = |args: &[&str]| {
+            let _ = Command::new(self.tool).args(args).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        };
+        quiet(&["rm", "-f", "-v", self.name.as_str()]);
+        quiet(&["network", "rm", self.name.as_str()]);
+    }
+}
+
+/// `exec` of one command in a job's container: each variable by its name alone.
+fn exec_args(name: &str, dir: &Path, vars: &[(OsString, OsString)], command: &str) -> Vec<String> {
+    let mut a: Vec<String> = vec!["exec".into(), "-w".into(), dir.to_string_lossy().to_string()];
+    let mut named = BTreeSet::new();
+    for (k, _) in vars {
+        if named.insert(k.to_string_lossy().to_string()) {
+            a.extend(["-e".into(), k.to_string_lossy().to_string()]);
+        }
+    }
+    a.extend([name.into(), "sh".into(), "-c".into(), command.into()]);
+    a
 }
 
 /// The test files of the tree that name one of the task's non-code files (a stylesheet a test reads
@@ -1758,6 +2290,8 @@ pub struct Workspace {
     pub cache: PathBuf,
     pub kept: Kept,
     secrets: Given,
+    /// AVP_SANDBOX on a worker: the setup and the steps run in a container of the job's own.
+    sandbox: Option<Sandbox>,
 }
 
 /// Where the values of the secrets a proof's steps name come from.
@@ -1773,7 +2307,7 @@ enum Given {
 /// (its part names its secrets), one part of a task's proof, or every step.
 fn steps_of(cfg: &CheckConfig, steps_override: Option<&str>, part: Option<&Part>) -> Vec<ConfiguredStep> {
     let mut steps: Vec<ConfiguredStep> = match (steps_override, part) {
-        (Some(cmd), p) => vec![ConfiguredStep { name: "full".into(), run: cmd.to_string(), needs_files: false, split: None, secrets: p.map(|p| p.secrets.clone()).unwrap_or_default(), artifacts: p.map(|p| p.artifacts.clone()).unwrap_or_default() }],
+        (Some(cmd), p) => vec![ConfiguredStep { name: "full".into(), run: cmd.to_string(), needs_files: false, split: None, own_job: false, secrets: p.map(|p| p.secrets.clone()).unwrap_or_default(), artifacts: p.map(|p| p.artifacts.clone()).unwrap_or_default() }],
         (None, Some(Part { step: Some(only), .. })) => cfg.steps.iter().filter(|s| &s.name == only).cloned().collect(),
         (None, Some(p)) => cfg.steps.iter().filter(|s| !p.skip.contains(&s.name)).cloned().collect(),
         (None, None) => cfg.steps.clone(),
@@ -1797,7 +2331,21 @@ pub fn secrets_named(cfg: &CheckConfig, steps_override: Option<&str>, part: Opti
 
 impl Workspace {
     pub fn new(data: &Path, repo: &str) -> Self {
-        Self { work: data.join("work").join(repo), cache: data.join("cache").join(repo), kept: Kept::new(data), secrets: Given::Store(data.to_path_buf(), repo.to_string()) }
+        Self { work: data.join("work").join(repo), cache: data.join("cache").join(repo), kept: Kept::new(data), secrets: Given::Store(data.to_path_buf(), repo.to_string()), sandbox: None }
+    }
+
+    /// On a worker started with AVP_SANDBOX: each check in a container of its own.
+    pub fn with_sandbox(mut self, sandbox: Option<Sandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The job's container when there is a sandbox, with `mounts` and the repo's own home (its
+    /// caches): the sandbox's image unless avp.toml names one. None without a sandbox.
+    fn jail(&self, cfg: &CheckConfig, mounts: &[&Path], dir: &Path, deadline: Option<Instant>) -> Result<Option<Jail>> {
+        let Some(sb) = &self.sandbox else { return Ok(None) };
+        let image = cfg.image.as_deref().filter(|i| !i.trim().is_empty()).unwrap_or(&sb.image);
+        Ok(Some(Jail::start(sb, image, mounts, &self.cache.join("home"), deadline, dir)?))
     }
 
     /// On a worker: the secrets come with the job, never from this machine.
@@ -1824,8 +2372,9 @@ impl Workspace {
     }
 
     /// Runs the setup once per fingerprint and returns the dir holding its products.
-    fn setup(&self, objects: &Objects, tree: &Tree, cfg: &CheckConfig) -> Result<Option<PathBuf>> {
+    fn setup(&self, objects: &Objects, tree: &Tree, cfg: &CheckConfig, deadline: Option<Instant>) -> Result<Option<PathBuf>> {
         let Some(setup) = &cfg.setup else { return Ok(None) };
+        let started = Instant::now();
         let _one_at_a_time = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fp = fingerprint(tree, &cfg.setup_keys);
         let dir = self.cache.join("setup");
@@ -1846,10 +2395,14 @@ impl Workspace {
             }
         }
         materialize(objects, &subset, &dir, &cfg.setup_links)?;
-        // Shared by every candidate of the repo: never stopped halfway.
-        let step = run(&dir, setup, &AtomicBool::new(false));
+        // Shared by every candidate of the repo: never stopped halfway. An install runs what the
+        // packages say (their scripts): in the sandbox too, with only the cache mounted.
+        let jail = self.jail(cfg, &[&dir], &dir, deadline)?;
+        let step = run(&dir, setup, &AtomicBool::new(false), jail.as_ref());
+        drop(jail);
         anyhow::ensure!(step.exit == 0, "setup failed ({}):\n{}", step.exit, step.output);
         fs::write(&stamp, fp)?;
+        PREP.with(|p| p.set(Prep { setup_s: started.elapsed().as_secs_f64(), setup_ran: true, ..p.get() }));
         Ok(Some(dir))
     }
 
@@ -1865,9 +2418,14 @@ impl Workspace {
     }
 
     fn check_steps(&self, objects: &Objects, tree: &Tree, name: &str, files: &[String], steps_override: Option<&str>, part: Option<&Part>, cancel: &AtomicBool) -> Result<(Vec<Step>, PathBuf)> {
+        let queued = Instant::now();
         let slot = Slot::take(name);
+        let taken = Instant::now();
+        PREP.with(|p| p.set(Prep { slot_s: (taken - queued).as_secs_f64(), ..Prep::default() }));
         let cfg = read_config(tree, objects)?.check;
-        let setup_dir = self.setup(objects, tree, &cfg)?;
+        // The job's time, from its slot, when a sandbox bounds it.
+        let deadline = self.sandbox.as_ref().and_then(|s| s.limits.timeout_s).map(|t| taken + Duration::from_secs(t));
+        let setup_dir = self.setup(objects, tree, &cfg, deadline)?;
         // One folder per slot, reused: the disk holds as many candidates as run at once. Folders
         // of the AVP that named them after their task go.
         let dir = self.work.join(format!("slot-{}", slot.0));
@@ -1934,6 +2492,7 @@ impl Workspace {
                 fs::write(&ws, text)?;
             }
         }
+        PREP.with(|p| p.set(Prep { prep_s: taken.elapsed().as_secs_f64(), ..p.get() }));
         let mut code: Vec<&str> = files.iter().map(String::as_str).filter(|f| is_code(f) && tree.contains_key(*f)).collect();
         // A test that reads a touched file by its name (a stylesheet, a fixture, a migration) is
         // related to it though no import says so: it goes to the steps that take {files} too.
@@ -1946,6 +2505,8 @@ impl Workspace {
         // Every file the task leaves in the tree, code or not: a security scan must see the
         // Dockerfiles, workflows and charts a typecheck has no use for.
         let all: Vec<&str> = files.iter().map(String::as_str).filter(|f| tree.contains_key(*f)).collect();
+        // A test file the task writes runs, however long it never failed: the change may be what breaks it.
+        let skipped: Vec<&str> = part.iter().flat_map(|p| &p.skip_files).map(String::as_str).filter(|f| tree.contains_key(*f) && !code.contains(f) && !all.contains(f)).collect();
         let mut out = Vec::new();
         let steps = steps_of(&cfg, steps_override, part);
         let named: BTreeSet<String> = steps.iter().flat_map(|s| s.secrets.iter().cloned()).collect();
@@ -1961,16 +2522,33 @@ impl Workspace {
             if s.needs_files && wanted.is_empty() {
                 continue;
             }
-            let cmd = s.run.replace("{files}", &code.join(" ")).replace("{all_files}", &all.join(" ")).replace("{shard}", &shard);
+            let cmd = s.run.replace("{files}", &code.join(" ")).replace("{all_files}", &all.join(" ")).replace("{skip_files}", &skipped.join(" ")).replace("{shard}", &shard);
             todo.push((s.name, cmd, s.secrets, s.artifacts));
         }
         // The services, once there is a step to run: a shard of the whole suite says which it
         // needs, every other check gets them all. Stopped at the end of this function, whatever ends it.
         let services: Vec<&Service> = cfg.services.iter().filter(|s| part.and_then(|p| p.services.as_ref()).is_none_or(|names| names.contains(&s.name))).collect();
-        let _up = if todo.is_empty() || services.is_empty() {
+        let folder = self.work.join(format!("slot-{}.services", slot.0));
+        let up_services = !todo.is_empty() && !services.is_empty();
+        // In a sandbox: the job's folder, the services' data, and the setup its links point into.
+        let jail = if todo.is_empty() || self.sandbox.is_none() {
             None
         } else {
-            match Up::start(&services, &dir, &self.work.join(format!("slot-{}.services", slot.0)), &env, cancel) {
+            let mut mounts = vec![dir.as_path()];
+            if up_services {
+                fs::create_dir_all(&folder)?;
+                mounts.push(&folder);
+            }
+            mounts.extend(setup_dir.as_deref());
+            match self.jail(&cfg, &mounts, &dir, deadline) {
+                Ok(jail) => jail,
+                Err(e) => return Ok((vec![Step { name: "sandbox".into(), command: String::new(), exit: 1, seconds: taken.elapsed().as_secs_f64(), output: format!("{e:#}") }], dir)),
+            }
+        };
+        let _up = if !up_services {
+            None
+        } else {
+            match Up::start(&services, &dir, &folder, &env, cancel, jail.as_ref()) {
                 Ok(up) => {
                     env.extend(up.env.iter().cloned());
                     Some(up)
@@ -1995,7 +2573,7 @@ impl Workspace {
                 break;
             }
             let given: Vec<(OsString, OsString)> = secrets.iter().map(|n| (OsString::from(n), OsString::from(&values[n]))).collect();
-            let (mut step, log) = run_with(&dir, &cmd, cancel, &env, &given, None);
+            let (mut step, log) = run_with(&dir, &cmd, cancel, &env, &given, None, jail.as_ref());
             step.name = name;
             if step.exit != CANCELLED {
                 self.keep(&step, log, &dir, &artifacts, &mut budget);
@@ -2171,6 +2749,17 @@ fn link_node_modules(setup: &Path, candidate: &Path, pkg: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_proof_keeps_its_slowest_parts_timing() {
+        note_part("task_t", "tree1", 2.0, &Prep { slot_s: 1.0, prep_s: 5.0, setup_s: 0.0, setup_ran: false });
+        note_part("task_t", "tree1", 0.5, &Prep { slot_s: 0.0, prep_s: 40.0, setup_s: 33.0, setup_ran: true });
+        note_part("task_t", "tree2", 9.0, &Prep::default());
+        let t = take_timing("task_t", "tree1").unwrap();
+        assert_eq!((t.wait_s, t.prep_s, t.setup_s, t.setup_ran), (3.0, 40.0, 33.0, true), "the slowest part's figures, the slot counted as waiting");
+        assert!(take_timing("task_t", "tree1").is_none(), "taken once: the proof keeps it");
+        assert_eq!(take_timing("task_t", "tree2").unwrap().wait_s, 9.0, "another tree's proof keeps its own");
+    }
     use super::*;
 
     /// The count `set_check_slots` gives holds whatever AVP_CHECK_SLOTS says, and raising it lets a
@@ -2351,7 +2940,7 @@ mod tests {
         let given = vec![(OsString::from("REGISTRY_TOKEN"), OsString::from("reg-s3cret-value"))];
         let mut told = vec![];
         let mut watch = |line: &str| told.push(line.to_string());
-        let step = run_with(&dir, "echo \"pushing with $REGISTRY_TOKEN\"; seq 1 20000; echo done $REGISTRY_TOKEN", &AtomicBool::new(false), &[], &given, Some(&mut watch)).0;
+        let step = run_with(&dir, "echo \"pushing with $REGISTRY_TOKEN\"; seq 1 20000; echo done $REGISTRY_TOKEN", &AtomicBool::new(false), &[], &given, Some(&mut watch), None).0;
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(step.exit, 0, "{}", step.output);
         assert!(step.output.starts_with("pushing with ***\n") && step.output.ends_with("done ***\n"), "{}", step.output);
@@ -2396,11 +2985,83 @@ secrets = ["BROWSER_TOKEN"]
 
     /// Whatever the process running the proof holds (here cargo's CARGO_PKG_* and the rest of the
     /// test's environment), a step sees only what `step_env` lets through and what AVP sets.
+    fn sandbox(tool: &'static str) -> Sandbox {
+        Sandbox { tool, image: "worker:1".into(), user: "1000:1000".into(), limits: Limits { cpus: Some("2".into()), memory: Some("4g".into()), pids: Some(512), disk: Some("10g".into()), timeout_s: Some(600) }, owner: "/srv/w1/data".into() }
+    }
+
+    /// The container a job runs in: only its folders, at the same path, a read-only root and a
+    /// tmpfs /tmp of its own size, not root, no capability, no new privilege, the job's limits, on
+    /// its own network, labelled for the worker that owns it.
+    #[test]
+    fn a_jobs_container_is_a_sandbox() {
+        let a = sandbox("docker").run_args("node:22", "avp-job-x", &[Path::new("/srv/w1/data/work/r/slot-0")], Path::new("/srv/w1/data/cache/r/home"));
+        let line = a.join(" ");
+        for want in ["run -d --name avp-job-x --label avp.sandbox=/srv/w1/data --network avp-job-x", "--user 1000:1000", "--cap-drop ALL", "--security-opt no-new-privileges", "--read-only", "--tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=10g", "--cpus 2 --memory 4g --memory-swap 4g --pids-limit 512", "-e HOME=/srv/w1/data/cache/r/home", "--entrypoint sh node:22 -c"] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+        let mounts: Vec<&String> = a.iter().zip(a.iter().skip(1)).filter(|(f, _)| *f == "-v").map(|(_, m)| m).collect();
+        assert_eq!(mounts, ["/srv/w1/data/work/r/slot-0:/srv/w1/data/work/r/slot-0"]);
+        assert!(!line.contains("--privileged") && !line.contains("docker.sock") && !line.contains("--userns"));
+        assert!(sandbox("podman").run_args("node:22", "j", &[], Path::new("/h")).contains(&"--userns=keep-id".to_string()));
+        // Its network's bridge is named for the firewall's rules, by either tool.
+        assert_eq!(sandbox("docker").network_args("j", "avpj0123456789a").join(" "), "network create --label avp.sandbox=/srv/w1/data --driver bridge -o com.docker.network.bridge.name=avpj0123456789a j");
+        assert_eq!(sandbox("podman").network_args("j", "avpj0123456789a").join(" "), "network create --label avp.sandbox=/srv/w1/data --interface-name avpj0123456789a j");
+    }
+
+    /// A step reaches the container by name: its variables, a secret among them, are named on the
+    /// command line, their values never; the worker's PATH, HOME and secrets do not go in.
+    #[test]
+    fn a_sandboxed_step_names_its_variables_never_their_values() {
+        let vars: Vec<(OsString, OsString)> = [("STRIPE_KEY", "sk_test_123456"), ("CI", "true"), ("CI", "true")].map(|(k, v)| (k.into(), v.into())).to_vec();
+        let a = exec_args("avp-job-x", Path::new("/w/slot-0"), &vars, "cargo test");
+        assert_eq!(a.join(" "), "exec -w /w/slot-0 -e STRIPE_KEY -e CI avp-job-x sh -c cargo test");
+        let host = [("PATH", "/usr/bin"), ("HOME", "/home/w"), ("AVP_TOKEN", "t"), ("AWS_SECRET_ACCESS_KEY", "s"), ("NODE_OPTIONS", "--x"), ("LC_CTYPE", "C")].map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let given: Vec<String> = sandbox_env(host.into_iter(), "NODE_OPTIONS,AWS_SECRET_ACCESS_KEY", "").into_iter().map(|(k, _)| k.into_string().unwrap()).collect();
+        assert_eq!(given, ["NODE_OPTIONS"]);
+    }
+
+    /// A job's services share its network: no port on the host, its limits, no new privilege.
+    #[test]
+    fn a_sandboxed_service_joins_the_jobs_network_only() {
+        let jail = Jail { tool: "docker", name: "avp-job-x".into(), limits: Limits { memory: Some("1g".into()), ..Limits::default() }, deadline: None, dir: PathBuf::new() };
+        assert_eq!(jail.service_args().join(" "), "--network container:avp-job-x --security-opt no-new-privileges --memory 1g --memory-swap 1g");
+        std::mem::forget(jail);
+        let table = "  sl  local_address rem_address   st\n   0: 00000000:1538 00000000:0000 0A 00000000\n   1: 0100007F:18EB 0100007F:9C40 01 00000000\n";
+        assert!(listens(table, 5432), "0x1538 listens");
+        assert!(!listens(table, 6379), "0x18EB is a connection, not a listener");
+    }
+
+    /// The server's limits come first, the worker's fill the rest; a step that hits one says which.
+    #[test]
+    fn a_step_past_a_limit_names_it() {
+        let server = Limits { memory: Some("2g".into()), timeout_s: Some(900), ..Limits::default() };
+        let worker = Limits { memory: Some("8g".into()), pids: Some(256), disk: Some("20g".into()), ..Limits::default() };
+        let l = server.or(worker);
+        assert_eq!((l.memory.as_deref(), l.pids, l.disk.as_deref(), l.timeout_s), (Some("2g"), Some(256), Some("20g"), Some(900)));
+        assert_eq!((bytes("20g"), bytes("512M"), bytes("100"), bytes("1.5g")), (Some(20 << 30), Some(512 << 20), Some(100), None));
+        assert!(limit_hit(137, "Killed", &l).unwrap().contains("AVP_SANDBOX_MEMORY=2g"));
+        assert!(limit_hit(1, "sh: fork: Resource temporarily unavailable", &l).unwrap().contains("AVP_SANDBOX_PIDS=256"));
+        assert!(limit_hit(1, "write: No space left on device", &l).unwrap().contains("AVP_SANDBOX_DISK=20g"));
+        assert_eq!(limit_hit(1, "assertion failed", &l), None);
+        let jail = Jail { tool: "docker", name: "j".into(), limits: l, deadline: Some(Instant::now()), dir: PathBuf::new() };
+        assert!(jail.over(&mut Instant::now()).unwrap().contains("900s (AVP_WORKER_RUN_S)"));
+        std::mem::forget(jail);
+    }
+
+    /// A worker whose sandbox reaches the cloud's metadata, or cannot tell, does not start.
+    #[test]
+    fn a_sandbox_that_reaches_the_metadata_is_refused() {
+        assert!(probed("probed\n", "img").is_ok());
+        assert!(probed("reached 169.254.169.254:80\nprobed\n", "img").unwrap_err().contains("reaches 169.254.169.254:80"));
+        assert!(probed("no probe\n", "alpine").unwrap_err().contains("neither curl nor bash"));
+        assert!(probed("", "img").is_err());
+    }
+
     #[test]
     fn a_step_starts_from_a_scrubbed_environment() {
         let dir = std::env::temp_dir().join(format!("avp-test-env-{}", ulid::Ulid::new()));
         fs::create_dir_all(&dir).unwrap();
-        let step = run(&dir, "env", &AtomicBool::new(false));
+        let step = run(&dir, "env", &AtomicBool::new(false), None);
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(step.exit, 0, "{}", step.output);
         let allowed: Vec<String> = step_env(std::env::vars_os(), &std::env::var("AVP_PROOF_ENV").unwrap_or_default(), &std::env::var("AVP_DEPLOY_ENV").unwrap_or_default()).into_iter().map(|(k, _)| k.into_string().unwrap()).collect();
@@ -2420,7 +3081,7 @@ secrets = ["BROWSER_TOKEN"]
         let dir = std::env::temp_dir().join(format!("avp-test-log-{}", ulid::Ulid::new()));
         fs::create_dir_all(&dir).unwrap();
         let given = [(OsString::from("KEY"), OsString::from("sk_test_51abc"))];
-        let (step, log) = run_with(&dir, "echo first; printf '10%%\\r100%%\\n'; sleep 0.3; echo \"key $KEY\"", &AtomicBool::new(false), &[], &given, None);
+        let (step, log) = run_with(&dir, "echo first; printf '10%%\\r100%%\\n'; sleep 0.3; echo \"key $KEY\"", &AtomicBool::new(false), &[], &given, None, None);
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(step.exit, 0, "{}", step.output);
         let lines: Vec<&str> = log.lines.iter().map(|(_, l)| l.as_str()).collect();

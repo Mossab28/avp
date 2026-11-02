@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AVP Cloud</title>
+<meta name="description" content="Where coding agents ship. Tasks instead of branches, every change proven on the exact head before it lands. Plug any agent in one command.">
+<meta property="og:title" content="AVP Cloud: where coding agents ship">
+<meta property="og:description" content="Tasks instead of branches, every change proven on the exact head before it lands. Any agent, one command.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23000'/%3E%3Cpath d='M6 16h20' stroke='%23444' stroke-width='2'/%3E%3Ccircle cx='9' cy='16' r='3.2' fill='%23f4f4f4'/%3E%3Ccircle cx='16' cy='16' r='3.2' fill='%23f4f4f4'/%3E%3Ccircle cx='23' cy='16' r='3.2' fill='none' stroke='%23f4f4f4' stroke-width='1.6'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* The brand lands here: every color, font and measure of the page. A section is dark by default,
+   `.light` turns it to paper; its drawings read --ink and --dot from the section they sit in. */
+:root {
+  --black: #000;
+  --paper: #f1f0ec;
+  --sans: "Geist", "Helvetica Neue", Arial, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --gutter: clamp(16px, 4vw, 56px);
+  --max: 1320px;
+}
+.dark, :root { --bg: var(--black); --fg: #ededed; --fg2: #a3a3a3; --mut: #6b6b6b; --line: #1c1c1c; --line2: #2c2c2c; --panel: #0a0a0a; --inv: var(--paper); --invfg: #000; --dot: 237,237,237; }
+.light { --bg: var(--paper); --fg: #0a0a0a; --fg2: #3d3d3d; --mut: #8a8984; --line: #dcdad4; --line2: #c4c2bb; --panel: #fbfaf7; --inv: #0a0a0a; --invfg: var(--paper); --dot: 10,10,10; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { background: var(--black); -webkit-font-smoothing: antialiased; }
+body { font-family: var(--sans); background: var(--black); color: #ededed; overflow-x: hidden; }
+a { color: inherit; text-decoration: none; }
+::selection { background: #ededed; color: #000; }
+section, header, footer { background: var(--bg); color: var(--fg); }
+
+.wrap { max-width: var(--max); margin: 0 auto; padding: 0 var(--gutter); }
+.mono { font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--mut); }
+.tag { font-family: var(--mono); font-size: 11px; background: var(--inv); color: var(--invfg); padding: 2px 6px; display: inline-block; }
+
+/* nav: it takes the colors of the section under it */
+nav { position: fixed; inset: 0 0 auto 0; z-index: 10; display: flex; justify-content: space-between; align-items: center; padding: 12px var(--gutter); color: var(--fg); transition: color .4s, background .4s; }
+nav.on-light { --fg: #0a0a0a; --fg2: #3d3d3d; --line2: #c4c2bb; --inv: #0a0a0a; --invfg: var(--paper); background: rgba(241,240,236,.82); backdrop-filter: blur(10px); }
+nav.on-dark { --fg: #ededed; --fg2: #a3a3a3; --line2: #2c2c2c; --inv: var(--paper); --invfg: #000; background: rgba(0,0,0,.72); backdrop-filter: blur(10px); }
+nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 500; font-size: 15px; letter-spacing: -.01em; }
+nav .links { display: flex; gap: 2px; }
+nav .links a { font-size: 14px; color: var(--fg2); padding: 7px 12px; border-radius: 6px; transition: color .2s; }
+nav .links a:hover { color: var(--fg); }
+nav .cta { display: flex; gap: 8px; }
+.btn { font-size: 14px; font-weight: 500; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line2); color: var(--fg); display: inline-block; transition: transform .2s, opacity .2s; }
+.btn:hover { opacity: .8; }
+.btn:active { transform: scale(.97); }
+.btn.solid { background: var(--inv); color: var(--invfg); border-color: var(--inv); }
+
+/* hero */
+.hero { position: relative; min-height: 100svh; display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: clamp(48px, 8vh, 96px); overflow: hidden; }
+#clouds { position: absolute; inset: 0; width: 100%; height: 100%; }
+.hero::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 25%, rgba(0,0,0,.7) 60%, #000 90%); pointer-events: none; }
+.hero .wrap { position: relative; z-index: 2; width: 100%; }
+.intro { display: flex; align-items: center; gap: 12px; font-size: 15px; color: var(--fg2); margin-bottom: 26px; }
+.intro .dots { flex: 0 1 180px; border-bottom: 1px dotted var(--mut); height: 1px; transform: translateY(3px); }
+h1 { font-weight: 500; font-size: clamp(52px, 9.6vw, 140px); line-height: .9; letter-spacing: -.055em; }
+h1 .soft { color: var(--mut); }
+.hero-foot { display: grid; grid-template-columns: 1fr auto; gap: 32px; align-items: end; margin-top: 40px; }
+.hero-foot p { max-width: 460px; color: var(--fg2); font-size: 17px; line-height: 1.5; }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: clamp(28px, 4vh, 44px); border-top: 1px solid var(--line2); }
+.kpi { padding: 16px 20px 0 0; position: relative; }
+.kpi + .kpi { padding-left: 20px; border-left: 1px solid var(--line2); }
+.kpi b { display: block; font-weight: 500; font-size: clamp(40px, 5.6vw, 84px); letter-spacing: -.05em; line-height: 1; font-variant-numeric: tabular-nums; }
+.kpi b .u { color: var(--mut); }
+.kpi > span { display: block; margin-top: 8px; font-size: 14px; color: var(--fg2); }
+.kpi sup { font-size: 10px; margin-left: 3px; }
+.kpi::before { content: ""; position: absolute; top: -1px; left: 0; height: 1px; width: 0; background: var(--fg); transition: width 1.6s cubic-bezier(.2,.7,.2,1); }
+.kpis.on .kpi::before { width: 100%; }
+.badge { position: absolute; z-index: 2; top: 92px; right: var(--gutter); width: 210px; }
+
+/* the small windows */
+.win { border: 1px solid var(--line2); background: var(--panel); font-family: var(--mono); font-size: 13px; min-width: 0; }
+.win .bar { display: flex; justify-content: space-between; gap: 12px; background: var(--inv); color: var(--invfg); padding: 3px 8px; font-size: 11px; }
+.win .body { padding: 14px 16px; color: var(--fg); }
+.cmd { display: flex; gap: 10px; align-items: center; white-space: nowrap; }
+.cmd .p { color: var(--mut); }
+.copy { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--mut); background: none; border: 1px solid var(--line2); padding: 2px 8px; cursor: pointer; border-radius: 4px; transition: color .2s; }
+.copy:hover { color: var(--fg); }
+
+/* sections, crop marks */
+section { position: relative; padding: clamp(80px, 11vw, 150px) 0; }
+.frame { position: relative; padding: clamp(28px, 4vw, 48px) 0; }
+.frame::before, .frame::after { content: ""; position: absolute; width: 10px; height: 10px; border-color: var(--line2); border-style: solid; }
+.frame::before { top: 0; left: 0; border-width: 1px 0 0 1px; }
+.frame::after { bottom: 0; right: 0; border-width: 0 1px 1px 0; }
+h2 { font-weight: 500; font-size: clamp(44px, 7.6vw, 116px); line-height: .92; letter-spacing: -.05em; }
+h2.c { text-align: center; }
+h2 .soft { color: var(--mut); }
+h3 { font-weight: 500; font-size: 17px; letter-spacing: -.01em; margin: 14px 0 8px; }
+
+/* how: three drawings */
+.cols { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: clamp(40px, 6vw, 72px); }
+.col { border-left: 1px solid var(--line2); padding: 0 24px 0 14px; }
+.col p { color: var(--fg2); font-size: 15px; line-height: 1.55; }
+.draw { display: block; width: 100%; height: 150px; margin-bottom: 18px; }
+
+/* the line, live */
+.live { display: grid; grid-template-columns: 1fr 1.2fr; gap: 48px; align-items: center; margin-top: 64px; }
+.live p { color: var(--fg2); font-size: 15px; line-height: 1.55; max-width: 420px; }
+.log { height: 252px; overflow: hidden; position: relative; }
+.log .row { display: grid; grid-template-columns: 40px 64px 1fr; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12px; animation: drop .6s cubic-bezier(.2,.7,.2,1); }
+.log .row .v { color: var(--mut); }
+.log .row .v.g::before { content: "● "; color: var(--fg); }
+.log .row .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg2); }
+@keyframes drop { from { opacity: 0; transform: translateY(-10px); } }
+
+/* numbers */
+.big { font-weight: 500; font-size: clamp(60px, 12vw, 184px); line-height: .88; letter-spacing: -.06em; }
+.big .unit { color: var(--mut); }
+.foot { margin-top: 18px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 64px; }
+.stat { border-left: 1px solid var(--line2); padding: 0 16px; }
+.stat b { display: block; font-weight: 500; font-size: clamp(40px, 5vw, 64px); letter-spacing: -.04em; line-height: 1; margin-top: 56px; font-variant-numeric: tabular-nums; }
+.stat span { display: block; color: var(--fg2); font-size: 14px; margin-top: 8px; }
+.bench { margin-top: 48px; }
+.bench table { width: 100%; border-collapse: collapse; }
+.bench th { text-align: left; font-weight: 400; color: var(--mut); font-size: 11px; padding: 0 12px 10px 0; }
+.bench td { padding: 12px 12px 12px 0; border-top: 1px solid var(--line); white-space: nowrap; color: var(--fg2); }
+.bench td.num, .bench th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.bench tr.us td { color: var(--fg); }
+.bench .name { display: inline-block; padding: 1px 6px; }
+.bench tr.us .name { background: var(--inv); color: var(--invfg); }
+.meter { position: relative; height: 1px; background: var(--line2); min-width: 120px; }
+.meter i { position: absolute; top: -3px; left: 0; width: 7px; height: 7px; background: var(--fg); transform: translateX(-50%); transition: left 1.4s cubic-bezier(.2,.7,.2,1); }
+
+/* agents */
+.agents { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); margin-top: 56px; }
+.agents div { padding: 22px 24px 22px 0; border-bottom: 1px solid var(--line); font-size: clamp(20px, 2.4vw, 30px); letter-spacing: -.03em; display: flex; justify-content: space-between; align-items: baseline; transition: padding .3s; }
+.agents div:hover { padding-left: 8px; }
+.agents div .mono { font-size: 11px; }
+.steps { display: grid; grid-template-columns: 1.6fr 1fr 1fr; gap: 16px; margin-top: 40px; }
+
+/* plans */
+.plans { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 64px; border-top: 1px solid var(--line2); }
+.plan { padding: 28px 24px 32px 0; border-right: 1px solid var(--line); }
+.plan + .plan { padding-left: 24px; }
+.plan:last-child { border-right: 0; }
+.plan .price { font-size: 48px; font-weight: 500; letter-spacing: -.04em; margin: 28px 0 20px; }
+.plan ul { list-style: none; color: var(--fg2); font-size: 14px; line-height: 2; }
+.plan ul li::before { content: "+ "; color: var(--mut); font-family: var(--mono); }
+.plan .btn { margin-top: 28px; }
+
+/* closing */
+.close { text-align: center; overflow: hidden; }
+.close canvas { display: block; width: 100%; height: 160px; margin-top: 40px; }
+.close .btn { margin-top: 36px; font-size: 16px; padding: 12px 22px; }
+footer { border-top: 1px solid var(--line); padding: 28px 0 40px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+footer a:hover { color: var(--fg); }
+footer .links { display: flex; gap: 20px; }
+
+.rise { opacity: 0; transform: translateY(18px); transition: opacity .9s cubic-bezier(.2,.7,.2,1), transform .9s cubic-bezier(.2,.7,.2,1); }
+.rise.on { opacity: 1; transform: none; }
+
+@media (max-width: 860px) {
+  .kpi { padding-right: 8px; }
+  .kpi + .kpi { padding-left: 10px; }
+  .kpi b { font-size: 30px; }
+  .kpi > span { font-size: 12px; }
+  .hero::after { background: linear-gradient(180deg, transparent 6%, rgba(0,0,0,.86) 30%, #000 55%); }
+  nav .links { display: none; }
+  .badge { display: none; }
+  .hero-foot, .cols, .stats, .plans, .live, .steps { grid-template-columns: 1fr; }
+  .col, .stat { border-left: 0; border-top: 1px solid var(--line2); padding: 18px 0 0; margin-bottom: 28px; }
+  .stat b { margin-top: 16px; }
+  .plan, .plan + .plan { padding: 28px 0; border-right: 0; border-bottom: 1px solid var(--line); }
+  .agents { grid-template-columns: 1fr 1fr; }
+  .bench .body { overflow-x: auto; }
+  .bench .mcol { display: none; }
+  .cmd { white-space: normal; flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rise { opacity: 1; transform: none; transition: none; }
+  .meter i, .log .row { transition: none; animation: none; }
+}
+</style>
+</head>
+<body>
+
+<nav class="on-dark">
+  <a class="brand" href="/">
+    <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M5 16h22" stroke="currentColor" stroke-opacity=".3" stroke-width="2"/><circle cx="8.5" cy="16" r="3.4" fill="currentColor"/><circle cx="16" cy="16" r="3.4" fill="currentColor"/><circle cx="23.5" cy="16" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+    AVP
+  </a>
+  <div class="links">
+    <a href="#how">How it works</a><a href="#numbers">Numbers</a><a href="#agents">Agents</a><a href="#plans">Pricing</a><a href="https://github.com/Mossab28/avp">GitHub</a>
+  </div>
+  <div class="cta"><a class="btn" href="/signin">Sign in</a><a class="btn solid" href="/signup">Start free</a></div>
+</nav>
+
+<header class="hero dark">
+  <canvas id="clouds" aria-hidden="true"></canvas>
+  <div class="win badge rise" aria-hidden="true">
+    <div class="bar"><span>Line 1.0</span><span>●</span></div>
+    <canvas id="mini" style="display:block;width:100%;height:96px"></canvas>
+  </div>
+  <div class="wrap">
+    <div class="intro rise"><span>Introducing AVP Cloud</span><span class="dots"></span><span>Hosting for coding agents</span></div>
+    <h1 class="rise">Where Coding<br>Agents <span class="soft">Ship.</span></h1>
+    <div class="kpis rise">
+      <div class="kpi"><b><span class="count" data-to="99.7" data-dec="1">99.7</span><span class="u">%</span></b><span>less CI on GitHub<sup class="mono">1</sup></span></div>
+      <div class="kpi"><b><span class="count" data-to="7.4" data-dec="1">7.4</span><span class="u">x</span></b><span>faster to land a change<sup class="mono">1</sup></span></div>
+      <div class="kpi"><b>-<span class="count" data-to="55">55</span><span class="u">%</span></b><span>tokens per agent<sup class="mono">2</sup></span></div>
+    </div>
+    <div class="hero-foot">
+      <p class="rise">Tasks instead of branches. Every change proven on the exact head before it lands. Your agents never wait on a pull request again.</p>
+      <div class="win rise" style="min-width:min(100%,460px)">
+        <div class="bar"><span>install</span><span>macOS · Linux</span></div>
+        <div class="body"><div class="cmd"><span class="p">$</span><span id="install">curl -fsSL cloud.murmell.com/install | sh</span><button class="copy" data-copy="install">copy</button></div></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section id="how" class="light" data-theme="light">
+  <div class="wrap">
+    <div class="frame rise"><h2 class="c">Branches Were Made<br>For People.</h2></div>
+    <div class="cols">
+      <div class="col rise"><canvas class="draw" data-draw="tasks" aria-hidden="true"></canvas><span class="mono">Tasks, not branches</span><h3>Open, write, land.</h3><p>An agent opens a task on the head of the line and writes. No branch to name, no merge, no pull request to babysit.</p></div>
+      <div class="col rise"><canvas class="draw" data-draw="proof" aria-hidden="true"></canvas><span class="mono">Proven, then landed</span><h3>The line never goes red.</h3><p>Every change is proven on the exact head it lands on. Only the checks it touches run, side by side, in a sandbox of its own.</p></div>
+      <div class="col rise"><canvas class="draw" data-draw="line" aria-hidden="true"></canvas><span class="mono">One line</span><h3>Agents see each other.</h3><p>Who holds which file, who waits for whom, what just landed. Conflicts are settled before they happen, not after.</p></div>
+    </div>
+    <div class="live">
+      <div class="rise"><span class="mono">avp log</span><h3 style="font-size:28px;letter-spacing:-.03em;margin-top:10px">AVP is built by agents, on AVP.</h3><p>These are the last positions of AVP's own line, landed tonight by six agents working side by side. No branch was opened.</p></div>
+      <div class="win rise"><div class="bar"><span>avp log · repo avp</span><span id="clock">live</span></div><div class="body log" id="log"></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="numbers" class="dark" data-theme="dark">
+  <div class="wrap">
+    <div class="frame rise">
+      <div class="big"><span class="count" data-to="7.4" data-dec="1">7.4</span>x <span class="unit">faster</span><br>to land.</div>
+      <p class="mono foot">1. Murmell, 48 h of pull requests against 48 h on AVP, October 2026: GitHub's CI workflow 12,039 min, then 36 (the proofs ran on AVP's machines: 2,689 min); median 25 min to land a change, then 3.4. 2. The bench below.</p>
+    </div>
+    <div class="stats">
+      <div class="stat rise"><span class="mono">CI minutes</span><b>-<span class="count" data-to="77">77</span>%</b><span>15,310 GitHub minutes down to 3,475 for the same 48 hours.</span></div>
+      <div class="stat rise"><span class="mono">Broken states</span><b>0 / 43</b><span>12 agents in parallel never left the line red. Git: 9 of 45.</span></div>
+      <div class="stat rise"><span class="mono">Tokens</span><b>-<span class="count" data-to="55">55</span>%</b><span>Agents stop rebasing and re-reading. 4.7 M tokens against 10.3 M.</span></div>
+    </div>
+    <div class="win bench rise">
+      <div class="bar"><span>bench · 12 agents · 48 tasks · same machine</span><span>26.10.2026</span></div>
+      <div class="body">
+        <table>
+          <thead><tr><th>Tool</th><th class="num">Broken states</th><th class="num">Minutes</th><th class="num">Tokens</th><th class="mcol">Tokens, relative</th><th class="num">Cost</th></tr></thead>
+          <tbody>
+            <tr class="us"><td><span class="name">AVP</span></td><td class="num">0 / 43</td><td class="num">4.85</td><td class="num">4.67 M</td><td class="mcol"><div class="meter"><i data-at="34"></i></div></td><td class="num">$2.11</td></tr>
+            <tr><td><span class="name">Git + CI</span></td><td class="num">9 / 45</td><td class="num">6.85</td><td class="num">10.27 M</td><td class="mcol"><div class="meter"><i data-at="76"></i></div></td><td class="num">$3.65</td></tr>
+            <tr><td><span class="name">Jujutsu</span></td><td class="num">12 / 52</td><td class="num">9.90</td><td class="num">13.59 M</td><td class="mcol"><div class="meter"><i data-at="100"></i></div></td><td class="num">$4.92</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <p class="mono foot">Two runs per tool, Claude Code agents, the same tasks. Medians.</p>
+  </div>
+</section>
+
+<section id="agents" class="light" data-theme="light">
+  <div class="wrap">
+    <div class="frame rise"><h2>Any Agent.<br><span class="soft">One Command.</span></h2></div>
+    <div class="agents rise">
+      <div>Claude Code <span class="mono">MCP</span></div><div>Codex <span class="mono">MCP</span></div><div>Cursor <span class="mono">MCP</span></div>
+      <div>Gemini CLI <span class="mono">MCP</span></div><div>Copilot <span class="mono">MCP</span></div><div>OpenCode <span class="mono">MCP</span></div>
+      <div>Windsurf <span class="mono">MCP</span></div><div>Amp <span class="mono">MCP</span></div><div>Aider <span class="mono">CLI</span></div>
+    </div>
+    <div class="steps">
+      <div class="win rise"><div class="bar"><span>01 · install</span><span></span></div><div class="body"><div class="cmd"><span class="p">$</span><span id="s1">curl -fsSL cloud.murmell.com/install | sh</span><button class="copy" data-copy="s1">copy</button></div></div></div>
+      <div class="win rise"><div class="bar"><span>02 · sign in</span><span></span></div><div class="body"><div class="cmd"><span class="p">$</span><span id="s2">avp login</span><button class="copy" data-copy="s2">copy</button></div></div></div>
+      <div class="win rise"><div class="bar"><span>03 · in any git repo</span><span></span></div><div class="body"><div class="cmd"><span class="p">$</span><span id="s3">avp up</span><button class="copy" data-copy="s3">copy</button></div></div></div>
+    </div>
+    <p class="mono foot">avp up brings your history in and plugs every agent it finds on your machine. Leave any time: git clone works from AVP Cloud.</p>
+  </div>
+</section>
+
+<section id="plans" class="dark" data-theme="dark">
+  <div class="wrap">
+    <div class="frame rise"><h2>Pay For Proofs,<br><span class="soft">Not For Waiting.</span></h2></div>
+    <div class="plans rise">
+      <div class="plan"><span class="tag">Free</span><div class="price">$0</div><ul><li>Private repos</li><li>Every agent, unlimited</li><li>2,000 proof minutes a month</li><li>Sandboxed proofs</li></ul><a class="btn solid" href="/signup">Start free</a></div>
+      <div class="plan"><span class="tag">Team</span><div class="price">Soon</div><ul><li>Organizations and roles</li><li>More proof minutes</li><li>Deploys run by AVP</li><li>Priority machines</li></ul><a class="btn" href="mailto:mossab@murmell.com?subject=AVP%20Team">Join the list</a></div>
+      <div class="plan"><span class="tag">Enterprise</span><div class="price">Talk to us</div><ul><li>Your own cloud or ours</li><li>Single sign-on</li><li>Signed history, audit</li><li>Support with a name</li></ul><a class="btn" href="mailto:mossab@murmell.com?subject=AVP%20Enterprise">Contact</a></div>
+    </div>
+  </div>
+</section>
+
+<section class="close light" data-theme="light">
+  <div class="wrap">
+    <div class="frame rise"><h2 class="c">Stop Babysitting<br>Pull Requests.</h2><a class="btn solid" href="/signup">Start free</a></div>
+  </div>
+  <canvas id="tail" aria-hidden="true"></canvas>
+</section>
+
+<footer class="light">
+  <div class="wrap">
+    <span class="mono">AVP · © 2026 Murmell · Made in Paris</span>
+    <span class="mono links"><a href="https://github.com/Mossab28/avp">GitHub</a><a href="/signin">Sign in</a><a href="mailto:mossab@murmell.com">Contact</a></span>
+  </div>
+</footer>
+
+<script>
+const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + .5) / 16);
+const dotOf = el => getComputedStyle(el).getPropertyValue("--dot").trim();
+
+// A canvas drawn only while it is on screen, at the screen's density.
+function painter(c, draw) {
+  const g = c.getContext("2d");
+  let W = 0, H = 0, seen = false, t0 = performance.now();
+  const size = () => { const d = Math.min(devicePixelRatio || 1, 2); W = c.clientWidth; H = c.clientHeight; c.width = W * d; c.height = H * d; g.setTransform(d, 0, 0, d, 0, 0); };
+  new IntersectionObserver(([e]) => { seen = e.isIntersecting; if (seen) loop(); }).observe(c);
+  addEventListener("resize", size); size();
+  function loop(t = performance.now()) { if (!seen) return; g.clearRect(0, 0, W, H); draw(g, W, H, (t - t0) / 1000); if (!still) requestAnimationFrame(loop); }
+}
+
+// Dithered field: the sum of soft blobs, thresholded by the Bayer matrix into dots.
+function dither(g, W, H, S, rgb, alpha, value) {
+  g.fillStyle = `rgba(${rgb},${alpha})`;
+  for (let y = 0, j = 0; y < H; y += S, j++) for (let x = 0, i = 0; x < W; x += S, i++) {
+    if (value(x, y) > BAYER[(j & 3) * 4 + (i & 3)]) g.fillRect(x, y, S * .38, S * .38);
+  }
+}
+const blob = (x, y, bx, by, r) => { const dx = x - bx, dy = y - by; return Math.exp(-(dx * dx + dy * dy) / (r * r)); };
+
+// The hero's clouds.
+painter(document.getElementById("clouds"), (g, W, H, t) => {
+  const A = Math.max(W, H), rgb = "237,237,237";
+  const B = [[.08, .14, .15, .9], [.2, .3, .1, -.6], [.9, .1, .14, -.7], [.78, .26, .09, .8], [.58, .02, .11, .5], [.42, .4, .07, -.4]].map(([x, y, r, s], k) =>
+    [(x + Math.sin(t * .06 * s + k) * .04) * W, (y + Math.cos(t * .05 * s + k * 2) * .03) * H, r * A]);
+  dither(g, W, H, 5, rgb, .75, (x, y) => { let v = 0; for (const [bx, by, r] of B) v += blob(x, y, bx, by, r); return Math.min(1, v) * 1.25 - .3; });
+});
+
+// The badge: a line of positions, a task landing on it every few seconds.
+painter(document.getElementById("mini"), (g, W, H, t) => {
+  const rgb = "237,237,237", y = H / 2 + 10, n = 9, gap = W / (n + 1), p = (t % 3) / 3;
+  g.strokeStyle = `rgba(${rgb},.25)`; g.beginPath(); g.moveTo(10, y); g.lineTo(W - 10, y); g.stroke();
+  const shift = Math.min(1, p * 2.2) * gap;
+  for (let k = 0; k < n; k++) { g.fillStyle = `rgba(${rgb},1)`; g.beginPath(); g.arc(gap * (k + 1) - shift + gap * 0, y, 3.2, 0, 7); g.fill(); }
+  const ty = y - 30 * (1 - Math.min(1, p * 2.2)); g.strokeStyle = `rgba(${rgb},1)`; g.beginPath(); g.arc(gap * n, ty, 3.2, 0, 7); g.stroke();
+});
+
+// The three drawings of "how".
+const draws = {
+  // Tasks rise from below and land as dots on the line.
+  tasks(g, W, H, t, rgb) {
+    const y = H * .32;
+    g.strokeStyle = `rgba(${rgb},.3)`; g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+    for (let k = 0; k < 6; k++) {
+      const x = 18 + k * (W - 36) / 5, ph = ((t * .35 + k * .37) % 1);
+      g.fillStyle = `rgba(${rgb},1)`; g.beginPath(); g.arc(x, y, 3, 0, 7); g.fill();
+      const ty = H - 12 - ph * (H - 12 - y);
+      g.strokeStyle = `rgba(${rgb},${1 - ph})`; g.beginPath(); g.arc(x, ty, 3, 0, 7); g.stroke();
+      g.strokeStyle = `rgba(${rgb},${.12 * (1 - ph)})`; g.beginPath(); g.moveTo(x, ty); g.lineTo(x, H); g.stroke();
+    }
+  },
+  // A proof: its steps fill cell by cell, then the whole grid lands as one.
+  proof(g, W, H, t, rgb) {
+    const cols = 14, rows = 5, s = Math.min((W - 20) / cols, (H - 30) / rows), ox = (W - s * cols) / 2, oy = 14, cyc = t % 6, filled = Math.floor(cyc / 4.2 * cols * rows);
+    for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+      const k = i * rows + j, on = k < filled;
+      g.fillStyle = `rgba(${rgb},${on ? 1 : .1})`; g.fillRect(ox + i * s + 2, oy + j * s + 2, s - 4, s - 4);
+    }
+    const land = Math.max(0, Math.min(1, (cyc - 4.4) / .8));
+    g.fillStyle = `rgba(${rgb},${land})`; g.font = "11px 'Geist Mono', monospace"; g.fillText("✓ landed at the head", ox, oy + rows * s + 16);
+  },
+  // Agents on lanes, each converging to the one line, never crossing.
+  line(g, W, H, t, rgb) {
+    const lanes = 5, cy = H / 2;
+    for (let k = 0; k < lanes; k++) {
+      const y0 = 16 + k * (H - 32) / (lanes - 1);
+      g.strokeStyle = `rgba(${rgb},.22)`; g.beginPath(); g.moveTo(0, y0); g.bezierCurveTo(W * .45, y0, W * .5, cy, W * .78, cy); g.stroke();
+      const p = (t * .22 + k * .2) % 1, u = p, x = u * W * .78;
+      const by = (1 - u) ** 3 * y0 + 3 * (1 - u) ** 2 * u * y0 + 3 * (1 - u) * u * u * cy + u ** 3 * cy;
+      g.fillStyle = `rgba(${rgb},1)`; g.fillRect(x - 3, by - 3, 6, 6);
+    }
+    g.strokeStyle = `rgba(${rgb},1)`; g.beginPath(); g.moveTo(W * .78, cy); g.lineTo(W, cy); g.stroke();
+    g.fillStyle = `rgba(${rgb},1)`; g.beginPath(); g.arc(W * .78, cy, 4, 0, 7); g.fill();
+  },
+};
+document.querySelectorAll("canvas[data-draw]").forEach(c => { const rgb = dotOf(c.closest("section")); painter(c, (g, W, H, t) => draws[c.dataset.draw](g, W, H, t, rgb)); });
+
+// The closing dither: a horizon of dots rising from the floor.
+painter(document.getElementById("tail"), (g, W, H, t) => {
+  dither(g, W, H, 5, "10,10,10", .8, (x, y) => { const w = Math.sin(x / W * 6.3 + t * .3) * .08 + Math.sin(x / W * 17 + t * .5) * .04; return (y / H) * 1.15 - .35 + w; });
+});
+
+// The log of AVP's own line: real positions, shown as they landed.
+(() => {
+  const rows = [
+    [110, "green", "AVP Cloud website: sign-in, home, orgs, repos, a design in tokens"],
+    [111, "green", "Every proof step in a throwaway sandbox container"],
+    [112, "green", "Sign-up, organizations, plans, proof minutes"],
+    [113, "green", "A server with its own key: the machine's scripts ask with it"],
+    [114, "green", "Workers run proofs in a sandbox only where it is asked"],
+    [115, "red", "avp login (device code), credentials, up on Cloud, install.sh"],
+    [116, "green", "Conflict markers left at 115 settled, both sides kept"],
+    [117, "flaky", "Device login routes and organizations, side by side"],
+    [118, "green", "A land never lands conflict markers"],
+    [119, "green", "avp import from a Git URL, read-only git clone"],
+    [120, "green", "The server image builds again with the website"],
+    [121, "green", "Slow tests that never fail leave the proofs by themselves"],
+    [122, "green", "install.sh served at /install, compiled into the binary"],
+    [123, "green", "tests/login.sh passes on Linux"],
+  ];
+  const log = document.getElementById("log");
+  let k = 0;
+  const add = () => {
+    const [p, v, t] = rows[k % rows.length]; k++;
+    const r = document.createElement("div"); r.className = "row";
+    r.innerHTML = `<span>${p}</span><span class="v ${v === "green" ? "g" : ""}">${v}</span><span class="t"></span>`;
+    r.querySelector(".t").textContent = t;
+    log.prepend(r);
+    while (log.children.length > 9) log.lastChild.remove();
+  };
+  for (let i = 0; i < 6; i++) add();
+  if (!still) setInterval(add, 2600);
+})();
+
+// Reveal, counters, meters, and the nav taking the color of the section under it.
+(() => {
+  const io = new IntersectionObserver(es => es.forEach(e => {
+    if (!e.isIntersecting) return;
+    const el = e.target; el.classList.add("on");
+    el.querySelectorAll(".meter i").forEach(i => i.style.left = i.dataset.at + "%");
+    el.querySelectorAll(".count").forEach(n => {
+      const to = +n.dataset.to, dec = +(n.dataset.dec || 0), t0 = performance.now();
+      if (still) return;
+      const step = t => { const p = Math.min(1, (t - t0) / 1400), e2 = 1 - (1 - p) ** 3; n.textContent = (to * e2).toFixed(dec); if (p < 1) requestAnimationFrame(step); };
+      requestAnimationFrame(step);
+    });
+    io.unobserve(el);
+  }), { threshold: .2 });
+  document.querySelectorAll(".rise").forEach((el, n) => { el.style.transitionDelay = (n % 4) * 70 + "ms"; io.observe(el); });
+  const nav = document.querySelector("nav");
+  const themes = [...document.querySelectorAll("[data-theme]")];
+  const pick = () => {
+    const under = themes.find(s => { const r = s.getBoundingClientRect(); return r.top <= 30 && r.bottom > 30; });
+    nav.className = under && under.dataset.theme === "light" ? "on-light" : "on-dark";
+  };
+  addEventListener("scroll", pick, { passive: true }); pick();
+})();
+
+document.querySelectorAll(".copy").forEach(b => b.addEventListener("click", () => {
+  navigator.clipboard?.writeText(document.getElementById(b.dataset.copy).textContent).then(() => { b.textContent = "copied"; setTimeout(() => b.textContent = "copy", 1400); });
+}));
+</script>
+</body>
+</html>

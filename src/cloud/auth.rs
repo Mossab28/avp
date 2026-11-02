@@ -7,10 +7,10 @@
 
 use crate::db::Db;
 use crate::engine::Engine;
-use crate::model::{new_id, now_ms, Event, NewToken, Repo, TokenInfo, User};
+use crate::model::{new_id, now_ms, Event, LeasePolicy, NewToken, Repo, TokenInfo, User};
 use anyhow::{anyhow, Result};
 use axum::extract::{Path as P, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{Extensions, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -96,15 +96,20 @@ impl Who {
         }
     }
 
-    fn person(&self) -> Option<&str> {
+    pub(crate) fn person(&self) -> Option<&str> {
         match self {
             Who::Person(u) => Some(&u.name),
             _ => None,
         }
     }
 
+    /// The name a change of an organization is recorded under.
+    pub(crate) fn name(&self) -> String {
+        self.by(&HeaderMap::new())
+    }
+
     /// The name a change of people, tokens or roles is recorded under.
-    fn by(&self, headers: &HeaderMap) -> String {
+    pub(crate) fn by(&self, headers: &HeaderMap) -> String {
         match self {
             Who::Person(u) => u.name.clone(),
             Who::Server(Some(p)) => p.clone(),
@@ -125,7 +130,7 @@ impl Who {
 
 /// A refusal that is about rights (403), not a request gone wrong.
 #[derive(Debug)]
-struct Forbidden(String);
+pub(crate) struct Forbidden(pub(crate) String);
 
 impl std::fmt::Display for Forbidden {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -164,18 +169,31 @@ fn github_login(s: &str) -> String {
 /// Adds a person, with a first token for them, shown once. The first person turns accounts on and
 /// is an admin of the server: nobody else could give rights then.
 pub fn add_user(db: &Db, name: &str, email: Option<&str>, github: Option<&str>, admin: bool, by: &str) -> Result<(User, NewToken)> {
+    add_person(db, name, email, github, admin || !on(db)?, by)
+}
+
+/// A name of a person or an organization: letters, digits, `.`, `_` and `-`.
+pub(crate) fn valid_name(name: &str, whose: &str) -> Result<()> {
     anyhow::ensure!(
         !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) && !name.starts_with(['.', '-']),
-        "{name:?}: a person's name is letters, digits, `.`, `_` and `-`, 64 at most"
+        "{name:?}: {whose} name is letters, digits, `.`, `_` and `-`, 64 at most"
     );
+    Ok(())
+}
+
+/// A person whatever came before: one who signs up is never an admin, even the first.
+fn add_person(db: &Db, name: &str, email: Option<&str>, github: Option<&str>, admin: bool, by: &str) -> Result<(User, NewToken)> {
+    valid_name(name, "a person's")?;
     anyhow::ensure!(user(db, name)?.is_none(), "{name} is already a person of this server: `avp user list`");
+    // A repo's space is named by its organization or its person: one name, one of them.
+    anyhow::ensure!(super::orgs::org(db, name)?.is_none(), "{name} is an organization's name: choose another");
     let github = github.map(github_login).filter(|g| !g.is_empty());
     if let Some(g) = &github {
         if let Some(other) = user_of_github(db, g)? {
             anyhow::bail!("the GitHub login {g} already signs in {}", other.name);
         }
     }
-    let u = User { name: name.into(), email: email.map(str::trim).filter(|e| !e.is_empty()).map(String::from), github, admin: admin || !on(db)?, created_at: now_ms(), created_by: by.into() };
+    let u = User { name: name.into(), email: email.map(str::trim).filter(|e| !e.is_empty()).map(String::from), github, admin, created_at: now_ms(), created_by: by.into() };
     db.conn.execute(
         &format!("INSERT INTO users ({USER_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
         params![u.name, u.email, u.github, u.admin as i64, u.created_at, u.created_by],
@@ -191,6 +209,8 @@ pub fn remove_user(db: &Db, name: &str, by: &str) -> Result<()> {
     let now = now_ms();
     let revoked = db.conn.execute("UPDATE tokens SET revoked_at = ?2 WHERE person = ?1 AND revoked_at IS NULL", params![name, now])?;
     db.conn.execute("DELETE FROM roles WHERE person = ?1", params![name])?;
+    db.conn.execute("DELETE FROM members WHERE person = ?1", params![name])?;
+    db.conn.execute("DELETE FROM passwords WHERE person = ?1", params![name])?;
     db.conn.execute("DELETE FROM users WHERE name = ?1", params![name])?;
     db.emit(SERVER, "user.removed", None, None, json!({ "name": name, "tokens_revoked": revoked, "by": by }))?;
     Ok(())
@@ -294,7 +314,21 @@ pub fn expiry(s: &str, now: i64) -> Result<Option<i64>> {
 
 // ---- roles ----
 
+/// A person's role on a repo: the one given on the repo, else the one their role in the repo's
+/// organization gives (member: write, admin and owner: admin).
 pub fn role(db: &Db, repo: &str, person: &str) -> Result<Option<Role>> {
+    if let Some(r) = granted(db, repo, person)? {
+        return Ok(Some(r));
+    }
+    let org: Option<String> = db.conn.query_row("SELECT org FROM repos WHERE id = ?1", params![repo], |r| r.get(0)).optional()?.flatten();
+    Ok(match org {
+        Some(o) => super::orgs::member(db, &o, person)?.map(super::orgs::OrgRole::repo_role),
+        None => None,
+    })
+}
+
+/// The role given to a person on the repo itself.
+fn granted(db: &Db, repo: &str, person: &str) -> Result<Option<Role>> {
     let r: Option<String> = db.conn.query_row("SELECT role FROM roles WHERE repo = ?1 AND person = ?2", params![repo, person], |r| r.get(0)).optional()?;
     Ok(r.and_then(|r| Role::parse(&r).ok().flatten()))
 }
@@ -302,7 +336,7 @@ pub fn role(db: &Db, repo: &str, person: &str) -> Result<Option<Role>> {
 /// Gives a person a role on a repo (None takes it away), and says which they had.
 pub fn set_role(db: &Db, repo: &Repo, person: &str, role: Option<Role>, by: &str) -> Result<Option<Role>> {
     anyhow::ensure!(user(db, person)?.is_some(), "no user {person}: a server admin adds them first (`avp user add {person}`)");
-    let was = self::role(db, &repo.id, person)?;
+    let was = granted(db, &repo.id, person)?;
     match role {
         Some(r) => db.conn.execute(
             "INSERT INTO roles (repo, person, role) VALUES (?1, ?2, ?3) ON CONFLICT (repo, person) DO UPDATE SET role = excluded.role",
@@ -324,9 +358,14 @@ pub fn roles_of_repo(db: &Db, repo: &str) -> Result<Vec<(String, Role)>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter_map(|(p, r)| Some((p, Role::parse(&r).ok()??))).collect())
 }
 
-/// A person's role on each repo they have one on, by the repo's name.
+/// A person's role on each repo they have one on, by the repo's name (`<space>/<name>` on AVP
+/// Cloud): given on the repo, or by their role in its organization.
 pub fn roles_of_user(db: &Db, person: &str) -> Result<Vec<(String, Role)>> {
-    let mut st = db.conn.prepare("SELECT r.name, x.role FROM roles x JOIN repos r ON r.id = x.repo WHERE x.person = ?1 ORDER BY r.name")?;
+    let mut st = db.conn.prepare(
+        "SELECT COALESCE(COALESCE(r.org, r.owner) || '/', '') || r.name, COALESCE(x.role, CASE m.role WHEN 'member' THEN 'write' ELSE 'admin' END) FROM repos r \
+         LEFT JOIN roles x ON x.repo = r.id AND x.person = ?1 LEFT JOIN members m ON m.org = r.org AND m.person = ?1 \
+         WHERE x.role IS NOT NULL OR m.role IS NOT NULL ORDER BY r.name",
+    )?;
     let rows = st.query_map(params![person], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter_map(|(p, r)| Some((p, Role::parse(&r).ok()??))).collect())
 }
@@ -336,21 +375,26 @@ pub fn roles_of_user(db: &Db, person: &str) -> Result<Vec<(String, Role)>> {
 pub fn readable(db: &Db, repos: Vec<Repo>, who: Option<&Who>) -> Result<Vec<Repo>> {
     let Some(Who::Person(u)) = who.filter(|w| !w.root()) else { return Ok(repos) };
     let mine: std::collections::HashSet<String> = roles_of_user(db, &u.name)?.into_iter().map(|(r, _)| r).collect();
-    Ok(repos.into_iter().filter(|r| mine.contains(&r.name)).collect())
+    Ok(repos.into_iter().filter(|r| mine.contains(&r.full_name())).collect())
 }
 
-/// A person who creates a repo is its admin.
+/// A person who creates a repo is its admin; on AVP Cloud it is theirs, in their own space, until
+/// they bring it into an organization.
 pub fn created(e: &Engine, repo: &Repo, who: Option<&Who>) -> Result<()> {
     if let Some(Who::Person(u)) = who {
-        set_role(&e.db.lock().unwrap(), repo, &u.name, Some(Role::Admin), &u.name)?;
+        let db = e.db.lock().unwrap();
+        set_role(&db, repo, &u.name, Some(Role::Admin), &u.name)?;
+        if super::orgs::on() {
+            db.conn.execute("UPDATE repos SET owner = ?2 WHERE id = ?1", params![repo.id, u.name])?;
+        }
     }
     Ok(())
 }
 
-/// The changes of people, tokens and roles after `since`, oldest first.
+/// The changes of people, tokens, roles and organizations after `since`, oldest first.
 pub fn account_events(db: &Db, since: i64, limit: i64) -> Result<Vec<Event>> {
     let mut st = db.conn.prepare(
-        "SELECT id, at, kind, task, path, data FROM events WHERE id > ?1 AND ((repo = ?2 AND (kind LIKE 'user.%' OR kind LIKE 'token.%')) \
+        "SELECT id, at, kind, task, path, data FROM events WHERE id > ?1 AND ((repo = ?2 AND (kind LIKE 'user.%' OR kind LIKE 'token.%' OR kind LIKE 'org.%')) \
          OR (repo IN (SELECT id FROM repos) AND kind = 'role.set')) ORDER BY id LIMIT ?3",
     )?;
     let rows = st.query_map(params![since, SERVER, limit.clamp(1, 10_000)], |r| {
@@ -397,10 +441,16 @@ pub fn need(method: &Method, path: &str) -> Need {
     let read = *method == Method::GET || *method == Method::HEAD;
     let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
     match seg.as_slice() {
-        ["live"] | ["auth", ..] => Need::Nothing,
-        ["session"] if *method == Method::POST => Need::Nothing,
-        ["work"] | ["drain"] if read => Need::Person,
+        // A device login's approval is a signed-in person's; starting and polling one, before any token.
+        ["login", "device", "approve"] => Need::Person,
+        ["live"] | ["auth", ..] | ["login", ..] | ["install"] => Need::Nothing,
+        ["session"] | ["signup"] if *method == Method::POST => Need::Nothing,
+        // What the workers run is every organization's: on AVP Cloud, a server admin's to read.
+        ["work"] | ["drain"] if read && !super::orgs::on() => Need::Person,
+        ["orgs", _, "plan"] => Need::ServerAdmin,
         ["work", ..] | ["drain"] | ["users", ..] | ["accounts", ..] => Need::ServerAdmin,
+        // `git clone https://<server>/<repo>.git`: the repo's readers (the route refuses a push).
+        [key @ .., "info", "refs"] | [key @ .., "git-upload-pack" | "git-receive-pack"] if git_repo(key).is_some() => Need::Repo(git_repo(key).unwrap_or_default(), Role::Read),
         ["repos", repo, rest @ ..] => {
             let role = match rest {
                 ["secrets", ..] => Role::Admin,
@@ -408,12 +458,23 @@ pub fn need(method: &Method, path: &str) -> Need {
                 // POSTs that read: many objects, a diff, the line's memory of some paths.
                 ["objects"] | ["diff"] | ["history", "context"] => Role::Read,
                 ["envs", env] | ["envs", env, "rollback"] => return Need::Promote(repo.to_string(), env.to_string()),
-                ["import"] | ["guarded"] | ["landing"] | ["roles"] | ["envs", ..] => Role::Admin,
+                ["import"] | ["git", ..] | ["guarded"] | ["landing"] | ["roles"] | ["envs", ..] => Role::Admin,
                 _ => Role::Write,
             };
             Need::Repo(repo.to_string(), role)
         }
         _ => Need::Person,
+    }
+}
+
+/// The repo a git URL names: `<repo>.git`, or `<space>/<repo>.git` with its organization (or the
+/// person whose own it is) in front, which only reaches that space's repo.
+fn git_repo(seg: &[&str]) -> Option<String> {
+    let name = |r: &str| r.strip_suffix(".git").filter(|n| !n.is_empty()).map(String::from);
+    match seg {
+        [repo] => name(repo),
+        [space, repo] => name(repo).map(|r| format!("{space}/{r}")),
+        _ => None,
     }
 }
 
@@ -482,7 +543,8 @@ fn unsigned(msg: impl Into<String>) -> Response {
 /// machine), whether they may, and the person the routes then read (`x-avp-user`), never one the
 /// client chose.
 pub async fn gate(State(g): State<Gate>, mut req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let need = need(req.method(), req.uri().path());
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let git = path.contains(".git/");
     let h = req.headers();
     let live_ok = matches!(*req.method(), Method::GET | Method::HEAD) || h.contains_key("x-avp-live");
     let ask = Ask {
@@ -491,11 +553,29 @@ pub async fn gate(State(g): State<Gate>, mut req: axum::extract::Request, next: 
         machine: machine(&req),
     };
     req.extensions_mut().insert(g.known.clone());
-    let decided = tokio::task::spawn_blocking(move || g.decide(&ask, &need)).await;
+    let engine = g.engine.clone();
+    let decided = tokio::task::spawn_blocking(move || g.decide(&ask, &method, &path)).await;
     let who = match decided {
-        Ok(Ok(Some(who))) => who,
-        Ok(Ok(None)) => return next.run(req).await,
-        Ok(Err(refusal)) => return refusal,
+        Ok(Ok((who, named))) => {
+            // The routes read the repo by its id: the gate ran before them, so they match this path.
+            if let Some(path) = named {
+                let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+                if let Ok(uri) = format!("{path}{query}").parse() {
+                    *req.uri_mut() = uri;
+                }
+            }
+            match who {
+                Some(who) => who,
+                None => return next.run(req).await,
+            }
+        }
+        Ok(Err(mut refusal)) => {
+            // git sends its credentials only once asked for them.
+            if git && refusal.status() == StatusCode::UNAUTHORIZED {
+                refusal.headers_mut().insert("www-authenticate", axum::http::HeaderValue::from_static("Basic realm=\"avp\""));
+            }
+            return refusal;
+        }
         Err(e) => return json_refusal(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let person = match &who {
@@ -506,27 +586,208 @@ pub async fn gate(State(g): State<Gate>, mut req: axum::extract::Request, next: 
     if let Some(v) = person.and_then(|p| axum::http::HeaderValue::from_str(p).ok()) {
         req.headers_mut().insert("x-avp-user", v);
     }
-    req.extensions_mut().insert(who);
+    req.extensions_mut().insert(who.clone());
+    if super::orgs::on() {
+        return tenant(engine, &who, req, next).await;
+    }
     next.run(req).await
 }
 
+/// On AVP Cloud, what a role on the repo does not settle. One store holds every organization's
+/// objects, and a hash known is no right to read one: a person reads the objects their repo holds.
+/// A proof runs while the repo's space has minutes left on its plan.
+async fn tenant(e: Engine, who: &Who, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path().trim_matches('/').to_string();
+    let seg: Vec<&str> = path.split('/').collect();
+    let reader = matches!(who, Who::Person(u) if !u.admin);
+    let method = req.method().clone();
+    let read = method == Method::GET || method == Method::HEAD;
+    let missing = |hash: &str| json_refusal(StatusCode::NOT_FOUND, format!("no object {hash}"));
+    match seg.as_slice() {
+        // A repo goes in its space: the asker's own, or an organization's (`acme/shop`).
+        ["repos"] if method == Method::POST => {
+            let Ok(bytes) = axum::body::to_bytes(req.into_body(), 1 << 20).await else { return json_refusal(StatusCode::BAD_REQUEST, "a repo is asked for by its name and policy") };
+            #[derive(Deserialize)]
+            struct New {
+                name: String,
+                #[serde(default)]
+                policy: Option<LeasePolicy>,
+            }
+            let asked: New = match serde_json::from_slice(&bytes) {
+                Ok(n) => n,
+                Err(x) => return json_refusal(StatusCode::BAD_REQUEST, format!("a repo is asked for by its name and policy: {x}")),
+            };
+            let who = who.clone();
+            match tokio::task::spawn_blocking(move || super::orgs::create_repo(&e, &asked.name, asked.policy.unwrap_or(LeasePolicy::Advisory), &who)).await {
+                Ok(Ok(r)) => Json(r).into_response(),
+                Ok(Err(x)) => crate::server::err(x),
+                Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+            }
+        }
+        ["repos", repo, "objects", hash] if read && reader => {
+            let (e2, repo, hash) = (e.clone(), repo.to_string(), hash.to_string());
+            match tokio::task::spawn_blocking(move || holds(&e2, &repo, &[hash])).await {
+                Ok(Ok(None)) => next.run(req).await,
+                Ok(Ok(Some(h))) => missing(&h),
+                Ok(Err(x)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}")),
+                Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+            }
+        }
+        // A batch names its objects in its body: read here, then handed on as it came.
+        ["repos", repo, "objects"] if method == Method::POST && reader => {
+            let repo = repo.to_string();
+            let (parts, body) = req.into_parts();
+            let Ok(bytes) = axum::body::to_bytes(body, 64 << 20).await else { return json_refusal(StatusCode::BAD_REQUEST, "the list of objects is too long") };
+            let hashes: Vec<String> = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| serde_json::from_value(v["hashes"].clone()).ok()).unwrap_or_default();
+            let e2 = e.clone();
+            match tokio::task::spawn_blocking(move || holds(&e2, &repo, &hashes)).await {
+                Ok(Ok(None)) => next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))).await,
+                Ok(Ok(Some(h))) => missing(&h),
+                Ok(Err(x)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}")),
+                Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+            }
+        }
+        // Sent to the repo: from now on it holds it.
+        ["repos", repo, "objects", hash] if method == Method::PUT => {
+            let (repo, hash) = (repo.to_string(), hash.to_string());
+            let res = next.run(req).await;
+            if res.status().is_success() {
+                let kept = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let db = e.db.lock().unwrap();
+                    let id = db.repo(&repo)?.id;
+                    db.conn.execute("INSERT OR IGNORE INTO repo_objects (repo, hash) VALUES (?1, ?2)", params![id, hash])?;
+                    Ok(())
+                })
+                .await;
+                if let Ok(Err(x)) = kept {
+                    eprintln!("object of {path} not recorded: {x:#}");
+                }
+            }
+            res
+        }
+        ["repos", repo, "tasks", _, "land" | "check" | "speculate"] | ["repos", repo, "full"] if method == Method::POST => {
+            let repo = repo.to_string();
+            match tokio::task::spawn_blocking(move || super::orgs::may_prove(&e, &repo)).await {
+                Ok(Ok(Ok(()))) => next.run(req).await,
+                Ok(Ok(Err(over))) => json_refusal(StatusCode::PAYMENT_REQUIRED, over),
+                // A repo the gate let through but cannot find: the route says so.
+                Ok(Err(_)) => next.run(req).await,
+                Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+            }
+        }
+        _ => next.run(req).await,
+    }
+}
+
+/// The first of these objects the repo does not hold (None: it holds them all). It holds what was
+/// sent to it, what its tasks wrote, its line's trees and what is in them: the trees not read yet
+/// are read, newest first, until the object is found, and what they hold is remembered.
+pub fn holds(e: &Engine, repo: &str, hashes: &[String]) -> Result<Option<String>> {
+    let db = e.db.lock().unwrap();
+    let repo = db.repo(repo)?.id;
+    let known = |hash: &str| -> Result<bool> {
+        let one = |sql: &str| db.conn.query_row(sql, params![repo, hash], |r| r.get::<_, bool>(0));
+        Ok(one("SELECT EXISTS (SELECT 1 FROM repo_objects WHERE repo = ?1 AND hash = ?2)")?
+            || one("SELECT EXISTS (SELECT 1 FROM line WHERE repo = ?1 AND tree = ?2)")?
+            || one("SELECT EXISTS (SELECT 1 FROM writes WHERE blob = ?2 AND task IN (SELECT id FROM tasks WHERE repo = ?1))")?)
+    };
+    let mut unread: Option<Vec<String>> = None;
+    for hash in hashes {
+        if known(hash)? {
+            continue;
+        }
+        let trees = match &mut unread {
+            Some(t) => t,
+            None => {
+                let mut st = db.conn.prepare("SELECT tree FROM line WHERE repo = ?1 AND tree NOT IN (SELECT tree FROM repo_trees WHERE repo = ?1) GROUP BY tree ORDER BY MAX(position) DESC")?;
+                let rows = st.query_map(params![repo], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+                unread.insert(rows)
+            }
+        };
+        let mut found = false;
+        while !found && !trees.is_empty() {
+            let t = trees.remove(0);
+            let Ok(tree) = e.objects.get_tree(&t) else { continue };
+            let tx = db.conn.unchecked_transaction()?;
+            for entry in tree.values() {
+                tx.execute("INSERT OR IGNORE INTO repo_objects (repo, hash) VALUES (?1, ?2)", params![repo, entry.blob])?;
+            }
+            tx.execute("INSERT OR IGNORE INTO repo_trees (repo, tree) VALUES (?1, ?2)", params![repo, t])?;
+            tx.commit()?;
+            found = tree.values().any(|x| &x.blob == hash);
+        }
+        if !found {
+            return Ok(Some(hash.clone()));
+        }
+    }
+    Ok(None)
+}
+
 impl Gate {
-    fn decide(&self, ask: &Ask, need: &Need) -> Result<Option<Who>, Response> {
+    /// Who asks, whether they may, and on AVP Cloud the path with the repo it names said by its id
+    /// (see `named`).
+    fn decide(&self, ask: &Ask, method: &Method, path: &str) -> Result<(Option<Who>, Option<String>), Response> {
         let on = self.known.on(&self.engine.db).map_err(|e| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
         if !on {
             // As before accounts: the server's token when it has one, nothing otherwise.
             return match &self.key {
-                None => Ok(Some(Who::Anyone)),
+                None => Ok((Some(Who::Anyone), None)),
                 Some(key) => match token_user(ask.authorization.as_deref(), key) {
-                    Some(person) => Ok(Some(Who::Server(Some(person)))),
+                    Some(person) => Ok((Some(Who::Server(Some(person))), None)),
                     None => Err((StatusCode::UNAUTHORIZED, [("www-authenticate", "Basic realm=\"avp\"")], "AVP_TOKEN required").into_response()),
                 },
             };
         }
-        match self.identify(ask) {
-            Ok(who) => self.allow(&who, need).map(|_| Some(who)),
-            Err(_) if *need == Need::Nothing => Ok(None),
-            Err(refusal) => Err(refusal),
+        let who = match self.identify(ask) {
+            Ok(who) => who,
+            Err(_) if need(method, path) == Need::Nothing => return Ok((None, None)),
+            Err(refusal) => return Err(refusal),
+        };
+        let named = if super::orgs::on() { self.named(path, &who)? } else { None };
+        self.allow(&who, &need(method, named.as_deref().unwrap_or(path)))?;
+        Ok((Some(who), named))
+    }
+
+    /// On AVP Cloud, a path to a repo with the repo said by its id: `/repos/acme/shop/line` (or
+    /// `/repos/acme%2Fshop/line`) is acme's `shop`; `/repos/shop/line`, the asker's one `shop` when
+    /// other spaces have one too. None: the path stays as it is.
+    fn named(&self, path: &str, who: &Who) -> Result<Option<String>, Response> {
+        let Some(rest) = path.strip_prefix("/repos/") else { return Ok(None) };
+        let seg: Vec<&str> = rest.split('/').collect();
+        let failed = |e: anyhow::Error| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+        let to = |id: &str, after: &[&str]| Some(format!("/repos/{id}{}", after.iter().map(|s| format!("/{s}")).collect::<String>()));
+        let db = self.engine.db.lock().unwrap();
+        let first = seg[0].replace("%2F", "/").replace("%2f", "/");
+        if let Some((space, name)) = first.split_once('/') {
+            return Ok(db.repo_in(Some(space), name).map_err(failed)?.and_then(|id| to(&id, &seg[1..])));
+        }
+        if let [space, name, after @ ..] = seg.as_slice() {
+            if let Some(id) = db.repo_in(Some(space), name).map_err(failed)? {
+                return Ok(to(&id, after));
+            }
+        }
+        let same = db.repos_named(&first).map_err(failed)?;
+        if same.len() < 2 {
+            return Ok(None);
+        }
+        let mut mine = vec![];
+        for r in same {
+            let reads = match who {
+                Who::Person(u) if !u.admin => role(&db, &r.id, &u.name).map_err(failed)?.is_some(),
+                _ => true,
+            };
+            if reads {
+                mine.push(r);
+            }
+        }
+        match mine.as_slice() {
+            // None of theirs: the route answers there is no such repo, as for any other.
+            [] => Ok(None),
+            [one] => Ok(to(&one.id, &seg[1..])),
+            many => Err(json_refusal(
+                StatusCode::CONFLICT,
+                format!("{first} names {} of your repos: {}. Say which, as `<space>/{first}`", many.len(), many.iter().map(Repo::full_name).collect::<Vec<_>>().join(", ")),
+            )),
         }
     }
 
@@ -629,7 +890,7 @@ fn set_cookie(h: &HeaderMap, name: &str, value: &str, max_age_s: i64, same_site:
 
 type S = State<Engine>;
 
-async fn run<T: Serialize + Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Response {
+pub(crate) async fn run<T: Serialize + Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Response {
     let out = tokio::task::spawn_blocking(f).await.map_err(|e| anyhow!(e)).and_then(|r| r);
     match out {
         Ok(v) => Json(v).into_response(),
@@ -652,9 +913,15 @@ pub fn routes() -> Router<Engine> {
         .route("/tokens/{id}/revoke", post(revoke_route))
         .route("/accounts/events", get(events_route))
         .route("/session", post(sign_in).delete(sign_out))
+        .route("/signup", post(sign_up))
         .route("/auth", get(ways))
         .route("/auth/github", get(github_start))
         .route("/auth/github/callback", get(github_back))
+        .route("/login/device", get(device_page).post(device_create))
+        .route("/login/device/peek", get(device_peek))
+        .route("/login/device/approve", post(device_approve))
+        .route("/login/device/token", post(device_token))
+        .route("/install", get(install_script))
 }
 
 /// Who the server takes the request for, and their roles: `avp whoami`, AVP Live's corner.
@@ -670,9 +937,14 @@ async fn me(State(e): S, Extension(who): Extension<Who>, headers: HeaderMap) -> 
             Who::Server(p) => p.clone(),
             Who::Anyone => headers.get("x-avp-user").and_then(|v| v.to_str().ok()).map(String::from),
         };
+        let orgs = match &who {
+            Who::Person(u) if super::orgs::on() => super::orgs::orgs_of(&db, &u.name)?.into_iter().map(|(o, r)| json!({ "org": o.name, "role": r, "plan": o.plan })).collect(),
+            _ => vec![],
+        };
         Ok(json!({
             "accounts": on(&db)?, "person": person, "admin": who.root(), "via": who.via(), "github": github_app().is_some(),
             "roles": roles.iter().map(|(r, role)| json!({ "repo": r, "role": role })).collect::<Vec<_>>(),
+            "cloud": super::orgs::on(), "orgs": orgs,
         }))
     })
     .await
@@ -822,12 +1094,20 @@ async fn events_route(State(e): S, Query(q): Query<EventsQuery>) -> Response {
 
 #[derive(Deserialize)]
 struct SignIn {
+    #[serde(default)]
     token: String,
+    /// On AVP Cloud: a name or an email, and its password.
+    name: Option<String>,
+    password: Option<String>,
 }
 
 /// A person's token in, a session of AVP Live's out, as a cookie: the token itself never sits in
-/// the browser.
-async fn sign_in(State(e): S, headers: HeaderMap, Json(b): Json<SignIn>) -> Response {
+/// the browser. On AVP Cloud, a name (or email) and its password too: AVP Live gets its session,
+/// any other client a token of 90 days (`avp user login`).
+async fn sign_in(State(e): S, ext: Extensions, headers: HeaderMap, Json(b): Json<SignIn>) -> Response {
+    if let (Some(name), Some(password)) = (b.name.clone(), b.password.clone()) {
+        return password_sign_in(e, address(&headers, &ext), headers, name, password).await;
+    }
     if !headers.contains_key("x-avp-live") {
         return json_refusal(StatusCode::BAD_REQUEST, "signing in is AVP Live's: open /live");
     }
@@ -887,9 +1167,159 @@ async fn sign_out(State(e): S, Extension(who): Extension<Who>, headers: HeaderMa
     res
 }
 
+// ---- AVP Cloud's sign-up and passwords ----
+
+/// Who asks, for the limits on sign-ups and sign-ins: the address the proxy in front appended
+/// (the last of `x-forwarded-for`, the ones before it are the client's to make up), else the peer's.
+fn address(h: &HeaderMap, ext: &Extensions) -> String {
+    let forwarded = h.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).filter(|v| !v.is_empty()).last().map(String::from);
+    forwarded
+        .or_else(|| h.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|v| v.trim().to_string()))
+        .or_else(|| ext.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip().to_canonical().to_string()))
+        .unwrap_or_default()
+}
+
+/// Sign-ups an address may make an hour, and sign-ins it may try in 10 minutes: an open server is
+/// not a script's to fill with accounts or to guess passwords on.
+const SIGNUPS_AN_HOUR: usize = 5;
+const SIGNINS_IN_10_MIN: usize = 10;
+
+/// Whether `address` may try `what` once more: at most `most` in `window_ms`.
+fn within_limit(what: &str, address: &str, most: usize, window_ms: i64) -> bool {
+    type Tries = std::collections::HashMap<(String, String), Vec<i64>>;
+    static TRIES: std::sync::Mutex<Option<Tries>> = std::sync::Mutex::new(None);
+    let now = now_ms();
+    let mut all = TRIES.lock().unwrap();
+    let all = all.get_or_insert_with(Default::default);
+    // The addresses gone quiet are forgotten, so the map does not grow forever.
+    if all.len() > 10_000 {
+        all.retain(|_, at| at.iter().any(|t| now - t < 3_600_000));
+    }
+    let at = all.entry((what.to_string(), address.to_string())).or_default();
+    at.retain(|t| now - t < window_ms);
+    if at.len() >= most {
+        return false;
+    }
+    at.push(now);
+    true
+}
+
+fn too_many(what: &str) -> Response {
+    json_refusal(StatusCode::TOO_MANY_REQUESTS, format!("too many {what} from this address: try again later"))
+}
+
+/// A password as the server keeps it: argon2id, salted, never the password.
+fn password_hash(password: &str) -> Result<String> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    use base64::Engine as _;
+    anyhow::ensure!((10..=256).contains(&password.chars().count()), "a password is 10 characters at least, 256 at most");
+    let random = fresh()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&random[4..])?;
+    let salt = SaltString::encode_b64(&bytes[..16]).map_err(|e| anyhow!("salt: {e}"))?;
+    Ok(argon2::Argon2::default().hash_password(password.as_bytes(), &salt).map_err(|e| anyhow!("password: {e}"))?.to_string())
+}
+
+pub fn set_password(db: &Db, person: &str, password: &str) -> Result<()> {
+    let hash = password_hash(password)?;
+    db.conn.execute(
+        "INSERT INTO passwords (person, hash, set_at) VALUES (?1, ?2, ?3) ON CONFLICT (person) DO UPDATE SET hash = excluded.hash, set_at = excluded.set_at",
+        params![person, hash, now_ms()],
+    )?;
+    db.emit(SERVER, "user.password", None, None, json!({ "name": person, "by": person }))?;
+    Ok(())
+}
+
+/// The person a name or an email and a password sign in, if they do.
+pub fn check_password(db: &Db, name: &str, password: &str) -> Result<Option<User>> {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let name = name.trim();
+    let person: Option<String> = db.conn.query_row("SELECT name FROM users WHERE name = ?1 OR (?1 LIKE '%@%' AND lower(email) = lower(?1))", params![name], |r| r.get(0)).optional()?;
+    let Some(person) = person else { return Ok(None) };
+    let hash: Option<String> = db.conn.query_row("SELECT hash FROM passwords WHERE person = ?1", params![person], |r| r.get(0)).optional()?;
+    let ok = hash.is_some_and(|h| PasswordHash::new(&h).is_ok_and(|h| argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok()));
+    if ok { user(db, &person) } else { Ok(None) }
+}
+
+/// One who signs up on AVP Cloud: a person who is no admin, whose repos are their own until they
+/// bring them into an organization.
+pub fn sign_up_person(db: &Db, name: &str, email: &str, password: &str) -> Result<(User, NewToken)> {
+    anyhow::ensure!(super::orgs::signup_open(), Forbidden("signing up is closed on this server: a server admin adds people (`avp user add`)".into()));
+    let email = email.trim();
+    anyhow::ensure!(email.contains('@') && !email.contains(char::is_whitespace), "{email:?} is no email address");
+    let taken: bool = db.conn.query_row("SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower(?1))", params![email], |r| r.get(0))?;
+    anyhow::ensure!(!taken, "{email} already signs a person in: sign in with it (`avp user login {email}`)");
+    // The password is checked before anyone is added.
+    let hash = password_hash(password)?;
+    let (u, token) = add_person(db, name, Some(email), None, false, "sign-up")?;
+    db.conn.execute("INSERT INTO passwords (person, hash, set_at) VALUES (?1, ?2, ?3)", params![u.name, hash, now_ms()])?;
+    Ok((u, token))
+}
+
+#[derive(Deserialize)]
+struct SignUp {
+    name: String,
+    email: String,
+    password: String,
+}
+
+/// `POST /signup`: an account, its first token, and from AVP Live its session too.
+async fn sign_up(State(e): S, Extension(known): Extension<Known>, ext: Extensions, headers: HeaderMap, Json(b): Json<SignUp>) -> Response {
+    if !super::orgs::signup_open() {
+        return json_refusal(StatusCode::FORBIDDEN, "signing up is closed on this server: a server admin adds people (`avp user add`)");
+    }
+    if !within_limit("signup", &address(&headers, &ext), SIGNUPS_AN_HOUR, 3_600_000) {
+        return too_many("sign-ups");
+    }
+    let live = headers.contains_key("x-avp-live");
+    let out = tokio::task::spawn_blocking(move || -> Result<(User, NewToken, Option<NewToken>)> {
+        let db = e.db.lock().unwrap();
+        let made = sign_up_person(&db, b.name.trim(), &b.email, &b.password);
+        known.forget();
+        let (u, token) = made?;
+        let s = if live { Some(session(&db, &u.name, "sign-up")?) } else { None };
+        Ok((u, token, s))
+    })
+    .await;
+    match out {
+        Ok(Ok((u, token, s))) => {
+            let res = Json(json!({ "user": u, "token": token })).into_response();
+            match s {
+                Some(s) => signed_in(&headers, &s, res),
+                None => res,
+            }
+        }
+        Ok(Err(x)) if x.is::<Forbidden>() => json_refusal(StatusCode::FORBIDDEN, x.to_string()),
+        Ok(Err(x)) => json_refusal(StatusCode::BAD_REQUEST, format!("{x:#}")),
+        Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+    }
+}
+
+async fn password_sign_in(e: Engine, address: String, headers: HeaderMap, name: String, password: String) -> Response {
+    if !super::orgs::on() {
+        return json_refusal(StatusCode::BAD_REQUEST, "this server signs in with tokens: put yours in AVP_TOKEN (passwords are AVP Cloud's)");
+    }
+    if !within_limit("signin", &address, SIGNINS_IN_10_MIN, 600_000) {
+        return too_many("sign-ins");
+    }
+    let live = headers.contains_key("x-avp-live");
+    let out = tokio::task::spawn_blocking(move || -> Result<Option<NewToken>> {
+        let db = e.db.lock().unwrap();
+        let Some(u) = check_password(&db, &name, &password)? else { return Ok(None) };
+        Ok(Some(if live { session(&db, &u.name, "password")? } else { create_token(&db, &u.name, "signed in", "token", Some(now_ms() + 90 * 86_400_000), &u.name)? }))
+    })
+    .await;
+    match out {
+        Ok(Ok(Some(t))) if live => signed_in(&headers, &t, Json(json!({ "person": t.info.person })).into_response()),
+        Ok(Ok(Some(t))) => Json(json!({ "person": t.info.person, "token": t })).into_response(),
+        Ok(Ok(None)) => unsigned("no such name (or email) and password here"),
+        Ok(Err(x)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}")),
+        Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+    }
+}
+
 /// How one signs in here: whether accounts are on, and GitHub with them.
 async fn ways(State(e): S) -> Response {
-    run(move || Ok(json!({ "accounts": on(&e.db.lock().unwrap())?, "github": github_app().is_some() }))).await
+    run(move || Ok(json!({ "accounts": on(&e.db.lock().unwrap())?, "github": github_app().is_some(), "signup": super::orgs::signup_open(), "password": super::orgs::on() }))).await
 }
 
 /// The server's GitHub OAuth app, from its environment: `AVP_GITHUB_CLIENT_ID` and
@@ -923,7 +1353,7 @@ async fn github_start(headers: HeaderMap) -> Response {
     let Some((client_id, _)) = github_app() else { return back_to_live(Some("GitHub sign-in is off on this server: AVP_GITHUB_CLIENT_ID and AVP_GITHUB_CLIENT_SECRET turn it on")) };
     let Ok(state) = fresh() else { return back_to_live(Some("the server could not draw a random state")) };
     let mut u = reqwest::Url::parse(&format!("{}/login/oauth/authorize", github_urls().0)).unwrap();
-    u.query_pairs_mut().append_pair("client_id", &client_id).append_pair("state", &state).append_pair("allow_signup", "false");
+    u.query_pairs_mut().append_pair("client_id", &client_id).append_pair("state", &state).append_pair("allow_signup", if super::orgs::signup_open() { "true" } else { "false" });
     let mut res = (StatusCode::FOUND, [("location", u.to_string())]).into_response();
     // Lax: GitHub's redirect back is a navigation from another site, which a Strict cookie misses.
     if let Ok(v) = axum::http::HeaderValue::from_str(&set_cookie(&headers, OAUTH, &state, 600, "Lax")) {
@@ -939,17 +1369,30 @@ struct Back {
 }
 
 /// GitHub's answer: the code becomes the login of who signed in there, and the login a person here.
-async fn github_back(State(e): S, headers: HeaderMap, Query(q): Query<Back>) -> Response {
+async fn github_back(State(e): S, Extension(known): Extension<Known>, ext: Extensions, headers: HeaderMap, Query(q): Query<Back>) -> Response {
     let Some((client_id, secret)) = github_app() else { return back_to_live(Some("GitHub sign-in is off on this server")) };
     let (Some(code), Some(state)) = (q.code, q.state) else { return back_to_live(Some("GitHub sent no code back: sign in again")) };
     if cookie(&headers, OAUTH).as_deref() != Some(state.as_str()) {
         return back_to_live(Some("this sign-in did not start here, or took more than 10 minutes: sign in again"));
     }
+    let from = address(&headers, &ext);
     let out = tokio::task::spawn_blocking(move || -> Result<std::result::Result<NewToken, String>> {
         let login = github_login(&github_user(&client_id, &secret, &code)?);
         let db = e.db.lock().unwrap();
         match user_of_github(&db, &login)? {
             Some(u) => Ok(Ok(session(&db, &u.name, "github")?)),
+            // AVP Cloud open to sign-ups: the GitHub account makes the person, named as on GitHub.
+            None if super::orgs::signup_open() => {
+                if !within_limit("signup", &from, SIGNUPS_AN_HOUR, 3_600_000) {
+                    return Ok(Err("too many sign-ups from this address: try again later".into()));
+                }
+                let made = add_person(&db, &login, None, Some(&login), false, "sign-up");
+                known.forget();
+                match made {
+                    Ok((u, _)) => Ok(Ok(session(&db, &u.name, "github")?)),
+                    Err(x) => Ok(Err(format!("{x:#}: sign up with an email and another name, then ask a server admin to link {login}"))),
+                }
+            }
             None => Ok(Err(format!("the GitHub account {login} is no person of this server: a server admin adds you with `avp user add <name> --github {login}`"))),
         }
     })
@@ -981,6 +1424,300 @@ fn github_user(client_id: &str, secret: &str, code: &str) -> Result<String> {
     let me: serde_json::Value = http.get(format!("{api}/user")).header("accept", "application/vnd.github+json").header("user-agent", "avp").bearer_auth(access).send()?.error_for_status()?.json()?;
     me["login"].as_str().map(String::from).ok_or_else(|| anyhow!("GitHub said no login"))
 }
+
+// ---- `avp login`: device codes ----
+
+/// How long a device code waits for a person's yes, and how often the CLI asks meanwhile.
+const DEVICE_SECS: i64 = 600;
+const DEVICE_POLL_SECS: i64 = 2;
+/// The letters of the code a person checks in the browser: no vowels (no word spelled by chance),
+/// none read as another.
+const CODE_LETTERS: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
+
+/// A device code waiting for its person: kept in memory, since it lives minutes (a restart drops
+/// it, and `avp login` asks for another).
+struct Device {
+    user_code: String,
+    /// The machine that asks, for the person to recognize it, and as the token's name.
+    name: String,
+    expires_at: i64,
+    /// Whose yes it got (Ok), or that it got a no (Err).
+    decided: Option<Result<String, String>>,
+}
+
+/// The device codes waiting, by the hash of their secret half: what the CLI holds is nowhere here.
+fn devices() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, Device>> {
+    static DEVICES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Device>>> = std::sync::OnceLock::new();
+    let mut d = DEVICES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    d.retain(|_, x| x.expires_at > now);
+    d
+}
+
+/// What `avp login` gets to start: the secret it polls with, the code the person checks.
+#[derive(Debug, Serialize)]
+pub struct DeviceStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub expires_in: i64,
+    pub interval: i64,
+}
+
+/// Starts a device login for the machine `name`.
+pub fn device_start(name: &str) -> Result<DeviceStart> {
+    use chacha20poly1305::aead::{Generate, Key};
+    let device_code = fresh()?;
+    let bytes: [u8; 32] = Key::<chacha20poly1305::XChaCha20Poly1305>::try_generate().map_err(|e| anyhow!("the system's random generator: {e}"))?.into();
+    // 20^8 codes: guessing one in its ten minutes, signed in, is out of reach.
+    let letters: String = bytes[..8].iter().map(|b| CODE_LETTERS[*b as usize % CODE_LETTERS.len()] as char).collect();
+    let user_code = format!("{}-{}", &letters[..4], &letters[4..]);
+    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    let name = if name.is_empty() { "a machine".to_string() } else { name };
+    let mut d = devices();
+    // Anyone may start one: a flood waits its ten minutes out instead of filling the memory.
+    anyhow::ensure!(d.len() < 10_000, "too many logins wait right now: try again in a few minutes");
+    d.insert(hash(&device_code), Device { user_code: user_code.clone(), name, expires_at: now_ms() + DEVICE_SECS * 1000, decided: None });
+    Ok(DeviceStart { device_code, user_code, expires_in: DEVICE_SECS, interval: DEVICE_POLL_SECS })
+}
+
+/// A code as a person types it: case, spaces and the dash do not matter.
+fn user_code_of(typed: &str) -> String {
+    let l: String = typed.chars().filter(|c| c.is_ascii_alphabetic()).map(|c| c.to_ascii_uppercase()).collect();
+    if l.len() == 8 { format!("{}-{}", &l[..4], &l[4..]) } else { l }
+}
+
+/// The machine a code stands for, for the page to name before the person says yes.
+pub fn device_named(typed: &str) -> Option<String> {
+    let code = user_code_of(typed);
+    devices().values().find(|d| d.user_code == code && d.decided.is_none()).map(|d| d.name.clone())
+}
+
+/// A person's yes (or no) on a code: once, while it waits. Gives the machine's name.
+pub fn device_decide(typed: &str, person: &str, yes: bool) -> Result<String> {
+    let code = user_code_of(typed);
+    let mut d = devices();
+    let dev = d.values_mut().find(|d| d.user_code == code).ok_or_else(|| anyhow!("no login waits with the code {code}: it ended (10 minutes), or was mistyped. Run `avp login` again"))?;
+    anyhow::ensure!(dev.decided.is_none(), "the code {code} was already answered: run `avp login` again");
+    dev.decided = Some(if yes { Ok(person.to_string()) } else { Err(person.to_string()) });
+    Ok(dev.name.clone())
+}
+
+/// What the CLI's poll finds.
+#[derive(Debug)]
+pub enum Polled {
+    Pending,
+    /// A person's yes: their token, made now, the code gone (single use).
+    Approved(NewToken),
+    Denied(String),
+    /// Ended, used, or never made.
+    Gone,
+}
+
+pub fn device_poll(db: &Db, device_code: &str) -> Result<Polled> {
+    let key = hash(device_code.trim());
+    let mut d = devices();
+    let Some(dev) = d.get(&key) else { return Ok(Polled::Gone) };
+    match dev.decided.clone() {
+        None => Ok(Polled::Pending),
+        Some(Err(by)) => {
+            d.remove(&key);
+            Ok(Polled::Denied(by))
+        }
+        Some(Ok(person)) => {
+            let name = format!("avp login ({})", dev.name);
+            d.remove(&key);
+            drop(d);
+            anyhow::ensure!(user(db, &person)?.is_some(), "{person} is no longer a person of this server");
+            Ok(Polled::Approved(create_token(db, &person, &name, "token", None, &person)?))
+        }
+    }
+}
+
+/// The server's address as people reach it: `AVP_PUBLIC_URL`, else what the request came to,
+/// through the proxy in front. Only the characters of a host and port: it goes into a script.
+pub fn public_url(h: &HeaderMap) -> String {
+    if let Some(u) = std::env::var("AVP_PUBLIC_URL").ok().map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()) {
+        return u;
+    }
+    let v = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(|v| v.split(',').next().unwrap_or("").trim().to_string()).filter(|v| !v.is_empty());
+    let host = v("x-forwarded-host").or_else(|| v("host")).filter(|x| x.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c))).unwrap_or_else(|| "127.0.0.1:7117".into());
+    let https = v("x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    format!("{}://{host}", if https { "https" } else { "http" })
+}
+
+#[derive(Deserialize)]
+struct DeviceAsk {
+    name: Option<String>,
+}
+
+async fn device_create(State(e): S, headers: HeaderMap, Json(b): Json<DeviceAsk>) -> Response {
+    let name = b.name.unwrap_or_default();
+    let url = public_url(&headers);
+    run(move || {
+        anyhow::ensure!(on(&e.db.lock().unwrap())?, "this server has no accounts: there is nothing to log in to, AVP_SERVER is enough");
+        let s = device_start(&name)?;
+        let page = format!("{url}/login/device");
+        Ok(json!({ "device_code": s.device_code, "user_code": s.user_code, "verification_uri": page, "verification_uri_complete": format!("{page}?code={}", s.user_code), "expires_in": s.expires_in, "interval": s.interval }))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct DeviceAnswer {
+    code: String,
+    #[serde(default)]
+    deny: bool,
+}
+
+async fn device_approve(Extension(who): Extension<Who>, Json(b): Json<DeviceAnswer>) -> Response {
+    run(move || {
+        let Who::Person(u) = &who else { anyhow::bail!(Forbidden("a login is approved by a person: sign in with your own account".into())) };
+        let name = device_decide(&b.code, &u.name, !b.deny)?;
+        Ok(json!({ "person": u.name, "machine": name, "approved": !b.deny }))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct DeviceCode {
+    #[serde(default)]
+    code: Option<String>,
+}
+
+/// What the page shows before the yes: the machine that asks.
+async fn device_peek(Query(q): Query<DeviceCode>) -> Response {
+    let machine = q.code.as_deref().and_then(device_named);
+    Json(json!({ "machine": machine })).into_response()
+}
+
+#[derive(Deserialize)]
+struct DevicePoll {
+    device_code: String,
+}
+
+async fn device_token(State(e): S, Json(b): Json<DevicePoll>) -> Response {
+    let out = tokio::task::spawn_blocking(move || device_poll(&e.db.lock().unwrap(), &b.device_code)).await;
+    match out {
+        Ok(Ok(Polled::Pending)) => Json(json!({ "status": "pending" })).into_response(),
+        Ok(Ok(Polled::Approved(t))) => Json(json!({ "status": "approved", "person": t.info.person, "token": t })).into_response(),
+        Ok(Ok(Polled::Denied(by))) => json_refusal(StatusCode::FORBIDDEN, format!("{by} said no to this login")),
+        Ok(Ok(Polled::Gone)) => json_refusal(StatusCode::GONE, "this login ended (10 minutes) or was used: run `avp login` again"),
+        Ok(Err(e)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Err(e) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// The page a person approves a login on, signed in to this server.
+async fn device_page() -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], DEVICE_PAGE).into_response()
+}
+
+/// `curl -fsSL <server>/install | sh`: install.sh, with this server as the one it logs in to.
+async fn install_script(headers: HeaderMap) -> Response {
+    let url = public_url(&headers);
+    let script = include_str!("../../install.sh").replacen("cloud=${AVP_CLOUD_URL:-}", &format!("cloud=${{AVP_CLOUD_URL:-{url}}}"), 1);
+    ([(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], script).into_response()
+}
+
+const DEVICE_PAGE: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>Log in a machine - AVP</title>
+<style>
+:root { --bg: #000; --card: #0c0c0c; --line: #232323; --fg: #ececec; --act: #fff; --mut: #8d8d8d; --green: #3ccf74; --red: #ff5a52; --ease: cubic-bezier(.2, .8, .2, 1); }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg); }
+body { font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif; -webkit-font-smoothing: antialiased; display: grid; place-items: center; min-height: 100vh; padding: 24px; }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.card { width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 32px 28px; animation: rise .45s var(--ease); }
+h1 { font-size: 24px; font-weight: 680; letter-spacing: -.02em; margin: 0 0 6px; }
+p { color: var(--mut); margin: 0 0 22px; }
+p b { color: var(--fg); font-weight: 580; }
+input { width: 100%; font: 600 26px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .14em; text-align: center; text-transform: uppercase; color: var(--act); background: #000; border: 1px solid var(--line); border-radius: 12px; padding: 16px 12px; outline: none; transition: border-color .2s; }
+input:focus { border-color: var(--mut); }
+input.small { font: 14px/1.4 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0; text-transform: none; text-align: left; padding: 12px; }
+.row { display: flex; gap: 10px; margin-top: 18px; }
+button { flex: 1; font: inherit; font-weight: 600; border-radius: 12px; padding: 12px; cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--fg); transition: transform .12s var(--ease), background .2s; }
+button.go { background: var(--act); color: #000; border-color: var(--act); }
+button:active { transform: scale(.97); }
+button:disabled { opacity: .5; cursor: default; }
+.said { margin-top: 18px; min-height: 1.5em; color: var(--mut); }
+.said.ok { color: var(--green); }
+.said.no { color: var(--red); }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main class="card">
+  <section id="signin" hidden>
+    <h1>Sign in first</h1>
+    <p>A machine asks to work as you on this server. Sign in, then approve it here.</p>
+    <input id="token" class="small" placeholder="your token (avp_...)" autocomplete="off" spellcheck="false">
+    <div class="row"><button class="go" id="in">Sign in</button></div>
+    <p class="said" id="other"></p>
+  </section>
+  <section id="approve" hidden>
+    <h1>Log in a machine</h1>
+    <p id="as">Check that the code is the one your terminal shows.</p>
+    <input id="code" maxlength="9" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX">
+    <div class="row"><button id="deny">Deny</button><button class="go" id="yes">Approve</button></div>
+  </section>
+  <div class="said" id="said" aria-live="polite"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const live = { "x-avp-live": "1", "content-type": "application/json" };
+const say = (text, kind) => { $("said").textContent = text; $("said").className = "said" + (kind ? " " + kind : ""); };
+const code = new URLSearchParams(location.search).get("code") || "";
+$("code").value = code;
+
+async function peek() {
+  const c = $("code").value.trim();
+  if (!c) return;
+  const r = await fetch("/login/device/peek?code=" + encodeURIComponent(c));
+  const m = (await r.json()).machine;
+  say(m ? "Asked by " + m + "." : "No login waits with this code: it ended or was mistyped.", m ? "" : "no");
+}
+
+async function start() {
+  const r = await fetch("/me", { headers: live });
+  const me = r.ok ? await r.json() : null;
+  if (me && me.via === "token" && me.person) {
+    $("approve").hidden = false;
+    $("as").innerHTML = "Signed in as <b></b>. Check that the code is the one your terminal shows.";
+    $("as").querySelector("b").textContent = me.person;
+    peek();
+  } else {
+    $("signin").hidden = false;
+    $("other").innerHTML = 'Or sign in another way on <a href="/live" style="color:inherit;text-decoration:underline">AVP Live</a>, then come back to this page.';
+  }
+}
+
+$("in").onclick = async () => {
+  const r = await fetch("/session", { method: "POST", headers: live, body: JSON.stringify({ token: $("token").value.trim() }) });
+  if (!r.ok) return say((await r.json().catch(() => ({}))).error || "That token does not sign in here.", "no");
+  $("signin").hidden = true; say(""); start();
+};
+
+async function answer(deny) {
+  $("yes").disabled = $("deny").disabled = true;
+  const r = await fetch("/login/device/approve", { method: "POST", headers: live, body: JSON.stringify({ code: $("code").value, deny }) });
+  const b = await r.json().catch(() => ({}));
+  if (!r.ok) { $("yes").disabled = $("deny").disabled = false; return say(b.error || "That did not work.", "no"); }
+  $("approve").hidden = true;
+  say(deny ? "Denied: " + b.machine + " stays logged out." : b.machine + " is logged in as " + b.person + ". Back to your terminal.", deny ? "no" : "ok");
+}
+$("yes").onclick = () => answer(false);
+$("deny").onclick = () => answer(true);
+$("code").onchange = peek;
+start();
+</script>
+</body>
+</html>
+"##;
 
 #[cfg(test)]
 mod tests {
@@ -1038,6 +1775,39 @@ mod tests {
         assert!(matches!(check_token(&db, &other.token).unwrap(), Checked::Revoked), "a person removed: their tokens stop");
         let kinds: Vec<String> = account_events(&db, 0, 100).unwrap().into_iter().map(|e| format!("{} by {}", e.kind, e.data["by"].as_str().unwrap())).collect();
         assert!(kinds.contains(&"user.added by server".into()) && kinds.contains(&"token.revoked by bob".into()) && kinds.contains(&"user.removed by ada".into()), "{kinds:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_device_login_gives_its_token_once_to_the_person_who_approved_it() {
+        let dir = std::env::temp_dir().join(format!("avp-device-{}", new_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("avp.sqlite")).unwrap();
+        add_user(&db, "ada", None, None, false, "server").unwrap();
+        let s = device_start("ada on laptop").unwrap();
+        assert!(s.user_code.len() == 9 && s.user_code.as_bytes()[4] == b'-', "{}", s.user_code);
+        assert!(matches!(device_poll(&db, &s.device_code).unwrap(), Polled::Pending));
+        assert_eq!(device_named(&s.user_code.to_lowercase().replace('-', " ")).as_deref(), Some("ada on laptop"), "typed in any case, any spacing");
+        assert!(device_decide("BBBB-BBBB", "ada", true).is_err(), "a code that waits for nothing");
+
+        assert_eq!(device_decide(&s.user_code, "ada", true).unwrap(), "ada on laptop");
+        assert!(device_decide(&s.user_code, "ada", true).is_err(), "answered once");
+        let Polled::Approved(t) = device_poll(&db, &s.device_code).unwrap() else { panic!("approved") };
+        assert_eq!((t.info.person.as_str(), t.info.name.as_str()), ("ada", "avp login (ada on laptop)"));
+        assert!(matches!(check_token(&db, &t.token).unwrap(), Checked::Person(u) if u.name == "ada"));
+        assert!(matches!(device_poll(&db, &s.device_code).unwrap(), Polled::Gone), "single use");
+
+        let no = device_start("someone else").unwrap();
+        device_decide(&no.user_code, "ada", false).unwrap();
+        assert!(matches!(device_poll(&db, &no.device_code).unwrap(), Polled::Denied(by) if by == "ada"));
+        assert!(matches!(device_poll(&db, &no.device_code).unwrap(), Polled::Gone));
+
+        let late = device_start("slow").unwrap();
+        devices().get_mut(&hash(&late.device_code)).unwrap().expires_at = now_ms() - 1;
+        assert!(matches!(device_poll(&db, &late.device_code).unwrap(), Polled::Gone), "short-lived");
+        assert!(device_decide(&late.user_code, "ada", true).is_err());
+        assert_eq!(need(&Method::POST, "/login/device/approve"), Need::Person, "approved by a signed-in person");
+        assert_eq!(need(&Method::POST, "/login/device/token"), Need::Nothing, "polled before any token");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

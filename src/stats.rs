@@ -86,7 +86,17 @@ pub struct Stats {
     pub proofs_blocked: usize,
     /// How long a task's proof took, from its first step to its last (split shares side by side).
     pub proof_duration: Spread,
+    /// Proofs that say where their time went (AVP 0.6.1 and later): the agent's whole wait, the
+    /// wait for a machine, the preparation, and how many had to install their dependencies.
+    pub proof_total: Spread,
+    pub proof_wait: Spread,
+    pub proof_prep: Spread,
+    pub setup_misses: usize,
     pub machine_minutes: MachineMinutes,
+    /// What the machine time cost, when the server knows its machines' price per hour
+    /// (AVP_MACHINE_HOUR_USD): in all, and for one landing.
+    pub cost_usd: Option<f64>,
+    pub cost_per_landing_usd: Option<f64>,
     /// Times a task was replayed because the line moved under it, the tasks it happened to, and
     /// the replays that handed conflicts back to their agent.
     pub replays: usize,
@@ -97,6 +107,11 @@ pub struct Stats {
     pub full_suites: usize,
     pub full_red: usize,
     pub flaky: usize,
+    /// The full suites red in the window as long just before this one: when what the proofs miss
+    /// grows, the test files `[check] auto_skip` leaves out are the first suspects.
+    pub full_red_before: Option<usize>,
+    /// The test files `[check] auto_skip` leaves out of the proofs now.
+    pub tests_left_out: usize,
     /// Landings that undo a position (`avp revert`).
     pub reverts: usize,
     pub by_agent: BTreeMap<String, usize>,
@@ -255,9 +270,18 @@ pub fn text(s: &Stats) -> String {
         rows.push(("  by person".into(), tally(&s.by_person)));
     }
     rows.push(("Checking one change".into(), format!("{}; {}, {} red, {} blocked", median_p90(&s.proof_duration), count(s.proofs, "proof"), s.proofs_red, s.proofs_blocked)));
+    if s.proof_total.count > 0 {
+        rows.push(("  end to end".into(), format!("{}; waiting {}, preparing {} (median), dependencies installed {}", median_p90(&s.proof_total), duration(s.proof_wait.median_s), duration(s.proof_prep.median_s), count(s.setup_misses, "time"))));
+    }
     rows.push(("Full suite".into(), format!("{} (median) after landing; {}, {} red, {}", duration(s.landed_to_full.median_s), count(s.full_suites, "run"), s.full_red, count(s.flaky, "flaky rerun"))));
     let m = &s.machine_minutes;
     rows.push(("CI machine time".into(), format!("{} min: {} in proofs, {} in full suites", thousands(m.total), thousands(m.proofs), thousands(m.full_suites))));
+    if let (Some(all), Some(one)) = (s.cost_usd, s.cost_per_landing_usd) {
+        rows.push(("  cost".into(), format!("${all:.2}, ${one:.2} per landing")));
+    }
+    if s.landings > 0 || s.tests_left_out > 0 {
+        rows.push(("Missed by the proof".into(), missed(s)));
+    }
     rows.push(("The line moved".into(), format!("{} of {}, {} handed back", count(s.replays, "replay"), count(s.tasks_replayed, "task"), count(s.conflicts, "conflict"))));
     if let Some(b) = &s.before {
         rows.push(("Before AVP".into(), format!("{}, {} (median) to main, {} min of CI: {}, {}", count(b.pull_requests, "pull request"), duration(b.opened_to_merged.median_s), thousands(b.job_minutes), b.repo, span(&b.since, &b.until))));
@@ -265,6 +289,24 @@ pub fn text(s: &Stats) -> String {
     let mut out = format!("{} on AVP, {}\n", s.repo, span(&s.since, &s.until));
     for (k, v) in rows {
         out.push_str(&format!("\n  {k:<21}{v}"));
+    }
+    out
+}
+
+/// The guard of `[check] auto_skip`: what went red only in the full suite, whether it grew since the
+/// window before, and what to read when it did.
+fn missed(s: &Stats) -> String {
+    let mut out = format!("{} of {} landings went red only in the full suite", s.full_red, s.landings);
+    if s.landings > 0 {
+        out.push_str(&format!(" ({:.1} %)", 100.0 * s.full_red as f64 / s.landings as f64));
+    }
+    if let Some(before) = s.full_red_before.filter(|b| s.full_red > *b) {
+        out.push_str(&format!(", up from {before} the window before"));
+        if s.tests_left_out > 0 {
+            out.push_str(&format!(": {} left out of the proofs by auto_skip, `avp tests` names them", count(s.tests_left_out, "test file")));
+        }
+    } else if s.tests_left_out > 0 {
+        out.push_str(&format!("; {} left out of the proofs by auto_skip", count(s.tests_left_out, "test file")));
     }
     out
 }
@@ -467,5 +509,13 @@ mod tests {
         let t = text(&Stats { repo: "shop".into(), before: Some(b), ..Default::default() });
         assert!(t.contains("Before AVP           12 pull requests, 91 min (median) to main, 900 min of CI: acme/shop, 2026-10-01"), "{t}");
         assert!(!text(&Stats::default()).contains("Before AVP"));
+    }
+
+    #[test]
+    fn the_guard_says_when_what_the_proofs_miss_grows() {
+        let s = Stats { landings: 40, full_red: 3, full_red_before: Some(1), tests_left_out: 4, ..Default::default() };
+        assert!(text(&s).contains("3 of 40 landings went red only in the full suite (7.5 %), up from 1 the window before: 4 test files left out of the proofs by auto_skip, `avp tests` names them"), "{}", text(&s));
+        let calm = text(&Stats { full_red_before: Some(3), ..s });
+        assert!(calm.contains("(7.5 %); 4 test files left out of the proofs by auto_skip") && !calm.contains("up from"), "{calm}");
     }
 }

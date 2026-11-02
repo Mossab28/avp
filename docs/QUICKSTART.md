@@ -1,26 +1,51 @@
 # Your first 15 minutes
 
-You put AVP on a repo, ask an agent for a change, watch it land, make two agents change the same
-file, then read the line. The words are explained in [CONCEPTS.md](CONCEPTS.md).
+You plug your repo and your coding agent into AVP Cloud, ask the agent for a change, watch it land,
+make two agents change the same file, then read the line. The words are explained in
+[CONCEPTS.md](CONCEPTS.md).
 
-Every output below is real. It comes from a small Node project, `shop`: three commits, a
-`src/price.js` with `formatPrice` and `applyDiscount`, and `npm test` running `node --test`. Use
-your own repo: only the names change. You need git, and the tools your tests need.
+The outputs below come from a small Node project, `shop`: three commits, a `src/price.js` with
+`formatPrice` and `applyDiscount`, and `npm test` running `node --test`. Use your own repo: only the
+names change. You need git, and the tools your tests need. No GitHub account, no CI to set up.
 
 ## 1. Install (1 minute)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mossab28/avp/main/install.sh | sh
-avp --version
+curl -fsSL https://cloud.murmell.com/install | sh
 ```
 
 ```
-avp 0.5.0
+avp 0.6.1 installed in ~/.local/bin
+next: avp login https://cloud.murmell.com
+then, in a git checkout: avp up (your agents work on AVP Cloud)
 ```
 
-macOS and Linux, x86_64 and arm64; on Windows, inside WSL. The binary goes in `~/.local/bin`.
+macOS and Linux, x86_64 and arm64; on Windows, inside WSL. Any AVP server serves the same script
+at `/install`, with its own address in it: `curl -fsSL https://avp.example.com/install | sh`.
 
-## 2. `avp up` in your repo (1 minute)
+## 2. Log in (1 minute)
+
+```sh
+avp login
+```
+
+```
+Open https://cloud.murmell.com/login/device?code=KXQD-TMRB
+and approve this machine: the page shows the code KXQD-TMRB, check it is the one here.
+Waiting for your approval (10 minutes at most)...
+logged in to https://cloud.murmell.com as alice: the token is kept in ~/.config/avp/credentials (yours alone to read)
+next, in a git checkout: `avp up`, then ask your agent for a change
+```
+
+The browser opens the page; sign in there, check the code, approve. From then on every command
+works as you on AVP Cloud: no `AVP_SERVER` nor `AVP_TOKEN` to set. `avp whoami` says who you are
+there, `avp logout` forgets the login and revokes its token. `avp login <server>` logs in to your
+team's own AVP server instead; each server keeps its own login, and commands talk to the last one.
+
+In CI, where nobody opens a browser: `avp login --token -` reads a token (`avp token create`) from
+stdin, checks it with the server and keeps it the same way.
+
+## 3. `avp up` in your repo (1 minute)
 
 ```sh
 cd shop
@@ -30,30 +55,29 @@ avp up
 ```
 3/3 positions
 landing avp.toml (tests): its first proof installs the dependencies once...
-a change to the checks waits for a person's word: approved as alice, who ran avp up
 AVP is on for ~/shop
-  server   http://127.0.0.1:7117 (started, data in ~/.avp/data)
-  repo     shop, imported: the last 3 commits of HEAD are positions 0 to 2
+  server   https://cloud.murmell.com (running), as alice
+  repo     shop, imported: the last 3 commits of HEAD are positions 0 to 2, in acme
   checks   avp.toml landed at position 3: tests
-  mirror   every landed task becomes a commit on the local branch avp/line (no push)
+  mirror   none from this checkout: the team server mirrors its line (--mirror to run one here)
   agents   Claude Code  wired: MCP server for this folder
            Codex        wired: .codex/config.toml, rule in AGENTS.md (Codex loads it once it trusts this folder)
            OpenCode     wired: opencode.json, rule in AGENTS.md
            not installed: Cursor, Gemini CLI, Copilot (VS Code), Copilot CLI, Qwen Code, Kiro, Zed, Amp, Windsurf, Cline, Aider
   folders  agents work in ~/avp/<repo>-<n>, one each at a time: taken again with its install, or cloned from the head with the install of a folder whose lockfiles are the same
 Your branches, main and the files here are untouched. Start Claude Code, Codex or OpenCode in this folder and ask for a change:
-it opens a task, proves it, lands it, and the mirror writes it on avp/line. `avp log` shows the line, `avp down` stops the mirror.
+it opens a task, proves it, and lands it on the team's line. `avp log` shows the line.
 ```
 
-It took under 2 seconds. Line by line:
+Line by line:
 
-- **server**: a local AVP server, on this machine only.
-- **repo**: your last commits (50 at most) became the first positions of the line.
+- **server**: AVP Cloud, and who it takes you for.
+- **repo**: created there, in your organization (`acme`; in several, `avp up` asks which, or
+  `--org acme`; in none, your own space): your last commits (50 at most) became the first
+  positions of the line.
 - **checks**: what every change must pass before it lands, guessed from the project and landed as
-  `avp.toml`. A change to the checks always waits for a person; you ran `avp up`, so you are that
-  person. Read it with `avp show 3`, and edit it as any other file, in a task.
-- **mirror**: every landing becomes a git commit on the branch `avp/line`. With a remote `origin`,
-  it is pushed there too.
+  `avp.toml`. Read it with `avp show 3`, and edit it as any other file, in a task.
+- **mirror**: AVP Cloud keeps the line; your git checkout stays as it was.
 - **agents**: each coding agent installed on this machine, wired through its own project config:
   the MCP server it reaches AVP through, and the AVP rule in `AGENTS.md` (or the file it reads).
   `avp agents` prints this list again.
@@ -63,7 +87,14 @@ It took under 2 seconds. Line by line:
 `git status` says nothing: the files `avp up` wrote (here `.claude/settings.local.json`,
 `.codex/config.toml`, `opencode.json`, `AGENTS.md`) are listed in `.git/info/exclude`.
 
-## 3. Ask your agent for a change (3 minutes)
+On another machine, or for a teammate's repo already on AVP Cloud: `avp clone acme/shop` lays its
+head out in a new folder, `./shop`, and wires the agents found there the same way.
+
+Without logging in, `avp up` runs everything on this machine instead: a local AVP server (data in
+`~/.avp/data`), and a mirror that writes every landing as a git commit on the branch `avp/line`,
+pushed to `origin` when there is one. `avp down` stops it.
+
+## 4. Ask your agent for a change (3 minutes)
 
 Start your agent in the repo's folder and ask for a change, as you always do. Nothing to say about
 AVP: it finds the tools by itself. Here, Claude Code was asked:
@@ -108,7 +139,7 @@ The proof ran `npm test` on the head of the line plus the agent's change, it was
 change is position 4. Had it been red, the agent would have read the failing output in that answer,
 fixed, and landed again.
 
-## 4. Two agents, one file (3 minutes)
+## 5. Two agents, one file (3 minutes)
 
 Start a second agent beside the first: Claude Code in one terminal, Codex in another. Ask each for
 a change to `src/price.js`:
@@ -169,14 +200,15 @@ Only two changes to the same lines of the same file end in conflict markers. The
 agent's `avp_land` answers `not landed: conflict` with the files, the markers are in its folder, it
 settles them and lands again.
 
-## 5. AVP Live (1 minute)
+## 6. AVP Live (1 minute)
 
-Open <http://127.0.0.1:7117/live> in a browser. It shows the line as it moves: each landing, the
+Open <https://cloud.murmell.com/live> in a browser (<http://127.0.0.1:7117/live> for a local
+server). It shows the line as it moves: each landing, the
 tasks at work, and what each position changed (click one). Its left rail has six views: Overview,
 Line, Review (what waits for a person), Stats, Environments and Setup. It shows the newest repo of
 the server; `/live?repo=shop` picks one.
 
-## 6. Read the line (5 minutes)
+## 7. Read the line (5 minutes)
 
 The line, newest first:
 
@@ -274,8 +306,8 @@ shop on AVP, 2026-10-21 18:45 to 2026-10-28 18:45 UTC (7 days)
   The line moved       1 replay of 1 task, 0 conflicts handed back
 ```
 
-And git still has it all. Each landing is a commit on `avp/line`, with the task, the agent and the
-proof in its trailers:
+And git still has it all. With a local server, each landing is a commit on `avp/line`, with the
+task, the agent and the proof in its trailers (`avp mirror` writes the same from AVP Cloud's line):
 
 ```sh
 git log --oneline avp/line
@@ -308,6 +340,9 @@ Date:   Wed Oct 28 18:45:00 2026 +0000
 ```
 
 ## When you are done
+
+On AVP Cloud there is nothing to stop: `avp logout` forgets this machine's login. A local server
+stops with:
 
 ```sh
 avp down

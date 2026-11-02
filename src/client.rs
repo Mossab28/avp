@@ -15,11 +15,111 @@ fn token_header(base: &str) -> Option<reqwest::header::HeaderValue> {
     if has_userinfo {
         return None;
     }
-    let token = std::env::var("AVP_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())?;
-    let user = ["AVP_USER", "AVP_PERSON"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty())).unwrap_or_else(|| "avp".into());
+    let (user, token) = match std::env::var("AVP_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        Some(token) => (["AVP_USER", "AVP_PERSON"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty())).unwrap_or_else(|| "avp".into()), token),
+        // No token in the environment: the one `avp login` kept for this server, if any.
+        None => Credentials::load().get(base).map(|l| (l.person.clone(), l.token.clone()))?,
+    };
     let mut value = reqwest::header::HeaderValue::from_str(&format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{token}", user.trim())))).ok()?;
     value.set_sensitive(true);
     Some(value)
+}
+
+/// AVP Cloud, what `avp login` logs in to unless told another server: `AVP_CLOUD_URL` when this
+/// avp runs, else as it was built, else AVP's own.
+pub fn cloud_url() -> String {
+    let set = |v: Option<String>| v.map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty());
+    set(std::env::var("AVP_CLOUD_URL").ok()).or_else(|| set(option_env!("AVP_CLOUD_URL").map(String::from))).unwrap_or_else(|| "https://cloud.murmell.com".into())
+}
+
+/// A server's address as credentials know it: `https://` when none is said, no trailing slash.
+pub fn server_url(s: &str) -> String {
+    let s = s.trim().trim_end_matches('/');
+    if s.contains("://") { s.to_string() } else { format!("https://{s}") }
+}
+
+/// One server's login, kept by `avp login`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Login {
+    pub person: String,
+    pub token: String,
+    /// The token's id, for `avp logout` to revoke it (none for a token given with `--token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    pub at: i64,
+}
+
+/// What `avp login` keeps, in ~/.config/avp/credentials (readable by its owner alone): a login per
+/// server, and the one logged in to last, which every command talks to when nothing names another
+/// (no AVP_SERVER, no --server, no view of another server).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Credentials {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, Login>,
+}
+
+impl Credentials {
+    /// `$XDG_CONFIG_HOME/avp/credentials`, else `~/.config/avp/credentials`.
+    pub fn path() -> std::path::PathBuf {
+        let config = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        config.unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".config")).join("avp").join("credentials")
+    }
+
+    /// The file's logins; none when it is missing or unreadable (a command then asks as before).
+    pub fn load() -> Self {
+        Self::read(&Self::path())
+    }
+
+    fn read(p: &std::path::Path) -> Self {
+        std::fs::read_to_string(p).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    /// Written whole, readable by its owner alone, its folder too: a token is a password.
+    pub fn save(&self) -> Result<()> {
+        self.write(&Self::path())
+    }
+
+    fn write(&self, p: &std::path::Path) -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        let dir = p.parent().ok_or_else(|| anyhow!("{}: no folder", p.display()))?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let text = format!("# avp login: a token per server, a password each. `avp logout` takes one out.\n{}", toml::to_string(self)?);
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+        // A file made before with wider permissions keeps them through `mode`: narrowed first.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(text.as_bytes())?;
+        Ok(())
+    }
+
+    /// The login kept for the server at `base` (its address alone: a path after it is the repo's).
+    pub fn get(&self, base: &str) -> Option<&Login> {
+        self.servers.get(&server_url(base))
+    }
+
+    pub fn set(&mut self, server: &str, login: Login) {
+        let server = server_url(server);
+        self.current = Some(server.clone());
+        self.servers.insert(server, login);
+    }
+
+    /// Takes the server's login out; the last one logged in to stays current, if any is left.
+    pub fn remove(&mut self, server: &str) -> Option<Login> {
+        let server = server_url(server);
+        let gone = self.servers.remove(&server);
+        if self.current.as_deref() == Some(server.as_str()) {
+            self.current = self.servers.iter().max_by_key(|(_, l)| l.at).map(|(s, _)| s.clone());
+        }
+        gone
+    }
+}
+
+/// The server logged in to last, for a command that names none.
+pub fn logged_in() -> Option<String> {
+    let c = Credentials::load();
+    c.current.filter(|s| c.servers.contains_key(s))
 }
 
 /// The server did not answer: a proxy in front of it says it is down (502, 503, 504), or AVP's
@@ -80,12 +180,26 @@ pub struct Client {
 
 impl Client {
     pub fn new(base: &str) -> Self {
+        Self::build(base, token_header(base))
+    }
+
+    /// A client that presents `token` whatever the environment and the credentials say: what
+    /// `avp login --token` checks, what `avp logout` revokes.
+    pub fn with_token(base: &str, token: &str) -> Self {
+        let auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).ok().map(|mut v| {
+            v.set_sensitive(true);
+            v
+        });
+        Self::build(base, auth)
+    }
+
+    fn build(base: &str, auth: Option<reqwest::header::HeaderValue>) -> Self {
         // A connection that does not come within seconds will not come: the Wi-Fi dropped, and
         // the command goes to the outbox instead of hanging. Once connected, nothing cuts a request
         // (the blocking client's default is 30 s): a land waits for its proof, a download for its
         // last byte, however long; TCP keepalive (reqwest's, every 15 s) finds a link gone dead.
         let mut http = Http::builder().timeout(None).connect_timeout(std::time::Duration::from_secs(5));
-        if let Some(auth) = token_header(base) {
+        if let Some(auth) = auth {
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(reqwest::header::AUTHORIZATION, auth);
             http = http.default_headers(headers);
@@ -178,6 +292,12 @@ impl Client {
         let r = self.http.put(format!("{}/repos/{repo}/objects/{hash}", self.base)).body(bytes).send()?;
         let _: serde_json::Value = Self::take(r)?;
         Ok(hash)
+    }
+    /// A file as the body of a PUT, streamed from disk: a git history may not fit in memory.
+    pub fn put_file<T: DeserializeOwned>(&self, path: &str, file: &std::path::Path) -> Result<T> {
+        let f = std::fs::File::open(file)?;
+        let len = f.metadata()?.len();
+        Self::take(self.http.put(format!("{}{path}", self.base)).header(reqwest::header::CONTENT_LENGTH, len).body(reqwest::blocking::Body::sized(f, len)).send()?)
     }
     pub fn get_object(&self, repo: &str, hash: &str) -> Result<Vec<u8>> {
         let r = self.http.get(format!("{}/repos/{repo}/objects/{hash}", self.base)).send()?;
@@ -340,4 +460,38 @@ pub fn diff_stat(files: &[crate::engine::Diffed], color: bool) -> String {
     let s = |n: usize| if n == 1 { "" } else { "s" };
     out.push_str(&format!(" {} file{} changed, {added} insertion{}(+), {removed} deletion{}(-)\n", files.len(), s(files.len()), s(added), s(removed)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn credentials_keep_a_login_per_server_for_their_owner_alone() {
+        let dir = std::env::temp_dir().join(format!("avp-creds-{}", ulid::Ulid::new()));
+        let p = dir.join("avp").join("credentials");
+        let login = |person: &str, at: i64| Login { person: person.into(), token: format!("avp_{person}"), token_id: Some(format!("tok_{person}")), at };
+        let mut c = Credentials::default();
+        c.set("cloud.example.com/", login("ada", 1));
+        c.set("http://127.0.0.1:7117", login("bob", 2));
+        c.write(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "a token is a password");
+        assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        let back = Credentials::read(&p);
+        assert_eq!(back, c);
+        assert_eq!(back.current.as_deref(), Some("http://127.0.0.1:7117"), "the last login is the one commands talk to");
+        assert_eq!(back.get("https://cloud.example.com").map(|l| l.person.as_str()), Some("ada"), "one server, however its address is written");
+        assert!(back.get("https://other.example.com").is_none(), "a token goes to its own server alone");
+
+        // Wider permissions from before are narrowed on the next write.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = back;
+        assert_eq!(c.remove("http://127.0.0.1:7117").map(|l| l.person), Some("bob".into()));
+        assert_eq!(c.current.as_deref(), Some("https://cloud.example.com"), "logged out of one, the other stays current");
+        c.write(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(Credentials::read(&dir.join("none")).servers.is_empty(), "no file: no login");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
