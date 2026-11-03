@@ -372,6 +372,12 @@ pub struct TaskStatus {
     /// A task landed together with others (`avp land --with`): those others, landed at the same position.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub with: Vec<String>,
+    /// Where the proof running now stands: queued (so many ahead), preparing, a step's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
+    /// Leases of this task another task took over since it opened: `path taken over by task <id>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taken_over: Vec<String>,
 }
 
 /// What the server says each time an open task's `avp wait` looks (`POST .../waits`). It remembers
@@ -441,7 +447,24 @@ pub struct Landed {
     /// With `--with`: the other tasks proven with this one as one candidate, landed at the same position.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub with: Vec<String>,
+    /// How many checks the proof ran: 0 says the landing proved nothing (avp.toml has no steps).
+    /// None from a server before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<usize>,
 }
+
+/// A write's lease, as a person or an agent reads it beside the path.
+pub fn lease_said(lease: &str, previous_holder: Option<&str>) -> String {
+    match (lease, previous_holder) {
+        ("taken_over", Some(h)) => format!("task {h} held it: you both edit it now, the later to land replays on the other or settles a conflict"),
+        ("refused", Some(h)) => format!("refused: task {h} holds it and the repo is strict"),
+        ("held" | "taken", _) => "yours".into(),
+        (other, h) => format!("{other}{}", h.map(|h| format!(" from {h}")).unwrap_or_default()),
+    }
+}
+
+/// What a landing says of its proof when it ran no check.
+pub const NO_CHECKS: &str = "no checks ran: avp.toml has no [[check.steps]]";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NotLanded {
@@ -486,9 +509,14 @@ pub struct ImportEntry {
 }
 
 /// A path a tree may hold: relative, `/`-separated, with no empty, `.` or `..` part, no
-/// backslash and no NUL. Anything else could write outside the folder it is laid out in.
+/// backslash and no NUL. Anything else could write outside the folder it is laid out in. Nor a
+/// `.git` part (git refuses one too): a view is often a git checkout, and a repo's
+/// `.git/hooks/pre-commit` or `.git/config` laid out there would run on whoever opens it.
 pub fn safe_path(p: &str) -> bool {
-    !p.is_empty() && !p.starts_with('/') && !p.contains('\\') && !p.contains('\0') && p.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+    // As a case-insensitive disk reads a name (macOS, Windows): `.GIT`, `.git.`, `git~1`, `.g\u{200c}it`.
+    let read = |c: &str| c.chars().filter(|ch| !matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')).collect::<String>().to_lowercase().trim_end_matches(['.', ' ']).to_string();
+    !p.is_empty() && !p.starts_with('/') && !p.contains('\\') && !p.contains('\0')
+        && p.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && !matches!(read(c).as_str(), ".git" | "git~1"))
 }
 
 pub fn now_ms() -> i64 {

@@ -112,7 +112,15 @@ impl Plan {
     pub fn cap(self) -> Option<f64> {
         (self == Plan::Free).then(free_minutes)
     }
+
+    /// The people an organization on it may reach; None, as many as it pays for.
+    pub fn seats(self) -> Option<usize> {
+        (self == Plan::Free).then_some(FREE_SEATS)
+    }
 }
+
+/// The free plan's seats: an organization of three people at most.
+pub const FREE_SEATS: usize = 3;
 
 /// The free plan's proof minutes a month: `AVP_FREE_MINUTES`, 2000 unless it says otherwise.
 pub fn free_minutes() -> f64 {
@@ -199,7 +207,7 @@ fn visible(db: &Db, name: &str, who: &Who) -> Result<(Org, Option<OrgRole>)> {
 }
 
 /// An organization the asker may run: its admins' and owners', a server admin's.
-fn administered(db: &Db, name: &str, who: &Who) -> Result<(Org, Option<OrgRole>)> {
+pub(crate) fn administered(db: &Db, name: &str, who: &Who) -> Result<(Org, Option<OrgRole>)> {
     let (o, role) = visible(db, name, who)?;
     anyhow::ensure!(who.root() || role >= Some(OrgRole::Admin), Forbidden(format!("{} is a member of {name}: its admins and owners invite, give roles and bring repos in", who.name())));
     Ok((o, role))
@@ -210,6 +218,7 @@ fn administered(db: &Db, name: &str, who: &Who) -> Result<(Org, Option<OrgRole>)
 pub fn create(db: &Db, name: &str, by: &str) -> Result<Org> {
     needs_cloud()?;
     auth::valid_name(name, "an organization's")?;
+    auth::not_reserved(name)?;
     anyhow::ensure!(org(db, name)?.is_none() && auth::user(db, name)?.is_none(), "{name} is taken, by an organization or a person: choose another name");
     let o = Org { name: name.into(), plan: Plan::Free, created_at: now_ms(), created_by: by.into() };
     db.conn.execute("INSERT INTO orgs (name, plan, created_at, created_by) VALUES (?1, ?2, ?3, ?4)", params![o.name, o.plan.as_str(), o.created_at, o.created_by])?;
@@ -217,6 +226,38 @@ pub fn create(db: &Db, name: &str, by: &str) -> Result<Org> {
     db.emit(SERVER, "org.created", None, None, json!({ "org": name, "plan": o.plan, "by": by }))?;
     db.emit(SERVER, "org.member", None, None, json!({ "org": name, "person": by, "role": "owner", "was": "none", "by": by }))?;
     Ok(o)
+}
+
+/// An organization's new name, by an owner or an admin of it: its members, invites and repos follow,
+/// and its repos' old names stay as they were.
+pub fn rename(db: &Db, name: &str, to: &str, who: &Who) -> Result<Org> {
+    needs_cloud()?;
+    let (mut o, _) = administered(db, name, who)?;
+    auth::valid_name(to, "an organization's")?;
+    auth::not_reserved(to)?;
+    anyhow::ensure!(to != name, "{name} already has this name");
+    anyhow::ensure!(org(db, to)?.is_none() && auth::user(db, to)?.is_none(), "{to} is taken, by an organization or a person: choose another name");
+    for (table, col) in [("orgs", "name"), ("members", "org"), ("invites", "org"), ("repos", "org"), ("repo_names", "space")] {
+        db.conn.execute(&format!("UPDATE {table} SET {col} = ?2 WHERE {col} = ?1"), params![name, to])?;
+    }
+    forget_usage();
+    db.emit(SERVER, "org.renamed", None, None, json!({ "org": to, "was": name, "by": who.name() }))?;
+    o.name = to.into();
+    Ok(o)
+}
+
+/// An organization with no repo left, ended by an owner or an admin of it.
+pub fn delete(db: &Db, name: &str, who: &Who) -> Result<()> {
+    needs_cloud()?;
+    administered(db, name, who)?;
+    let repos: i64 = db.conn.query_row("SELECT COUNT(*) FROM repos WHERE org = ?1", params![name], |r| r.get(0))?;
+    anyhow::ensure!(repos == 0, "{name} still holds {repos} repo{}: move them out or delete them first (`avp repo transfer`, `avp repo delete`)", if repos == 1 { "" } else { "s" });
+    for (table, col) in [("members", "org"), ("invites", "org"), ("orgs", "name")] {
+        db.conn.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), params![name])?;
+    }
+    forget_usage();
+    db.emit(SERVER, "org.deleted", None, None, json!({ "org": name, "by": who.name() }))?;
+    Ok(())
 }
 
 /// Changes a member's role, or takes them out (None). Only an owner makes or unmakes an owner, and
@@ -239,6 +280,15 @@ pub fn set_member(db: &Db, name: &str, person: &str, role: Option<OrgRole>, who:
     if was != role {
         db.emit(SERVER, "org.member", None, None, json!({ "org": name, "person": person, "role": role_name(role), "was": role_name(was), "by": who.name() }))?;
     }
+    // Out of the organization, out of its repos: a role given on one of them (the admin role of the
+    // repo they brought in included) does not outlive their seat. Each goes in the repo's audit.
+    if role.is_none() {
+        let mut st = db.conn.prepare("SELECT x.repo FROM roles x JOIN repos r ON r.id = x.repo WHERE r.org = ?1 AND x.person = ?2")?;
+        let held = st.query_map(params![name, person], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in held {
+            auth::set_role(db, &db.repo(&id)?, person, None, &who.name())?;
+        }
+    }
     Ok(was)
 }
 
@@ -255,6 +305,11 @@ pub fn invite(db: &Db, name: &str, to: &str, role: OrgRole, who: &Who) -> Result
         anyhow::ensure!(member(db, name, to)?.is_none(), "{to} is already a member of {name}: `avp org role {name} {to} <role>` changes their role");
         (Some(to.to_string()), None)
     };
+    let key = match (&person, &email) {
+        (Some(p), _) => p.clone(),
+        (None, e) => person_of_email(db, e.as_deref().unwrap_or_default())?.unwrap_or_else(|| e.clone().unwrap_or_default()),
+    };
+    room_for(db, name, &[key])?;
     let i = Invite { id: new_id("inv"), org: name.into(), person, email, role, by: who.name(), at: now_ms() };
     db.conn.execute(&format!("INSERT INTO invites ({INVITE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"), params![i.id, i.org, i.person, i.email, i.role.as_str(), i.by, i.at])?;
     db.emit(SERVER, "org.invited", None, None, json!({ "org": name, "id": i.id, "person": i.person, "email": i.email, "role": role, "by": i.by }))?;
@@ -322,10 +377,12 @@ pub fn bring_repo(db: &Db, name: &str, repo: &str, who: &Who) -> Result<Repo> {
         anyhow::ensure!(u.admin || auth::role(db, &r.id, &u.name)? == Some(Role::Admin), Forbidden(format!("{} is no admin of {}: an admin of the repo brings it into an organization", u.name, r.name)));
     }
     if r.org.as_deref() != Some(name) {
+        may_move_out(db, &r, who)?;
         anyhow::ensure!(db.repo_in(Some(name), &r.name)?.is_none(), "{name}/{} already exists: rename one of them first, or bring the other repo", r.name);
+        room_for(db, name, &auth::roles_of_repo(db, &r.id)?.into_iter().map(|(p, _)| p).collect::<Vec<_>>())?;
         let was = space_of(db, &r.id)?;
         db.conn.execute("UPDATE repos SET org = ?2 WHERE id = ?1", params![r.id, name])?;
-        db.emit(SERVER, "org.repo", None, None, json!({ "org": name, "repo": r.name, "was": was, "by": who.name() }))?;
+        moved(db, r.org.as_deref(), Some(name), &r.name, was.as_deref(), name, &who.name())?;
         forget_usage();
         r.org = Some(name.into());
         r.space = Some(name.into());
@@ -356,11 +413,97 @@ pub fn create_repo(e: &Engine, name: &str, policy: crate::model::LeasePolicy, wh
         }
     };
     let r = e.create_repo_in(name, policy, org, owner)?;
-    if let Some(person) = who.person() {
-        auth::set_role(&e.db.lock().unwrap(), &r, person, Some(Role::Admin), person)?;
+    let db = e.db.lock().unwrap();
+    super::settings::created_by(&db, &r, &who.name())?;
+    match (who.person(), org) {
+        // An organization's repo is reached by the org role alone: its creator, an admin of the org,
+        // keeps no direct admin role that would outlive their seat.
+        (_, Some(o)) => {
+            db.emit(SERVER, "org.repo.created", None, None, json!({ "org": o, "repo": r.name, "by": who.name() }))?;
+        }
+        (Some(person), None) => {
+            auth::set_role(&db, &r, person, Some(Role::Admin), person)?;
+        }
+        (None, None) => {}
     }
     forget_usage();
     Ok(r)
+}
+
+/// Whether `who` may take a repo out of the space it is in: an admin or an owner of its
+/// organization, the person whose own it is, a server admin. An admin role on the repo alone does
+/// not: a collaborator does not walk off with an organization's repo, nor with a person's.
+pub(crate) fn may_move_out(db: &Db, repo: &Repo, who: &Who) -> Result<()> {
+    if who.root() {
+        return Ok(());
+    }
+    let me = who.person().unwrap_or_default();
+    match (&repo.org, &repo.space) {
+        (Some(o), _) => anyhow::ensure!(
+            member(db, o, me)? >= Some(OrgRole::Admin),
+            Forbidden(format!("{} is {o}'s: an admin or an owner of {o} moves it out, an admin role on the repo is not enough", repo.full_name()))
+        ),
+        (None, Some(p)) => anyhow::ensure!(p == me, Forbidden(format!("{} is {p}'s own: {p} moves it, an admin role on the repo is not enough", repo.full_name()))),
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+/// A repo that changed space, in the log of each organization it left or entered.
+pub(crate) fn moved(db: &Db, from: Option<&str>, into: Option<&str>, repo: &str, was: Option<&str>, to: &str, by: &str) -> Result<()> {
+    if let Some(o) = from.filter(|o| into != Some(*o)) {
+        db.emit(SERVER, "org.repo.out", None, None, json!({ "org": o, "repo": repo, "to": to, "by": by }))?;
+    }
+    if let Some(o) = into.filter(|o| from != Some(*o)) {
+        db.emit(SERVER, "org.repo", None, None, json!({ "org": o, "repo": repo, "was": was, "by": by }))?;
+    }
+    Ok(())
+}
+
+/// The person who signed up with this email, if one did.
+fn person_of_email(db: &Db, email: &str) -> Result<Option<String>> {
+    Ok(db.conn.query_row("SELECT name FROM users WHERE lower(email) = lower(?1)", params![email], |r| r.get(0)).optional()?)
+}
+
+/// Who holds a seat of an organization: its members, the people its invitations no one answered
+/// ask (an email no one signed up with stands for its person), and the people given a role on one
+/// of its repos who are no member.
+pub fn seated(db: &Db, org: &str) -> Result<std::collections::BTreeSet<String>> {
+    let mut out: std::collections::BTreeSet<String> = members(db, org)?.into_iter().map(|(p, _)| p).collect();
+    for i in pending(db, org)? {
+        match (i.person, i.email) {
+            (Some(p), _) => out.insert(p),
+            (None, Some(e)) => out.insert(person_of_email(db, &e)?.unwrap_or(e)),
+            (None, None) => false,
+        };
+    }
+    let mut st = db.conn.prepare("SELECT DISTINCT x.person FROM roles x JOIN repos r ON r.id = x.repo WHERE r.org = ?1")?;
+    out.extend(st.query_map(params![org], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+    Ok(out)
+}
+
+/// The seats taken, as a page says them: `3 of 3 seats` on a plan that caps them.
+pub fn seats_said(plan: Plan, taken: usize) -> String {
+    match plan.seats() {
+        Some(most) => format!("{taken} of {most} seats"),
+        None => format!("{taken} seat{}", if taken == 1 { "" } else { "s" }),
+    }
+}
+
+/// Refuses what would seat more people than the organization's plan has seats for: these people,
+/// those of them not seated yet.
+pub(crate) fn room_for(db: &Db, org: &str, people: &[String]) -> Result<()> {
+    let Some(plan) = self::org(db, org)?.map(|o| o.plan) else { return Ok(()) };
+    let Some(most) = plan.seats() else { return Ok(()) };
+    let seated = seated(db, org)?;
+    let new = people.iter().filter(|p| !seated.contains(p.as_str())).collect::<std::collections::BTreeSet<_>>().len();
+    anyhow::ensure!(
+        new == 0 || seated.len() + new <= most,
+        "{org} is on the free plan, {most} people at most (members, pending invitations, and people with a role on its repos who are no member): {} taken. \
+         The Team plan ($10/person/month) has no cap: a server admin moves {org} to it (`avp org plan {org} team`)",
+        seats_said(plan, seated.len())
+    );
+    Ok(())
 }
 
 /// Repos from before spaces that no organization holds: the person who created them (the first
@@ -428,8 +571,11 @@ pub struct Usage {
     pub over: bool,
     /// When the next month starts (RFC3339, UTC).
     pub resets_at: String,
-    /// Members of the organization, 1 for a person's own space.
+    /// The people seated in the organization (see `seated`), 1 for a person's own space.
     pub seats: usize,
+    /// The seats its plan has; None, no cap.
+    #[serde(default)]
+    pub seats_max: Option<usize>,
     pub repos: Vec<String>,
     /// Past the cap: what a refused proof says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,7 +605,8 @@ pub fn usage(db: &Db, space: &str, now: i64) -> Result<Usage> {
         cap,
         over: cap.is_some_and(|c| minutes >= c),
         resets_at: rfc3339(until),
-        seats: if o.is_some() { members(db, space)?.len() } else { 1 },
+        seats: if o.is_some() { seated(db, space)?.len() } else { 1 },
+        seats_max: if o.is_some() { plan.seats() } else { None },
         repos: repos.into_iter().map(|(_, n)| n).collect(),
         said: None,
     };
@@ -491,7 +638,7 @@ pub fn over_text(u: &Usage) -> String {
 static READ: std::sync::Mutex<Option<std::collections::HashMap<String, (i64, Usage)>>> = std::sync::Mutex::new(None);
 
 /// A plan changed, a repo changed space: every space is read again.
-fn forget_usage() {
+pub(crate) fn forget_usage() {
     *READ.lock().unwrap() = None;
 }
 
@@ -525,7 +672,8 @@ use super::auth::run;
 pub fn routes() -> Router<Engine> {
     Router::new()
         .route("/orgs", get(list).post(create_route))
-        .route("/orgs/{org}", get(show))
+        .route("/orgs/{org}", get(show).delete(delete_route))
+        .route("/orgs/{org}/rename", post(rename_route))
         .route("/orgs/{org}/members", post(member_route))
         .route("/orgs/{org}/invites", post(invite_route))
         .route("/orgs/{org}/repos", post(repo_route))
@@ -556,8 +704,8 @@ async fn list(State(e): S, Extension(who): Extension<Who>) -> Response {
         };
         let mut out = vec![];
         for (o, role) in mine {
-            let seats = members(&db, &o.name)?.len();
-            out.push(json!({ "name": o.name, "plan": o.plan, "role": role, "seats": seats, "created_at": o.created_at }));
+            let seats = seated(&db, &o.name)?.len();
+            out.push(json!({ "name": o.name, "plan": o.plan, "role": role, "seats": seats, "seats_max": o.plan.seats(), "seats_said": seats_said(o.plan, seats), "created_at": o.created_at }));
         }
         Ok(out)
     })
@@ -585,9 +733,22 @@ async fn show(State(e): S, Extension(who): Extension<Who>, P(name): P<String>) -
         let db = e.db.lock().unwrap();
         let (o, role) = visible(&db, &name, &who)?;
         let members: Vec<_> = members(&db, &name)?.into_iter().map(|(p, r)| json!({ "person": p, "role": r })).collect();
-        let invites = if who.root() || role >= Some(OrgRole::Admin) { pending(&db, &name)? } else { vec![] };
-        let repos: Vec<String> = repos_of(&db, &name)?.into_iter().map(|(_, n)| n).collect();
-        Ok(json!({ "name": o.name, "plan": o.plan, "role": role, "seats": members.len(), "members": members, "repos": repos, "invites": invites, "created_at": o.created_at, "created_by": o.created_by }))
+        let admin = who.root() || role >= Some(OrgRole::Admin);
+        let invites = if admin { pending(&db, &name)? } else { vec![] };
+        // A deleted repo leaves the list; its admins still see it, until its data goes.
+        let (mut repos, mut deleted) = (vec![], vec![]);
+        for (id, n) in repos_of(&db, &name)? {
+            match super::settings::settings(&db, &id)?.deleted_at {
+                None => repos.push(json!(n)),
+                Some(at) if admin => deleted.push(json!({ "name": n, "restorable_until": crate::blame::utc(super::settings::purge_at(at)) })),
+                Some(_) => {}
+            }
+        }
+        let seats = seated(&db, &name)?.len();
+        Ok(json!({
+            "name": o.name, "plan": o.plan, "role": role, "seats": seats, "seats_max": o.plan.seats(), "seats_said": seats_said(o.plan, seats),
+            "members": members, "repos": repos, "deleted": deleted, "invites": invites, "created_at": o.created_at, "created_by": o.created_by
+        }))
     })
     .await
 }
@@ -629,6 +790,19 @@ struct RepoBody {
 
 async fn repo_route(State(e): S, Extension(who): Extension<Who>, P(name): P<String>, Json(b): Json<RepoBody>) -> Response {
     run(move || bring_repo(&e.db.lock().unwrap(), &name, b.repo.trim(), &who)).await
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    name: String,
+}
+
+async fn rename_route(State(e): S, Extension(who): Extension<Who>, P(name): P<String>, Json(b): Json<RenameBody>) -> Response {
+    run(move || rename(&e.db.lock().unwrap(), &name, b.name.trim(), &who)).await
+}
+
+async fn delete_route(State(e): S, Extension(who): Extension<Who>, P(name): P<String>) -> Response {
+    run(move || delete(&e.db.lock().unwrap(), &name, &who).map(|_| json!({ "deleted": name }))).await
 }
 
 #[derive(Deserialize)]

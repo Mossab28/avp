@@ -36,7 +36,7 @@ ok "a flaky position is not red" '[ "$(events line.red)" = "[]" ]'
 for _ in $(seq 1 40); do [[ "$($T envs --repo ff)" == *"serves position 1"* ]] && break; sleep 0.5; done
 ok "staging follows a flaky position" '[[ "$($T envs --repo ff)" == *"staging"*"serves position 1"* ]]'
 ok "a person promotes it without --force" '$T promote production 1 --repo ff'
-ok "AVP Live tells flaky positions apart" '[[ "$(curl -s "$AVP_SERVER/live")" == *"line.flaky"* ]]'
+ok "AVP Live tells flaky positions apart" '[[ "$(curl -s "$AVP_SERVER/live.js")" == *"line.flaky"* ]]'
 
 mkdir two && $T open -C two --repo ff --goal "a broken change" >/dev/null && printf 'x\n' > two/broken.txt
 ok "a change the suite fails lands on its proof" '[[ "$($T -C two land)" == "landed at position 2"* ]]'

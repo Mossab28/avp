@@ -2,7 +2,8 @@
 //! queues the candidate, a `avp worker` (src/worker.rs) claims it and sends its steps back. One proof
 //! per worker, so a proof never shares its machine with another one, and capacity is the number of
 //! workers. If no worker claims a proof in time, or a worker goes silent, the server runs the proof
-//! itself, as before. Here too the drain (`POST /drain`), what the server's own machine asks before
+//! itself, as before, unless its proofs are strangers' code (AVP_SANDBOX): then only a sandboxed
+//! worker gets one, and a proof none finished in time is red. Here too the drain (`POST /drain`), what the server's own machine asks before
 //! it takes a new version, and `GET /work`, what an autoscaler follows.
 
 use crate::engine::Engine;
@@ -33,6 +34,11 @@ pub(crate) fn routes() -> Router<Engine> {
 /// Where a proof runs (the seam's `prove_away`): on a worker when the server has them, None when
 /// it proves it itself, or when no worker answers in time. A speculative proof goes to a worker or
 /// nowhere: the server does not spend itself on a guess.
+/// Where the proof of `name` stands in the workers' queue, when the server has one.
+pub(crate) fn progress(name: &str) -> Option<String> {
+    dispatcher()?.progress(name)
+}
+
 pub(crate) fn prove_away(job: Job, speculative: bool) -> Result<Option<Vec<Step>>> {
     let Some(d) = dispatcher() else { return Ok(None) };
     let name = job.name.clone();
@@ -42,8 +48,24 @@ pub(crate) fn prove_away(job: Job, speculative: bool) -> Result<Option<Vec<Step>
         return Ok(Some(steps));
     }
     anyhow::ensure!(!speculative, "no worker took the speculative proof");
+    // The code of strangers runs in a sandboxed worker or nowhere: here, beside the server's data
+    // and keys, a proof that outlived its wait (or a queue kept full on purpose) would read them.
+    if sandboxed_only() {
+        eprintln!("no sandboxed worker answered for {name}: red, never proven here");
+        return Ok(Some(vec![Step { name: "worker".into(), command: String::new(), exit: 1, seconds: 0.0, output: "no sandboxed worker finished this proof in time (AVP_WORKER_CLAIM_S, AVP_WORKER_RUN_S): this server never runs a proof itself. `avp land` again queues it anew".into() }]));
+    }
+    // On AVP Cloud the code proven is a stranger's, and the server's machine holds every
+    // organization's data: a job no worker took, that outran its time or lost its worker (all three
+    // within a stranger's reach) is proven nowhere rather than here.
+    anyhow::ensure!(!super::orgs::on(), "no worker proved {name}: none took it in time, it ran past AVP_WORKER_RUN_S, or it lost its worker 3 times. Land again; a proof that hangs its machine is red");
     eprintln!("no worker answered for {name}: proving here");
     Ok(None)
+}
+
+/// AVP_SANDBOX on the server (AVP Cloud's): its proofs are strangers' code, run only by workers that
+/// say they run each job in a sandbox, never by the server itself.
+fn sandboxed_only() -> bool {
+    std::env::var("AVP_SANDBOX").is_ok_and(|v| !v.trim().is_empty())
 }
 
 #[derive(Default)]
@@ -58,6 +80,8 @@ struct Queue {
     /// When each job was queued, and first claimed: the proof's wait for a machine.
     queued_at: HashMap<String, Instant>,
     claimed_at: HashMap<String, Instant>,
+    /// Where each claimed job stands, as its worker last said.
+    phase: HashMap<String, String>,
 }
 
 /// What a proof stopped halfway gives back: one step, cancelled.
@@ -99,8 +123,8 @@ impl Dispatcher {
     /// Queues the job and waits for a worker's steps. A worker silent for AVP_WORKER_LOST_S
     /// (default 30: it beats every 2 s) loses the job, which goes back to the front of the queue;
     /// a worker can die mid-proof, or before its claim even reached it. None when nobody claimed
-    /// it within AVP_WORKER_CLAIM_S (default 120), after 3 lost workers, or past
-    /// AVP_WORKER_RUN_S (default 2400): the caller then proves it itself.
+    /// it within AVP_WORKER_CLAIM_S (default 120), after 3 lost workers, or a minute past
+    /// AVP_WORKER_RUN_S (default 2400) from its claim: the caller then proves it itself.
     pub fn run(&self, job: Job) -> Option<Vec<Step>> {
         let (claim_within, run_within, lost_after) = (secs("AVP_WORKER_CLAIM_S", 120), secs("AVP_WORKER_RUN_S", 2400), secs("AVP_WORKER_LOST_S", 30));
         let mut lost = 0;
@@ -128,7 +152,10 @@ impl Dispatcher {
                         self.cv.notify_all();
                     }
                     let unclaimed = q.waiting.iter().any(|j| j.id == id);
-                    if (unclaimed && start.elapsed() > claim_within) || lost >= 3 || start.elapsed() > run_within {
+                    // The worker's own time cap counts from its claim and kills the job there, its
+                    // red steps on their way: the server waits for them a minute more.
+                    let ran_out = q.claimed_at.get(&id).is_some_and(|t| t.elapsed() > run_within + Duration::from_secs(60));
+                    if (unclaimed && start.elapsed() > claim_within) || lost >= 3 || ran_out {
                         q.waiting.retain(|j| j.id != id);
                         q.claimed.remove(&id);
                         q.replies.remove(&id);
@@ -197,8 +224,11 @@ impl Dispatcher {
     }
 
     /// A worker's sign of life on a job it runs: (still its own, to be stopped).
-    pub fn alive(&self, id: &str) -> (bool, bool) {
+    pub fn alive(&self, id: &str, phase: Option<String>) -> (bool, bool) {
         let mut q = self.lock();
+        if let Some(p) = phase.filter(|_| q.claimed.contains_key(id)) {
+            q.phase.insert(id.to_string(), p);
+        }
         if q.cancelled.remove(id) {
             return (false, true);
         }
@@ -225,10 +255,25 @@ impl Dispatcher {
         }
         q.claimed.remove(id);
         q.cancelled.remove(id);
+        q.phase.remove(id);
         match q.replies.remove(id) {
             Some(tx) => tx.send(steps).is_ok(),
             None => false,
         }
+    }
+
+    /// Where the proof of `name` (a task's id) stands in the queue: waiting for a machine behind
+    /// so many jobs, or claimed and as far as its worker said. None when the queue does not hold it.
+    pub fn progress(&self, name: &str) -> Option<String> {
+        let q = self.lock();
+        if let Some(ahead) = q.waiting.iter().position(|j| j.name == name) {
+            return Some(match ahead {
+                0 => "queued, next for a machine".into(),
+                n => format!("queued ({n} ahead), waiting for a machine"),
+            });
+        }
+        let (id, _) = q.claimed.iter().find(|(_, (_, j))| j.name == name)?;
+        Some(q.phase.get(id).cloned().unwrap_or_else(|| "on a machine, preparing".into()))
     }
 
     pub fn depth(&self) -> Depth {
@@ -298,16 +343,29 @@ struct Claim {
     /// The worker runs parts of a proof (AVP 0.4.7 and later).
     #[serde(default)]
     parts: bool,
+    /// The worker runs each job in a sandbox (AVP_SANDBOX): docker or podman.
+    #[serde(default)]
+    sandbox: Option<String>,
 }
 /// A worker asks for a proof to run; answers 204 after `wait_s` (at most 55 s) if there is none,
 /// or while the server drains.
 async fn work_claim(State(e): S, Json(req): Json<Claim>) -> R {
     let Some(d) = dispatcher() else { return Err(err(anyhow::anyhow!("workers are off on this server (AVP_WORKERS=1 turns them on)"))) };
+    if let Some(refused) = unsandboxed(&req, sandboxed_only()) {
+        return Err(err(anyhow::anyhow!(refused)));
+    }
     let wait = std::time::Duration::from_secs(req.wait_s.unwrap_or(25).min(55));
     match blocking(move || Ok(claim_undrained(d, wait, req.parts).map(|job| with_secrets(&e, job)))).await? {
         Some(claimed) => ok(claimed),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+/// Why a worker that does not run its jobs in a sandbox gets none from a server whose proofs are
+/// strangers' code.
+fn unsandboxed(req: &Claim, only: bool) -> Option<String> {
+    let said = req.sandbox.as_deref().is_some_and(|t| !t.trim().is_empty());
+    (only && !said).then(|| "this server's proofs run only in a sandbox: start the worker with AVP_SANDBOX=docker (docs/GUIDE.md, \"Proofs in a sandbox\")".to_string())
 }
 
 /// The job with the values of the secrets its steps name, read from the store as it is handed
@@ -366,9 +424,15 @@ async fn work_result(State(e): S, P(id): P<String>, Json(req): Json<WorkResult>)
     .await?;
     ok(serde_json::json!({ "accepted": accepted }))
 }
-async fn work_alive(P(id): P<String>) -> R {
+#[derive(Deserialize, Default)]
+struct Alive {
+    /// Where the proof stands (a worker from before says nothing).
+    #[serde(default)]
+    phase: Option<String>,
+}
+async fn work_alive(P(id): P<String>, body: Option<Json<Alive>>) -> R {
     let Some(d) = dispatcher() else { return Err(err(anyhow::anyhow!("workers are off"))) };
-    let (alive, cancel) = d.alive(&id);
+    let (alive, cancel) = d.alive(&id, body.map(|b| b.0.phase).unwrap_or_default());
     ok(serde_json::json!({ "alive": alive, "cancel": cancel }))
 }
 /// The proofs waiting and running, here and on workers, the deploys AVP runs, and whether the
@@ -433,4 +497,19 @@ fn from_host(req: &axum::extract::Request) -> Result<(), Response> {
         return Ok(());
     }
     Err((StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "only the server's own machine (127.0.0.1, no proxy) or its token may drain it" }))).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server whose proofs are strangers' code hands none to a worker that runs them on its machine.
+    #[test]
+    fn a_sandboxed_server_hands_proofs_to_sandboxed_workers_only() {
+        let claim = |sandbox: Option<&str>| Claim { wait_s: None, parts: true, sandbox: sandbox.map(String::from) };
+        assert!(unsandboxed(&claim(None), true).unwrap().contains("AVP_SANDBOX=docker"));
+        assert!(unsandboxed(&claim(Some(" ")), true).is_some());
+        assert_eq!(unsandboxed(&claim(Some("docker")), true), None);
+        assert_eq!(unsandboxed(&claim(None), false), None);
+    }
 }

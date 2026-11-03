@@ -343,8 +343,12 @@ What a job gets:
 
 - Its folder, read-write, and nothing else of the machine: no other job's folder, not the worker's
   objects, its token or its variables. The repo's setup cache (`setup_links`, `node_modules`) and its
-  home (cargo's registry, pnpm's store, corepack) are mounted too, kept per repo, never shared with
-  another repo. Each is mounted at its path on the machine, so the setup's links resolve.
+  home (cargo's registry, pnpm's store, corepack) are mounted too, never shared with another repo,
+  and never the line's own: a task's jobs run on a copy of them of their own, kept for its next
+  proofs, and only a green run of the whole suite on the line saves its copy as the line's. A slot's
+  folder and its `keep` folders (`target/`) go to the next job only if it is the same task's, or the
+  line's; else they are laid out anew from the line's. A red or unfinished proof never writes what
+  a later proof trusts.
 - A read-only root, a `/tmp` of its own (a tmpfs, `AVP_SANDBOX_DISK` in size), a user that is not
   root (the worker's own uid, or `AVP_SANDBOX_USER=uid:gid`), no capability, no new privilege.
 - The image `[check] image` names in avp.toml, else the worker's `AVP_SANDBOX_IMAGE`. Its `PATH` and
@@ -361,10 +365,15 @@ What a job gets:
 - Its services (`[[check.services]]`) in its own network: a service's container joins the job's
   container's network, so `localhost:{port}` reaches it from a step as on a machine, and nothing is
   published on the worker. `{port}` is the service's own port there (two services of one job each
-  need their own). A service's image runs as it wants (a database starts as root), with no new
-  privilege and the job's limits.
+  need their own). A service's image starts as it wants (a database starts as root), with only the
+  capabilities a database needs (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID`,
+  `NET_BIND_SERVICE`), no new privilege, no folder of the machine, and the job's limits. A service's
+  `options`, `volumes`, `privileged`, `cap_add`, `user` or `network` in avp.toml are refused.
+- With `AVP_SANDBOX_RUNTIME=runsc`, the job and its services run under gVisor, a kernel of their own
+  in front of the machine's; a worker asked for a runtime docker lacks does not start.
 - The internet (installs need it), and nothing else: never the cloud's metadata (169.254.169.254),
-  the private ranges (10/8, 172.16/12, 192.168/16, 100.64/10), nor the worker's machine.
+  the private ranges (10/8, 172.16/12, 192.168/16, 100.64/10), the worker's machine, nor mail
+  (TCP 25, 465, 587).
 
 The network is the machine's to close, once, as root: each job's network is a bridge named `avpj`
 and 11 characters, and these rules drop what leaves one for a private address or the machine
@@ -374,6 +383,7 @@ itself, DNS aside (docker's resolver answers inside the container, podman's on t
 iptables -t mangle -N AVP-SANDBOX 2>/dev/null; iptables -t mangle -F AVP-SANDBOX
 iptables -t mangle -A AVP-SANDBOX -p udp --dport 53 -j RETURN
 iptables -t mangle -A AVP-SANDBOX -p tcp --dport 53 -j RETURN
+iptables -t mangle -A AVP-SANDBOX -p tcp -m multiport --dports 25,465,587 -j DROP
 for net in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8; do
   iptables -t mangle -A AVP-SANDBOX -d $net -j DROP
 done
@@ -388,8 +398,12 @@ networks an earlier run of it left, then starts a job's container and tries 169.
 it (and each `host:port` of `AVP_SANDBOX_PROBE`, comma separated: the server's private address); if
 one answers, or the image has neither curl nor bash to try, it does not start. Nor does it start
 without `AVP_SANDBOX_IMAGE`, as root without `AVP_SANDBOX_USER`, or when docker does not answer.
-`tests/sandbox.sh`, run on a worker (Linux, docker, a user of the docker group), proves that a job
-cannot read another's folder, cannot reach 169.254.169.254, and leaves no container.
+A server whose proofs are strangers' code says so with `AVP_SANDBOX=docker` itself: it hands them to
+sandboxed workers only, and never proves one on its own machine (a proof no worker finished in time
+is red). `tests/sandbox.sh`, run on a worker (Linux, docker, a user of the docker group), proves that
+a job cannot read another's folder, cannot reach 169.254.169.254, leaves nothing a later job finds,
+is stopped alone past its disk or its time, and leaves no container. docs/internal/SECURITY-AUDIT.md
+("Proof isolation") is the threat model.
 
 A worker that runs in a container itself (AVP Cloud's, `deploy/aws/files/scripts/worker-up.sh`)
 reaches the machine's docker through its socket, and has its data folder mounted at the same path,
@@ -676,6 +690,26 @@ On a server that names who is asking (`AVP_TOKEN`, a proxy), a task opened from 
 person's: only the server's own follow opens them as the commits' authors. `--json` gives an agent
 each commit, its task and what became of it; `avp import-git` exits 2 when one is left open.
 
+### `git push` lands
+
+A person who still works with git pushes to the server as to GitHub, and the push is a landing:
+
+```sh
+git remote add avp https://<server>/acme/shop.git
+git push avp main                    # main only: there are no branches (`git push avp feature:main` lands a branch's work)
+```
+
+The pushed commits go into a scratch repo; their tree, against the position the push started
+from, becomes a task (its goal the last commit's message, its author the person who pushes, the
+agent `git-push`), proven and landed as `avp land` does. git shows the proof under `remote:`. Green:
+the push succeeds and prints the position and its URL, and the position's commit is the pushed
+one (nothing to pull). Behind the head, it is replayed on it as any task is; `git pull` then
+brings the position's commit. Red or in conflict: the push is refused with what failed, nothing
+lands; fix, commit, push again. A push touching a guarded path waits for an approval: the refusal
+names the task (`avp approve <task>`). Only the repo's writers push. A push to a repo that does
+not exist yet, in your space or an organization of yours, creates it with its history imported,
+one position per first-parent commit, as `avp import` does.
+
 ## A team server
 
 A team server is the same avp on a machine the team reaches, with a key, and workers on your own
@@ -849,6 +883,32 @@ avp stats               # its last line: the same month and cap
 Every change is an event: `org.created`, `org.member`, `org.invited`, `org.joined`, `org.declined`,
 `org.plan`, `org.repo`, `user.password` (`avp org log`, and every organization's in `avp user log`).
 The routes and their JSON, for a web page or an agent: [API.md](API.md).
+
+**A repo's settings.** Its admins' (a server admin's too): the settings page of the website, `avp
+repo ...` (`--json` for a script) and the `avp_repo` tool for an agent do the same through the same
+routes, and each answer says what changed and what to do next. The server checks the role on every
+one.
+
+```sh
+avp repo show                         # who reaches it, the tokens that do, what guards it
+avp repo invite bob --role write      # by name or email, at once (they signed up); read|write|admin
+avp repo role bob read                # change it; `avp repo rm bob` takes it away (the last admin stays)
+avp repo token create --name ci --role read --expires 90d   # this repo alone, shown once
+avp repo token revoke tok_01...
+avp repo rename store                 # the old name keeps answering, `git clone` included
+avp repo describe "The shop's API"
+avp repo visibility public            # anyone reads and clones it; nobody writes without a role
+avp repo transfer acme                # to your own space or an organization you administer
+avp repo archive                      # read-only: tasks are refused, saying so; --off undoes it
+avp repo delete --confirm shop        # missing at once, data gone after 7 days
+avp repo restore                      # within those 7 days
+avp repo log                          # who changed a setting, a role, a token, a guard, when
+```
+
+A token made for a repo reaches that repo alone, to read or to write and never beyond its person's
+role there: it never changes settings nor approves a guarded change, which stay a person's. Its
+person losing the role stops it too. Guarded paths, avp.toml always among them, are shown read-only
+with who approves them (a person with write or admin).
 
 ## Diff, clone, save points
 
@@ -1088,6 +1148,9 @@ avp landing proof_and_approval   # a green proof waits for a person
 avp guard infra/ migrations/     # or only for these paths
 avp approve task_…               # or: avp refuse task_… --why "rename it"
 ```
+
+On AVP Cloud an approval is a person's, never a token's (not even yours, which your agent holds):
+give it with the Approve button on the task's page, or `avp approve`, which asks your password in the terminal.
 
 ## Without `avp up`
 

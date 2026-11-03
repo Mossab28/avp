@@ -82,6 +82,13 @@ fn python_declares(top: &Path, package: &str) -> bool {
         || poetry.and_then(|p| p.get("group")).and_then(|g| g.as_table()).is_some_and(|g| g.values().any(|grp| keys(grp.get("dependencies"))))
 }
 
+/// The virtualenv of the guessed Python checks. A Python without ensurepip (Debian's without
+/// python3-venv) cannot make one with pip: the venv is made without, on the system's packages, and
+/// a `pip` beside its python that runs the system's pip, which installs into the venv. Every step
+/// keeps calling `.venv/bin/pip` and `.venv/bin/python` either way.
+pub const PY_VENV: &str = "{ python3 -m venv .venv || { rm -rf .venv && python3 -m venv --without-pip --system-site-packages .venv \
+&& printf '%s\\n' '#!/bin/sh' 'exec \"${0%/*}/python\" -m pip \"$@\"' > .venv/bin/pip && chmod +x .venv/bin/pip; }; }";
+
 /// The checks a proof runs, guessed from the files at the root of the project (Node, Python,
 /// Rust, Go, Java with Maven or Gradle, Ruby). None when nothing is recognised: the line then lands without proof steps until an
 /// avp.toml says what to run.
@@ -155,7 +162,7 @@ pub fn guess_checks(top: &Path) -> Option<(String, Vec<String>)> {
         } else if has("poetry.lock") {
             ("POETRY_VIRTUALENVS_IN_PROJECT=true poetry install --no-interaction --all-extras --no-root".into(), vec!["pyproject.toml", "poetry.lock"], "poetry run", Some("poetry install --no-interaction --only-root -q"))
         } else if has("requirements.txt") {
-            let mut i = String::from("python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt");
+            let mut i = format!("{PY_VENV} && .venv/bin/pip install -q -r requirements.txt");
             for extra in ["requirements-dev.txt", "requirements-test.txt"] {
                 if has(extra) {
                     i.push_str(&format!(" -r {extra}"));
@@ -165,7 +172,7 @@ pub fn guess_checks(top: &Path) -> Option<(String, Vec<String>)> {
         } else {
             // No lockfile: the dependencies come with the project, in each candidate (pip's cache
             // makes it quick after the first proof).
-            ("python3 -m venv .venv".into(), vec!["pyproject.toml", "setup.py", "setup.cfg"], ".venv/bin/python -m", Some("(.venv/bin/pip install -q -e '.[test,dev]' || .venv/bin/pip install -q -e .)"))
+            (PY_VENV.into(), vec!["pyproject.toml", "setup.py", "setup.cfg"], ".venv/bin/python -m", Some("(.venv/bin/pip install -q -e '.[test,dev]' || .venv/bin/pip install -q -e .)"))
         };
         setup = Some((install, keys.into_iter().filter(|k| has(k)).map(String::from).collect()));
         links = vec![".venv".into()];
@@ -245,7 +252,11 @@ fn land_files(client: &Client, repo: &Repo, goal: &str, files: &[(&str, &str)]) 
         std::fs::write(dir.join(path), text)?;
     }
     view::sync(client, &dir, &mut s)?;
-    let mut r = client.land(&repo.id, &task.id)?;
+    // Where the first proof stands while it waits for a machine and installs: minutes in silence
+    // otherwise.
+    let tell: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(|now: &str| eprintln!("proof: {now}"));
+    let say: std::sync::Arc<dyn Fn(&str) + Send + Sync> = std::sync::Arc::new(|line: &str| eprintln!("{line}"));
+    let mut r = crate::mcp::through_drain(client, &repo.id, &task.id, say, tell, || client.land(&repo.id, &task.id))?;
     // A change to the checks always waits for a person's word. Here the person is at the terminal,
     // asking for these checks: their run says yes. A repo where every landing waits for a person
     // keeps waiting for one.
@@ -1026,16 +1037,51 @@ pub fn repo_here(client: &Client, top: &Path, name: &str, history: usize) -> Res
     match client.get::<Repo>(&format!("/repos/{name}")) {
         Ok(r) => {
             let head: LineEntry = client.get(&format!("/repos/{}/head", r.id))?;
+            // A repo of the same name is not this project when none of its commits is in this
+            // checkout's history: another folder of the same name, attached to it in silence.
+            if !shares_history(client, top, &r.id, head.position)? {
+                bail!("{name} is already on {} and shares no commit with this checkout: it is another project. Name this one: `avp up --as <name>`; or, if it is that repo, fetch its history first (git clone it from AVP)", client.shown());
+            }
             Ok((r, format!("{name}, already on AVP (head of the line: position {})", head.position)))
         }
         // A name of several of the person's repos (AVP Cloud): they say which.
         Err(e) if format!("{e:#}").starts_with("409") => Err(e),
         Err(_) => {
             let (r, last) = gitbridge::import_git(client, top, name, "advisory", history)?;
+            // The commits themselves, so that `git clone` from AVP gives them back as they are
+            // (author, dates, message, SHAs) under the positions landed on top.
+            if let Err(e) = gitbridge::upload_history(client, &r.id, top) {
+                eprintln!("the git history was not sent ({e:#}): a `git clone` from AVP writes the imported positions as new commits");
+            }
             let what = if last == 0 { "the commit at HEAD is position 0".to_string() } else { format!("the last {} commits of HEAD are positions 0 to {last}", last + 1) };
             Ok((r, format!("{name}, imported: {what}")))
         }
     }
+}
+
+/// Whether the checkout has one of the commits of the repo's line, among its oldest and newest
+/// positions. True when the line names no commit at all (a repo made with `avp init`): nothing to
+/// tell it by.
+fn shares_history(client: &Client, top: &Path, repo: &str, head: i64) -> Result<bool> {
+    let mut shas: Vec<String> = Vec::new();
+    for from in [head, head.min(299)] {
+        let line: Vec<LineEntry> = client.get(&format!("/repos/{repo}/line?from={from}&limit=300"))?;
+        shas.extend(line.into_iter().filter_map(|l| l.git));
+    }
+    if shas.is_empty() {
+        return Ok(true);
+    }
+    shas.sort();
+    shas.dedup();
+    let mut git = Command::new("git").arg("-C").arg(top).args(["cat-file", "--batch-check"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    {
+        use std::io::Write;
+        let mut stdin = git.stdin.take().context("git cat-file")?;
+        let asked: String = shas.iter().map(|s| format!("{s}^{{commit}}\n")).collect();
+        stdin.write_all(asked.as_bytes())?;
+    }
+    let out = git.wait_with_output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(" commit ")))
 }
 
 /// The mirror that writes every landed task as a commit on `branch`, pushed to origin when `push`

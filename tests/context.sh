@@ -28,9 +28,9 @@ ok "open --json keeps the task at the top and adds its context" '[ "$(python3 -c
 cx=$($T -C c context src/a.txt:2 docs/)
 ok "context says the same of any path, and why a line is what it is" '[[ "$cx" == *"src/a.txt"*"say TWO"*"docs/d.md"*"src/a.txt:2  TWO"*"written at position 1 by task"* ]]'
 ok "a path with no history is said so" '[[ "$($T -C c context nowhere.txt)" == "no position of the line changed these paths" ]]'
-ok "claiming a path outside the scope tells its history" '[[ "$($T -C c claim docs/d.md)" == *"docs/d.md: taken"*"docs/d.md"*imported* ]]'
+ok "claiming a path outside the scope tells its history" '[[ "$($T -C c claim docs/d.md)" == *"docs/d.md: yours"*"docs/d.md"*imported* ]]'
 printf 'r2\n' > c/README.md && sent=$($T -C c sync)
-ok "so does the first write outside the scope, once" '[[ "$sent" == *"+ README.md [taken]"*"newest first"*"README.md"*imported* ]] && printf "r3\n" > c/README.md && [ "$($T -C c sync)" = "+ README.md [held]" ]'
+ok "so does the first write outside the scope, once" '[[ "$sent" == *"+ README.md [yours]"*"newest first"*"README.md"*imported* ]] && printf "r3\n" > c/README.md && [ "$($T -C c sync)" = "+ README.md [yours]" ]'
 
 mkdir agent && mcp=$(cd agent && printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"e2e"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"avp_context","arguments":{"paths":["src/"]}}}' \

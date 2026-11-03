@@ -50,15 +50,18 @@ nav .cta { display: flex; gap: 8px; }
 .btn.solid { background: var(--inv); color: var(--invfg); border-color: var(--inv); }
 
 /* hero */
-.hero { position: relative; min-height: 100svh; display: flex; flex-direction: column; justify-content: flex-end; padding-bottom: clamp(48px, 8vh, 96px); overflow: hidden; }
+.hero { position: relative; min-height: 100svh; display: flex; flex-direction: column; justify-content: flex-end; padding-top: 96px; padding-bottom: clamp(32px, 6vh, 72px); overflow: hidden; }
 #clouds { position: absolute; inset: 0; width: 100%; height: 100%; }
 .hero::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 25%, rgba(0,0,0,.7) 60%, #000 90%); pointer-events: none; }
 .hero .wrap { position: relative; z-index: 2; width: 100%; }
-.intro { display: flex; align-items: center; gap: 12px; font-size: 15px; color: var(--fg2); margin-bottom: 26px; }
+.intro { display: flex; align-items: center; gap: 12px; font-size: 16px; color: var(--fg); margin-bottom: 26px; }
+.intro span:not(.dots) { background: #000; padding: 4px 10px; border: 1px solid var(--line2); }
+.intro span:first-child { font-weight: 500; }
+@media (max-width: 520px) { .intro { font-size: 13px; gap: 8px; } .intro span:not(.dots) { white-space: nowrap; padding: 3px 7px; } }
 .intro .dots { flex: 0 1 180px; border-bottom: 1px dotted var(--mut); height: 1px; transform: translateY(3px); }
-h1 { font-weight: 500; font-size: clamp(52px, 9.6vw, 140px); line-height: .9; letter-spacing: -.055em; }
+h1 { font-weight: 500; font-size: clamp(48px, min(8.6vw, 13.5vh), 132px); line-height: .9; letter-spacing: -.055em; }
 h1 .soft { color: var(--mut); }
-.hero-foot { display: grid; grid-template-columns: 1fr auto; gap: 32px; align-items: end; margin-top: 40px; }
+.hero-foot { display: grid; grid-template-columns: 1fr auto; gap: 32px; align-items: end; margin-top: clamp(20px, 3vh, 40px); }
 .hero-foot p { max-width: 460px; color: var(--fg2); font-size: 17px; line-height: 1.5; }
 .kpis { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: clamp(28px, 4vh, 44px); border-top: 1px solid var(--line2); }
 .kpi { padding: 16px 20px 0 0; position: relative; }
@@ -114,7 +117,7 @@ h3 { font-weight: 500; font-size: 17px; letter-spacing: -.01em; margin: 14px 0 8
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 64px; }
 .stat { border-left: 1px solid var(--line2); padding: 0 16px; }
 .stat b { display: block; font-weight: 500; font-size: clamp(40px, 5vw, 64px); letter-spacing: -.04em; line-height: 1; margin-top: 56px; font-variant-numeric: tabular-nums; }
-.stat span { display: block; color: var(--fg2); font-size: 14px; margin-top: 8px; }
+.stat > span { display: block; color: var(--fg2); font-size: 14px; margin-top: 8px; }
 .bench { margin-top: 48px; }
 .bench table { width: 100%; border-collapse: collapse; }
 .bench th { text-align: left; font-weight: 400; color: var(--mut); font-size: 11px; padding: 0 12px 10px 0; }
@@ -139,6 +142,7 @@ h3 { font-weight: 500; font-size: 17px; letter-spacing: -.01em; margin: 14px 0 8
 .plan + .plan { padding-left: 24px; }
 .plan:last-child { border-right: 0; }
 .plan .price { font-size: 48px; font-weight: 500; letter-spacing: -.04em; margin: 28px 0 20px; }
+.plan .price .per { font-size: 14px; letter-spacing: 0; color: var(--mut); margin-left: 8px; font-weight: 400; }
 .plan ul { list-style: none; color: var(--fg2); font-size: 14px; line-height: 2; }
 .plan ul li::before { content: "+ "; color: var(--mut); font-family: var(--mono); }
 .plan .btn { margin-top: 28px; }
@@ -198,8 +202,8 @@ footer .links { display: flex; gap: 20px; }
     <canvas id="mini" style="display:block;width:100%;height:96px"></canvas>
   </div>
   <div class="wrap">
-    <div class="intro rise"><span>Introducing AVP Cloud</span><span class="dots"></span><span>Hosting for coding agents</span></div>
-    <h1 class="rise">Where Coding<br>Agents <span class="soft">Ship.</span></h1>
+    <div class="intro rise"><span>Introducing AVP Cloud</span><span class="dots"></span><span>Hosting for AI agents</span></div>
+    <h1 class="rise">Git Was Never<br>Made <span class="soft">For Agents.</span></h1>
     <div class="kpis rise">
       <div class="kpi"><b><span class="count" data-to="99.7" data-dec="1">99.7</span><span class="u">%</span></b><span>less CI on GitHub<sup class="mono">1</sup></span></div>
       <div class="kpi"><b><span class="count" data-to="7.4" data-dec="1">7.4</span><span class="u">x</span></b><span>faster to land a change<sup class="mono">1</sup></span></div>
@@ -237,7 +241,7 @@ footer .links { display: flex; gap: 20px; }
       <p class="mono foot">1. Murmell, 48 h of pull requests against 48 h on AVP, October 2026: GitHub's CI workflow 12,039 min, then 36 (the proofs ran on AVP's machines: 2,689 min); median 25 min to land a change, then 3.4. 2. The bench below.</p>
     </div>
     <div class="stats">
-      <div class="stat rise"><span class="mono">CI minutes</span><b>-<span class="count" data-to="77">77</span>%</b><span>15,310 GitHub minutes down to 3,475 for the same 48 hours.</span></div>
+      <div class="stat rise"><span class="mono">CI on GitHub</span><b><span class="count" data-to="99.7" data-dec="1">99.7</span>%</b><span>less: the proofs run on AVP's own machines, not GitHub Actions.</span></div>
       <div class="stat rise"><span class="mono">Broken states</span><b>0 / 43</b><span>12 agents in parallel never left the line red. Git: 9 of 45.</span></div>
       <div class="stat rise"><span class="mono">Tokens</span><b>-<span class="count" data-to="55">55</span>%</b><span>Agents stop rebasing and re-reading. 4.7 M tokens against 10.3 M.</span></div>
     </div>
@@ -278,9 +282,10 @@ footer .links { display: flex; gap: 20px; }
 <section id="plans" class="dark" data-theme="dark">
   <div class="wrap">
     <div class="frame rise"><h2>Pay For Proofs,<br><span class="soft">Not For Waiting.</span></h2></div>
+    <p class="mono foot" style="margin-bottom:28px">The same work costs about 5x less than on GitHub Actions: fewer minutes, not cheaper ones. Agents are never billed, only people.</p>
     <div class="plans rise">
-      <div class="plan"><span class="tag">Free</span><div class="price">$0</div><ul><li>Private repos</li><li>Every agent, unlimited</li><li>2,000 proof minutes a month</li><li>Sandboxed proofs</li></ul><a class="btn solid" href="/signup">Start free</a></div>
-      <div class="plan"><span class="tag">Team</span><div class="price">Soon</div><ul><li>Organizations and roles</li><li>More proof minutes</li><li>Deploys run by AVP</li><li>Priority machines</li></ul><a class="btn" href="mailto:mossab@murmell.com?subject=AVP%20Team">Join the list</a></div>
+      <div class="plan"><span class="tag">Free</span><div class="price">$0</div><ul><li>Private repos</li><li>Every agent, unlimited</li><li>Up to 3 people</li><li>3,000 proof minutes a month</li><li>Sandboxed proofs</li></ul><a class="btn solid" href="/signup">Start free</a></div>
+      <div class="plan"><span class="tag">Team</span><div class="price">$10<span class="per">/ person / month</span></div><ul><li>Every agent, unlimited</li><li>5,000 proof minutes per person, pooled</li><li>Extra minutes at $0.003</li><li>Deploys run by AVP, signed history</li></ul><a class="btn" href="/signup">Start with Team</a></div>
       <div class="plan"><span class="tag">Enterprise</span><div class="price">Talk to us</div><ul><li>Your own cloud or ours</li><li>Single sign-on</li><li>Signed history, audit</li><li>Support with a name</li></ul><a class="btn" href="mailto:mossab@murmell.com?subject=AVP%20Enterprise">Contact</a></div>
     </div>
   </div>
@@ -300,9 +305,9 @@ footer .links { display: flex; gap: 20px; }
   </div>
 </footer>
 
+<script src="/ui/field.js"></script>
 <script>
 const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + .5) / 16);
 const dotOf = el => getComputedStyle(el).getPropertyValue("--dot").trim();
 
 // A canvas drawn only while it is on screen, at the screen's density.
@@ -315,22 +320,9 @@ function painter(c, draw) {
   function loop(t = performance.now()) { if (!seen) return; g.clearRect(0, 0, W, H); draw(g, W, H, (t - t0) / 1000); if (!still) requestAnimationFrame(loop); }
 }
 
-// Dithered field: the sum of soft blobs, thresholded by the Bayer matrix into dots.
-function dither(g, W, H, S, rgb, alpha, value) {
-  g.fillStyle = `rgba(${rgb},${alpha})`;
-  for (let y = 0, j = 0; y < H; y += S, j++) for (let x = 0, i = 0; x < W; x += S, i++) {
-    if (value(x, y) > BAYER[(j & 3) * 4 + (i & 3)]) g.fillRect(x, y, S * .38, S * .38);
-  }
-}
-const blob = (x, y, bx, by, r) => { const dx = x - bx, dy = y - by; return Math.exp(-(dx * dx + dy * dy) / (r * r)); };
-
 // The hero's clouds.
-painter(document.getElementById("clouds"), (g, W, H, t) => {
-  const A = Math.max(W, H), rgb = "237,237,237";
-  const B = [[.08, .14, .15, .9], [.2, .3, .1, -.6], [.9, .1, .14, -.7], [.78, .26, .09, .8], [.58, .02, .11, .5], [.42, .4, .07, -.4]].map(([x, y, r, s], k) =>
-    [(x + Math.sin(t * .06 * s + k) * .04) * W, (y + Math.cos(t * .05 * s + k * 2) * .03) * H, r * A]);
-  dither(g, W, H, 5, rgb, .75, (x, y) => { let v = 0; for (const [bx, by, r] of B) v += blob(x, y, bx, by, r); return Math.min(1, v) * 1.25 - .3; });
-});
+painter(document.getElementById("clouds"), (g, W, H, t) =>
+  clouds(g, W, H, t, [[.08, .14, .15, .9], [.2, .3, .1, -.6], [.9, .1, .14, -.7], [.78, .26, .09, .8], [.58, .02, .11, .5], [.42, .4, .07, -.4]]));
 
 // The badge: a line of positions, a task landing on it every few seconds.
 painter(document.getElementById("mini"), (g, W, H, t) => {

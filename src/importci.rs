@@ -1407,7 +1407,7 @@ fn plan(top: &Path, ci: &Ci) -> Plan {
         }
         reqs.dedup();
         pkgs.dedup();
-        let mut setup = String::from("python3 -m venv .venv");
+        let mut setup = String::from(crate::up::PY_VENV);
         if !reqs.is_empty() || !pkgs.is_empty() {
             setup.push_str(" && .venv/bin/pip install -q");
             for (flag, f) in &reqs {

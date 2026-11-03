@@ -85,6 +85,12 @@ struct CreateRepo {
     name: String,
     #[serde(default = "advisory")]
     policy: LeasePolicy,
+    /// A repo made from the website starts with a line an agent can open a task on: position 0,
+    /// empty or holding this README.md. Without either, the line waits for `avp init` or `avp up`.
+    #[serde(default)]
+    start: bool,
+    #[serde(default)]
+    readme: Option<String>,
 }
 fn advisory() -> LeasePolicy {
     LeasePolicy::Advisory
@@ -95,9 +101,28 @@ async fn create_repo(State(e): S, asker: axum::http::Extensions, Json(req): Json
     ok(blocking(move || {
         let repo = e.create_repo(&req.name, req.policy)?;
         crate::seam::created(&e, &repo, &asker)?;
+        start_line(&e, &repo, req.start, req.readme.as_deref(), None)?;
         Ok(repo)
     })
     .await?)
+}
+/// Position 0 of a repo made from the website (`start`, or a `readme`): AVP Cloud's way to POST
+/// /repos calls it too, with the person who made it: no task lands position 0, its note names them.
+pub(crate) fn start_line(e: &Engine, repo: &Repo, start: bool, readme: Option<&str>, by: Option<&str>) -> anyhow::Result<()> {
+    if !start && readme.is_none() {
+        return Ok(());
+    }
+    let entries = match readme {
+        Some(text) => vec![ImportEntry { path: "README.md".into(), blob: e.objects.put(text.as_bytes())?, mode: 0o100644 }],
+        None => vec![],
+    };
+    let how = if entries.is_empty() { "empty" } else { "with a README" };
+    let note = match by {
+        Some(p) => format!("created on the web by {p}, {how}"),
+        None => format!("created {how}"),
+    };
+    e.import(&repo.id, &entries, &note)?;
+    Ok(())
 }
 /// The repos the asker may read: on a server with accounts, those they have a role on.
 async fn repos(State(e): S, asker: axum::http::Extensions) -> R {
@@ -121,9 +146,24 @@ async fn put_object(State(e): S, P((_, hash)): P<(String, String)>, body: Bytes)
     }
     ok(serde_json::json!({ "hash": got }))
 }
-async fn get_object(State(e): S, P((_, hash)): P<(String, String)>) -> R {
+#[derive(Deserialize)]
+struct Raw {
+    /// The file's name: the website's Raw shows a text file as text, under that name, not its hash.
+    name: Option<String>,
+}
+async fn get_object(State(e): S, P((_, hash)): P<(String, String)>, Query(q): Query<Raw>) -> R {
     let bytes = blocking(move || e.objects.get(&hash)).await?;
-    Ok(bytes.into_response())
+    let Some(name) = q.name.map(|n| n.replace(|c: char| c == '"' || c == '\\' || c.is_control(), "_")).filter(|n| !n.is_empty()) else { return Ok(bytes.into_response()) };
+    // Text inline (its CSP sandbox and nosniff still on: never a page of this site), anything
+    // else downloaded; under its name either way.
+    let text = !bytes[..bytes.len().min(8000)].contains(&0) && std::str::from_utf8(&bytes).is_ok();
+    let disposition = format!("{}; filename=\"{}\"; filename*=UTF-8''{}", if text { "inline" } else { "attachment" }, name.replace(|c: char| !c.is_ascii(), "_"), url_encode(&name));
+    let kind = if text { "text/plain; charset=utf-8" } else { "application/octet-stream" };
+    Ok(([(axum::http::header::CONTENT_TYPE, kind.to_string()), (axum::http::header::CONTENT_DISPOSITION, disposition)], bytes).into_response())
+}
+/// A file name in a header's `filename*`: every byte but the plain ones percent-encoded.
+fn url_encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 #[derive(Deserialize)]
@@ -436,6 +476,29 @@ async fn status(State(e): S, P((repo, task)): P<(String, String)>) -> R {
 }
 async fn write(State(e): S, P((repo, task)): P<(String, String)>, Json(req): Json<PutWrite>) -> R {
     ok(blocking(move || { own_task(&e, &repo, &task)?; e.write(&task, req) }).await?)
+}
+#[derive(Deserialize)]
+struct FileQuery {
+    /// Unix mode bits; none: the mode the file has at the task's base, or 0o100644 for a new one.
+    mode: Option<u32>,
+}
+/// A write with the file's bytes in the body, for a browser (AVP Cloud's editor and uploads): it has
+/// no blake3 to name the object before sending it, as the CLI does (`PUT /objects/{hash}`, then a
+/// write). The same write after that, under the same gate and the same guarded paths.
+async fn put_file(State(e): S, P((repo, task, path)): P<(String, String, String)>, Query(q): Query<FileQuery>, body: Bytes) -> R {
+    ok(blocking(move || {
+        own_task(&e, &repo, &task)?;
+        let mode = match q.mode {
+            Some(m) => m,
+            None => {
+                let base = e.db.lock().unwrap().task(&task)?.base_tree;
+                e.objects.get_tree(&base)?.get(&path).map_or_else(default_mode, |x| x.mode)
+            }
+        };
+        let blob = e.objects.put(&body)?;
+        e.write(&task, PutWrite { path, kind: WriteKind::Put, blob: Some(blob), mode })
+    })
+    .await?)
 }
 #[derive(Deserialize)]
 struct Paths {
@@ -771,16 +834,28 @@ fn git_said(code: StatusCode, msg: String) -> Response {
     (code, [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], format!("{msg}\n")).into_response()
 }
 
-/// `git clone https://<server>/<repo>.git`, read only: the smart HTTP protocol on the server's own
-/// bare repo of the line (gitbridge::sync_served), answered by `git http-backend`. The gate let
-/// through only the repo's readers. A push is refused: the line moves by landing, nothing else.
-async fn git_http(State(e): S, method: axum::http::Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes) -> Response {
+/// `git clone https://<server>/<repo>.git`: the smart HTTP protocol on the server's own bare repo
+/// of the line (gitbridge::sync_served), answered by `git http-backend`. The gate let through only
+/// the repo's readers. A push is a landing (src/gitpush.rs), which the gate lets its writers do.
+async fn git_http(State(e): S, method: axum::http::Method, uri: axum::http::Uri, headers: HeaderMap, asker: axum::http::Extensions, body: Bytes) -> Response {
     let path = uri.path().trim_start_matches('/');
     let Some((key, rest)) = path.split_once(".git/") else { return git_said(StatusCode::NOT_FOUND, format!("no repo at /{path}")) };
     // `<space>/<repo>.git` on AVP Cloud reaches that space's repo alone.
     let query = uri.query().unwrap_or("").to_string();
-    if rest == "git-receive-pack" || query.contains("service=git-receive-pack") {
-        return git_said(StatusCode::FORBIDDEN, format!("AVP takes no push: the line of {key} moves by landing tasks, each proven on its head.\nOpen a task and land it: `avp open --repo {key} --goal \"...\"`, write, then `avp land`."));
+    if query.contains("service=git-receive-pack") {
+        let (e, key) = (e.clone(), key.to_string());
+        return match tokio::task::spawn_blocking(move || crate::gitpush::advert(&e, &key)).await {
+            Ok(b) => ([(axum::http::header::CONTENT_TYPE, "application/x-git-receive-pack-advertisement"), (axum::http::header::CACHE_CONTROL, "no-cache")], b).into_response(),
+            Err(x) => git_said(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+        };
+    }
+    if rest == "git-receive-pack" {
+        let header = |h: &str| headers.get(h).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        if !header("content-encoding").is_empty() {
+            return git_said(StatusCode::UNSUPPORTED_MEDIA_TYPE, "a push is taken uncompressed".into());
+        }
+        let push = crate::gitpush::Push { key: key.to_string(), person: verified_person(&headers), asker, base_url: crate::gitpush::base_url(&headers) };
+        return crate::gitpush::receive(e, push, body, header("content-type")).await;
     }
     let (key, rest) = (key.to_string(), rest.to_string());
     let advert = rest == "info/refs";
@@ -885,6 +960,7 @@ const SITE_FILES: &[(&str, &str, &str)] = &[
     ("site.css", "text/css; charset=utf-8", include_str!("../ui/site.css")),
     ("site.js", "text/javascript; charset=utf-8", include_str!("../ui/site.js")),
     ("repo.js", "text/javascript; charset=utf-8", include_str!("../ui/repo.js")),
+    ("field.js", "text/javascript; charset=utf-8", include_str!("../ui/field.js")),
 ];
 const SITE_PAGE: &str = include_str!("../ui/site.html");
 /// AVP Cloud's landing page: what a browser signed out sees on `/`, and always on `/welcome`.
@@ -912,7 +988,7 @@ fn site_page() -> Response {
             (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (axum::http::header::CACHE_CONTROL, "no-cache"),
             // Scripts of this server only: a name or a goal that holds markup never runs.
-            (axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; frame-ancestors 'none'"),
         ],
         SITE_PAGE,
     )
@@ -951,6 +1027,8 @@ fn site(api: Router) -> Router {
         .route("/signup", page())
         .route("/new", page())
         .route("/settings", page())
+        .route("/usage", page())
+        .route("/connect", page())
         .route("/o/{org}", page())
         .route("/r/{*rest}", page())
         .fallback_service(api)
@@ -982,6 +1060,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/repos/{repo}/tasks", post(open_task).get(tasks))
         .route("/repos/{repo}/tasks/{task}", get(status))
         .route("/repos/{repo}/tasks/{task}/writes", post(write))
+        .route("/repos/{repo}/tasks/{task}/files/{*path}", put(put_file))
         .route("/repos/{repo}/tasks/{task}/claim", post(claim))
         .route("/repos/{repo}/tasks/{task}/release", post(release))
         .route("/repos/{repo}/tasks/{task}/undo", post(undo))
@@ -1015,6 +1094,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/{a}/git-receive-pack", post(git_http))
         .route("/{a}/{b}/git-receive-pack", post(git_http))
         .merge(crate::seam::routes())
+        // An address no route takes: JSON, as every other answer of the API, not an empty body.
+        .fallback(|m: axum::http::Method, u: axum::http::Uri| async move { (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("no route {m} {}", u.path()) }))) })
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(engine.clone());
     // Who asks and whether they may, for every route: accounts and tokens. The gate goes before
@@ -1022,7 +1103,19 @@ pub fn router(engine: Engine) -> Router {
     // (`/repos/acme/shop/line`).
     let api: Router = crate::seam::access(Router::new().fallback_service(router), &engine).with_state(engine);
     // The website's pages and files go in before the gate: they hold no data (see site_page).
-    site(api)
+    site(api).layer(axum::middleware::map_response(hardened))
+}
+
+/// What every answer says to a browser: its type as sent, never guessed (a repo's file served raw
+/// never becomes a page or a script of this site), and an answer that is no page of the website
+/// (an object, a log, JSON) runs nothing and shows in no frame, opened directly or not.
+async fn hardened(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    h.insert(axum::http::header::X_CONTENT_TYPE_OPTIONS, axum::http::HeaderValue::from_static("nosniff"));
+    if !h.contains_key(axum::http::header::CONTENT_SECURITY_POLICY) {
+        h.insert(axum::http::header::CONTENT_SECURITY_POLICY, axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; sandbox"));
+    }
+    res
 }
 
 pub async fn serve(engine: Engine, addr: &str) -> anyhow::Result<()> {
@@ -1061,7 +1154,7 @@ mod tests {
         let c = reqwest::Client::new();
         let get = |path: &str, accept: &str| c.get(format!("{base}{path}")).header("accept", accept).send();
         // Signed out, `/` is the landing page; signed in, the app.
-        assert!(get("/", "text/html").await.unwrap().text().await.unwrap().contains("Where Coding"));
+        assert!(get("/", "text/html").await.unwrap().text().await.unwrap().contains("Git Was Never"));
         for path in ["/signin", "/r/shop", "/r/shop/code/src/main.rs", "/o/acme"] {
             let r = get(path, "text/html").await.unwrap();
             assert_eq!(r.status(), StatusCode::OK, "{path}");
@@ -1072,6 +1165,8 @@ mod tests {
         let css = get("/ui/site.css", "*/*").await.unwrap();
         assert_eq!(css.headers()["content-type"], "text/css; charset=utf-8");
         assert!(css.text().await.unwrap().contains("--avp-bg:"));
+        // The dotted field both the landing and the app draw with.
+        assert!(get("/ui/field.js", "*/*").await.unwrap().text().await.unwrap().contains("function clouds"));
         assert_eq!(get("/ui/nothing.js", "*/*").await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 }

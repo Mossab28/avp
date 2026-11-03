@@ -1,7 +1,7 @@
 #!/bin/bash
 # Come in from Git, leave with Git: `avp import` makes a repo from a checkout with its history,
 # an agent lands on it, and `git clone <server>/<repo>.git` gives the head of the line on top of
-# the original commits. A push is refused; with accounts, a clone needs a reader's token.
+# the original commits (a push lands: tests/git-push.sh). With accounts, a clone needs a reader's token.
 # Usage: AVP=target/release/avp bash tests/git-clone.sh <scratch dir>
 set -u
 T=${AVP:-$HOME/Projects/avp/target/release/avp}
@@ -29,9 +29,6 @@ ok "on top of the original commits, one commit per landed position" 'git -C c1 m
 ok "the commit says its position" 'git -C c1 log -1 --format=%B | grep -q "^AVP-Position: 2"'
 ok "a space in front that is not the repo's is refused" '! git clone -q $AVP_SERVER/acme/shop.git c0'
 ok "the exec bit is carried" 'git -C c1 ls-tree HEAD bin/run.sh | grep -q "^100755"'
-cd c1 && printf 'x\n' > hand.txt && g add -A && g commit -qm "by hand"
-git push -q origin main >"$W/push.log" 2>&1; P=$?; cd ..
-ok "a push is refused, saying to land through AVP" '[ $P != 0 ] && grep -q "avp land" $W/push.log'
 A=$($T user add ada 2>&1 | grep -o 'avp_[A-Za-z0-9_-]\{40,\}' | head -1)
 B=$(AVP_TOKEN=$A $T user add bob 2>&1 | grep -o 'avp_[A-Za-z0-9_-]\{40,\}' | head -1)
 # As from another machine: the server's own keeps every right.

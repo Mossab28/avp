@@ -257,3 +257,19 @@ fn a_database_from_before_spaces_keeps_its_repos_and_names_them_per_space() {
     assert_eq!(twice, "tools already exists: choose another name");
     assert!(db.repo("hello").unwrap_err().to_string().contains("ada/hello, bob/hello"));
 }
+
+#[test]
+fn a_repo_made_on_the_website_starts_its_line_empty_or_with_a_readme() {
+    let (base, _e, _rt, _d) = served();
+    let http = Client::new();
+    let gia = sign_up(&http, &base, "gia", "203.0.113.31");
+    let as_ = |r: RequestBuilder| from(r, "203.0.113.9", Some(&gia));
+    json_of(as_(http.post(format!("{base}/repos"))).json(&json!({ "name": "notes", "readme": "# notes\n" })));
+    let tree = json_of(as_(http.get(format!("{base}/repos/gia/notes/tree/0"))));
+    let blob = tree["README.md"]["blob"].as_str().unwrap().to_string();
+    assert_eq!(as_(http.get(format!("{base}/repos/gia/notes/objects/{blob}"))).send().unwrap().text().unwrap(), "# notes\n");
+    json_of(as_(http.post(format!("{base}/repos"))).json(&json!({ "name": "blank", "start": true })));
+    assert_eq!(json_of(as_(http.get(format!("{base}/repos/gia/blank/head"))))["position"], 0, "an empty repo has a head a task opens on");
+    json_of(as_(http.post(format!("{base}/repos"))).json(&json!({ "name": "later" })));
+    assert_eq!(status(as_(http.get(format!("{base}/repos/gia/later/head")))), 400, "without either, the line waits for avp init");
+}

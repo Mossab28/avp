@@ -39,6 +39,10 @@ pub struct Deploys {
     deploy_locks: Mutex<HashMap<(String, String), Arc<Mutex<()>>>>,
 }
 
+/// A `run` deploy runs on the server's own machine, outside any sandbox, with its credentials: on
+/// AVP Cloud that machine holds every organization's data, and the command is a stranger's.
+const RUN_ON_CLOUD: &str = "a deploy AVP runs itself (`deploy = { run = ... }`) runs on the server's machine, which AVP Cloud shares with every organization: here a deploy is a GitHub workflow (`deploy = { github_workflow = \"deploy.yml\" }`), or no deploy, the environment then moving when promoted";
+
 impl Engine {
     /// Each environment that follows the full suite takes the newest green position, once it
     /// serves the one it was last promoted to. Promoted again while a deploy runs, it would start
@@ -160,6 +164,8 @@ impl Engine {
     /// The bridge's latest reading of a deploy's step.
     pub fn deploy_progress(&self, repo: &str, name: &str, mut p: DeployProgress) -> Result<DeployProgress> {
         p.at = now_ms();
+        // A link every reader of the repo is shown and clicks: a web page, never `javascript:`.
+        anyhow::ensure!(p.url.as_deref().is_none_or(|u| u.starts_with("https://") || u.starts_with("http://")), "a deploy's url is an http(s) address");
         self.cloud.deploys.progress.lock().unwrap_or_else(|e| e.into_inner()).insert((repo.to_string(), name.to_string()), p.clone());
         Ok(p)
     }
@@ -228,6 +234,7 @@ impl Engine {
             db.emit(repo, "env.moved", entry.task.as_deref(), None, rolled_back(serde_json::json!({ "env": name, "position": position, "by": person }), rollback))?;
             return Ok(env);
         };
+        anyhow::ensure!(!matches!(deploy, Deploy::Run(_)) || !super::orgs::on(), "{}", RUN_ON_CLOUD);
         let p = Promotion { position, git: entry.git.clone(), by: person.to_string(), agent: agent.to_string(), at: now_ms() };
         db.set_promotion(repo, name, &p)?;
         db.emit(repo, "env.promoted", entry.task.as_deref(), None, rolled_back(serde_json::json!({ "env": name, "position": position, "by": person, "agent": agent, "git": entry.git }), rollback))?;
@@ -344,6 +351,8 @@ impl Engine {
         };
         let colors = regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").unwrap();
         let ran = || -> Result<Step> {
+            // One recorded before this server ran AVP Cloud, resumed at a restart, neither.
+            anyhow::ensure!(!super::orgs::on(), "{}", RUN_ON_CLOUD);
             anyhow::ensure!(safe_path(name) && !name.contains('/'), "{name:?} cannot name the deploy's folder");
             let mut run = command.replace("{position}", &p.position.to_string());
             if run.contains("{git}") {

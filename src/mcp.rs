@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Mcp {
     /// The session's view: the directory the agent started in, or the folder avp_open laid out
@@ -70,7 +70,7 @@ fn on_a_task(name: &str, args: &Value) -> bool {
 }
 
 /// What `task` says to a tool, given to every tool but avp_open.
-const TASK_ARG: &str = "The task this call is for: its id, or the start of one. Needed only when this session has several tasks open (a lead whose subagents each opened one); with one, it is that one.";
+const TASK_ARG: &str = "The task this call is for: its id, or the start of one. Needed only when this session has several tasks open (a lead whose subagents each opened one); with one, it is that one. An open task of yours this session does not know (its MCP server restarted) is taken back, its folder laid out.";
 
 /// What a land or a check says when the server holds its proof back: it drains (`POST /drain`)
 /// before it takes a new version, and starts no proof until then.
@@ -82,21 +82,36 @@ pub const RESTARTED: &str = "the server restarts on its new version: asking agai
 /// proof for an update (`GET /drain?task=`, after 2 s, then every 10 s), so that an agent does not
 /// wait in silence. The update ends in a restart, which cuts the answer: once the server answers
 /// again (5 min at most), `ask` goes again, and the proof starts there. Without a drain, an error
-/// is the error.
-pub fn through_drain<T>(client: &Client, task: &str, say: Arc<dyn Fn(&str) + Send + Sync>, ask: impl Fn() -> Result<T>) -> Result<T> {
+/// is the error. Meanwhile `tell` hears where the proof stands each time it changes (the task's
+/// status, every 2 s): waiting for a machine and how many ahead, preparing, the step it runs.
+pub fn through_drain<T>(client: &Client, repo: &str, task: &str, say: Arc<dyn Fn(&str) + Send + Sync>, tell: Arc<dyn Fn(&str) + Send + Sync>, ask: impl Fn() -> Result<T>) -> Result<T> {
     loop {
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let held = Arc::new(AtomicBool::new(false));
         // False once `ask` is over: nothing is said after its answer.
         let live = Arc::new(Mutex::new(true));
         {
-            let (client, path, held, live, say) = (client.clone(), format!("/drain?task={task}"), held.clone(), live.clone(), say.clone());
+            let (client, path, held, live, say, tell) = (client.clone(), format!("/drain?task={task}"), held.clone(), live.clone(), say.clone(), tell.clone());
+            let status = format!("/repos/{repo}/tasks/{task}");
             std::thread::spawn(move || {
-                let mut every = Duration::from_secs(2);
-                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
-                    every = Duration::from_secs(10);
-                    // A server from before the drain, or one that restarts: nothing more to say.
-                    let Ok(d) = client.get::<Value>(&path) else { return };
+                let (mut tick, mut drains, mut told) = (0u32, true, None::<String>);
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(Duration::from_secs(2)) {
+                    tick += 1;
+                    if let Ok(st) = client.get::<TaskStatus>(&status) {
+                        let live = live.lock().unwrap_or_else(|e| e.into_inner());
+                        if *live && st.progress.is_some() && st.progress != told {
+                            tell(st.progress.as_deref().unwrap_or_default());
+                            told = st.progress;
+                        }
+                    }
+                    // A server from before the drain, or one that restarts: nothing more to say of it.
+                    if !drains || tick % 5 != 1 {
+                        continue;
+                    }
+                    let Ok(d) = client.get::<Value>(&path) else {
+                        drains = false;
+                        continue;
+                    };
                     let live = live.lock().unwrap_or_else(|e| e.into_inner());
                     if *live && d["held"] == true && !held.swap(true, Ordering::Relaxed) {
                         say(DRAINED);
@@ -119,6 +134,13 @@ pub fn through_drain<T>(client: &Client, task: &str, say: Arc<dyn Fn(&str) + Sen
             out => return out,
         }
     }
+}
+
+/// How long a proof waited for a machine, as a line of a tool's answer, when it waited (2 s and
+/// more: the status is read every 2 s).
+fn queued_line(queued: &Mutex<Option<(Instant, Instant)>>) -> Option<String> {
+    let (first, last) = (*queued.lock().unwrap_or_else(|e| e.into_inner()))?;
+    Some(format!("the proof waited about {}s for a machine before it ran\n", (last - first).as_secs() + 2))
 }
 
 /// The file a conversation is being written to: the most recently written `.jsonl` under `dir`
@@ -368,12 +390,13 @@ fn tools() -> Vec<Value> {
         tool("avp_secrets", "The repo's secrets for tests: names and when each was set, never a value. When a red step says a secret it names is not set, tell a person which one: they set it with `avp secret set NAME` (the value on stdin). An agent never handles a value.", json!({}), &[]),
         tool("avp_migrate_report", "The last `avp migrate` report of this repo: what moving the team to AVP did (server, line, mirror on avp/line, agents, avp.toml from the CI), each proof step and shard of the whole suite green or red on the head with what to change, and the plan of what is left, numbered like docs/MIGRATE.md. Read it when asked to finish a move to AVP: fix what is red in avp.toml, then ask a person to run `avp migrate` again; tell a person what is theirs (a secret to set, main to protect).", json!({ "repo": { "type": "string", "description": "AVP repo: its name, or `<space>/<name>` on AVP Cloud (acme/shop), when this directory is neither a view nor its checkout (default: $AVP_REPO)." } }), &[]),
         tool("avp_abandon", "Drop the open task and its leases. Nothing lands.", json!({}), &[]),
+        tool("avp_repo", "A repo's settings (its admins'), as its settings page has them: `show` (who reaches it, the tokens made for it, what guards it), `invite` a person by name or email with a `role` (read, write, admin), change a `role`, `remove` one, `token` (a token for this repo alone, `role` read or write, shown once: hand it to the CI, never print it back), `revoke` one by `id`, `rename`, `describe`, `visibility` (private or public), `transfer` to a space `to`, `archive`, `unarchive`, `delete` (only with `confirm` set to the repo's name, and only when a person asked for it: restorable 7 days), `restore`, `log` (who changed what, when). Each answer says what changed and what to do next.", json!({ "action": { "type": "string", "enum": crate::repo_settings::ACTIONS }, "repo": { "type": "string", "description": "AVP repo: its name, or `<space>/<name>` on AVP Cloud (default: this view's, or $AVP_REPO)." }, "person": { "type": "string", "description": "A person's name or email (invite, role, remove)." }, "role": { "type": "string", "description": "read, write or admin (invite, role); read or write (token)." }, "name": { "type": "string", "description": "The new name (rename), or what a token is for (token)." }, "description": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public"] }, "to": { "type": "string", "description": "The space to move it to (transfer): your name or an organization you administer." }, "confirm": { "type": "string", "description": "The repo's name, typed (delete)." }, "id": { "type": "string", "description": "A token id (revoke)." }, "expires": { "type": "string", "description": "When a token stops: 90d, 12h, a date, or never (token)." } }), &["action"]),
         tool("avp_goal", "Say the open task's goal better before it lands: what it changes, in one sentence. Once landed, it is the line's record of the change.", json!({ "goal": { "type": "string" } }), &["goal"]),
         tool("avp_outbox", "What waits in this folder's outbox (what changed something while the server did not answer), sent in order: each entry, when it was queued, why its last send failed. When an answer says the outbox is stuck on an entry the server refused, `retry` sends it again, `drop` takes entries out by number (`avp outbox` for a person).", json!({ "retry": { "type": "boolean" }, "drop": { "type": "array", "items": { "type": "integer" }, "description": "Entry numbers, as listed." } }), &[]),
     ]
     .into_iter()
     .map(|mut t| {
-        if !matches!(t["name"].as_str(), Some("avp_open" | "avp_migrate_report")) {
+        if !matches!(t["name"].as_str(), Some("avp_open" | "avp_migrate_report" | "avp_repo")) {
             t["inputSchema"]["properties"]["task"] = json!({ "type": "string", "description": TASK_ARG });
         }
         t
@@ -440,6 +463,11 @@ impl Mcp {
                 if let Some(d) = landed {
                     return Ok(d);
                 }
+                // An open task of this person from before this server started (the host restarted
+                // it): taken back, in its folder.
+                if let Some(d) = self.take_back(want, args)? {
+                    return Ok(d);
+                }
             }
             return match hits.as_slice() {
                 [(d, _, _)] => Ok(d.clone()),
@@ -456,6 +484,39 @@ impl Mcp {
             [] => Ok(session),
             _ => anyhow::bail!("{} tasks are open in this session (a lead's subagents each opened one): pass `task`, one of\n{}", open.len(), list()),
         }
+    }
+
+    /// The open task `want` names, of this person, that this session does not have yet (its MCP
+    /// server restarted, its host was closed): taken back in the folder that still says it is
+    /// its, else in a new one with the task's tree laid out. None when the repo has no such task.
+    fn take_back(&self, want: &str, args: &Value) -> Result<Option<PathBuf>> {
+        let repo = args["repo"].as_str().map(String::from).or_else(|| std::env::var("AVP_REPO").ok()).or_else(|| view::load(&self.dir()).ok().map(|s| s.repo)).or_else(|| crate::up::repo_name(&self.started_in));
+        let Some(repo) = repo else { return Ok(None) };
+        let Ok(open) = self.client.get::<Vec<Task>>(&format!("/repos/{repo}/tasks?state=open")) else { return Ok(None) };
+        let [task] = open.iter().filter(|t| t.id.starts_with(want)).collect::<Vec<_>>()[..] else { return Ok(None) };
+        let me = self.actor().person;
+        anyhow::ensure!(task.actor.person == me, "task {} is {}'s, not yours ({me}): only its person takes it back", task.id, task.actor.person);
+        let base = crate::up::views();
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&base).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        dirs.push(self.started_in.clone());
+        let dir = match dirs.into_iter().find(|d| view::load(d).ok().and_then(|v| v.task).as_deref() == Some(task.id.as_str())) {
+            Some(d) => {
+                anyhow::ensure!(hold(&d), "task {} is in {}, which another live session holds", task.id, d.display());
+                d
+            }
+            None => {
+                let r: Repo = self.client.get(&format!("/repos/{repo}"))?;
+                let name = slug(&r.name);
+                let dir = (1..).map(|n| base.join(format!("{name}-{n}"))).find(|d| !d.exists() && hold(d)).unwrap();
+                let mut s = view::ViewState { server: self.client.base.clone(), repo: task.repo.clone(), task: Some(task.id.clone()), base: Some((task.base_position, task.base_tree.clone())), known: BTreeMap::new(), ..Default::default() };
+                let tree: Tree = self.client.get(&format!("/repos/{repo}/tasks/{}/tree", task.id))?;
+                view::lay_out(&self.client, &tree, &dir, &mut s, &[self.started_in.clone()])?;
+                view::save(&dir, &s)?;
+                dir
+            }
+        };
+        self.slot(&dir);
+        Ok(Some(dir))
     }
 
     /// What a land or a check says while the server drains (see through_drain): a progress
@@ -476,6 +537,30 @@ impl Mcp {
             }
         };
         (Arc::new(say), said)
+    }
+
+    /// Where a land's or a check's proof stands, each change a progress notification when the
+    /// host gave a token for one; and how long it stood waiting for a machine, from the first time
+    /// it was seen queued to the last, for the tool's answer.
+    #[allow(clippy::type_complexity)]
+    fn progress_tell(&self) -> (Arc<dyn Fn(&str) + Send + Sync>, Arc<Mutex<Option<(Instant, Instant)>>>) {
+        let queued: Arc<Mutex<Option<(Instant, Instant)>>> = Arc::default();
+        let (token, seen) = (PROGRESS.with(|p| p.borrow().clone()), queued.clone());
+        let n = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tell = move |now: &str| {
+            if now.starts_with("queued") || now.starts_with("waiting for a machine") {
+                let mut q = seen.lock().unwrap_or_else(|e| e.into_inner());
+                let at = Instant::now();
+                *q = Some((q.map(|(first, _)| first).unwrap_or(at), at));
+            }
+            if let Some(token) = &token {
+                let note = json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progressToken": token, "progress": n.fetch_add(1, Ordering::Relaxed) + 1, "message": format!("proof: {now}") } });
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{note}");
+                let _ = out.flush();
+            }
+        };
+        (Arc::new(tell), queued)
     }
 
     /// Appends one line to the journal. Never fails the call it describes.
@@ -629,7 +714,7 @@ impl Mcp {
         let open: Vec<Task> = self.client.get(&format!("/repos/{repo}/tasks?state=open")).unwrap_or_default();
         out.push_str(&format!("\n{}", crate::wait::open_hint(&open, &task.id).unwrap_or_else(|| "No other open task on this repo.".into())));
         if !task.similar.is_empty() {
-            out.push_str("\nOpen tasks with a close goal (someone may already be doing this: check before duplicating, or abandon):");
+            out.push_str("\nOpen tasks with a close goal (someone may already be doing this: check before duplicating, or abandon). One of yours, from before a restart: pass its id as `task` to any avp_ tool (avp_status) to take it back in its folder, and avp_abandon this one:");
             for o in &task.similar {
                 out.push_str(&format!("\n  {o}"));
             }
@@ -656,7 +741,7 @@ impl Mcp {
         self.slot(&self.dir()).taken.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::history::outside_scope(r.puts.iter().chain(r.deletes.iter())));
         let mut lines = Vec::new();
         for w in r.puts.iter().chain(r.deletes.iter()) {
-            lines.push(format!("{} {} [{}{}]", if w.write.kind == WriteKind::Delete { "-" } else { "+" }, w.write.path, w.lease, w.previous_holder.as_ref().map(|h| format!(" from {h}")).unwrap_or_default()));
+            lines.push(format!("{} {} [{}]{}", if w.write.kind == WriteKind::Delete { "-" } else { "+" }, w.write.path, crate::model::lease_said(&w.lease, w.previous_holder.as_deref()), if w.write.kind == WriteKind::Delete { String::new() } else { view::size_note(&self.dir(), &w.write.path) }));
         }
         Ok(if lines.is_empty() { "no new writes".into() } else { lines.join("\n") })
     }
@@ -761,6 +846,12 @@ impl Mcp {
                     out.push_str(&format!("\n  {} {p}", match w.kind { WriteKind::Put => "+", WriteKind::Delete => "-", WriteKind::Conflict => "! (unsettled conflict)" }));
                 }
                 out.push_str(&format!("\nleases: {}", st.leases.iter().map(|l| l.path.clone()).collect::<Vec<_>>().join(", ")));
+                if let Some(now) = &st.progress {
+                    out.push_str(&format!("\nproof running: {now}"));
+                }
+                for t in &st.taken_over {
+                    out.push_str(&format!("\nlease lost: {t} (coordinate before writing it again)"));
+                }
                 if let Some(p) = &st.last_proof {
                     out.push_str(&format!("\nlast proof: {}", Self::proof_text(p)));
                 }
@@ -777,8 +868,9 @@ impl Mcp {
                 let synced = self.sync(&mut s)?;
                 let t = self.task(&s)?;
                 let (say, said) = self.drain_say();
-                let p: Proof = through_drain(&self.client, &t, say, || self.client.check(&repo, &t))?;
-                let waited: String = said.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| format!("{l}\n")).collect();
+                let (tell, queued) = self.progress_tell();
+                let p: Proof = through_drain(&self.client, &repo, &t, say, tell, || self.client.check(&repo, &t))?;
+                let waited: String = said.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| format!("{l}\n")).chain(queued_line(&queued)).collect();
                 Ok(format!("{waited}sync: {synced}\n{}{}", Self::proof_text(&p), self.first_writes(&repo, &t)))
             }
             "avp_land" => {
@@ -801,9 +893,11 @@ impl Mcp {
                     Value::String(w) => vec![w.clone()],
                     w => w.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default(),
                 };
-                let landed = through_drain(&self.client, &t, say, || if with.is_empty() { self.client.land_as(&repo, &t, stack) } else { self.client.land_with(&repo, &t, &with) })?;
-                // What the agent waited for, when the server drained under it, then the answer.
-                let waited: String = said.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| format!("{l}\n")).collect();
+                let (tell, queued) = self.progress_tell();
+                let landed = through_drain(&self.client, &repo, &t, say, tell, || if with.is_empty() { self.client.land_as(&repo, &t, stack) } else { self.client.land_with(&repo, &t, &with) })?;
+                // What the agent waited for, when the server drained under it or no machine was
+                // free, then the answer.
+                let waited: String = said.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| format!("{l}\n")).chain(queued_line(&queued)).collect();
                 match landed {
                     Ok(l) => {
                         let tree: Tree = self.client.get(&format!("/repos/{repo}/tree/{}", l.position))?;
@@ -818,7 +912,7 @@ impl Mcp {
                             std::thread::spawn(move || crate::checkout::align_when_written(&client, &dir, &repo, position, std::time::Duration::from_secs(120)));
                         }
                         let under: String = l.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
-                        Ok(format!("{waited}sync: {synced}\n{under}landed at position {}{}{} (proof {}). The task is closed; open a new one for the next piece of work.", l.position, crate::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof))
+                        Ok(format!("{waited}sync: {synced}\n{under}landed at position {}{}{} (proof {}{}). The task is closed; open a new one for the next piece of work.", l.position, crate::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof, if l.checks == Some(0) { format!(": {}", crate::model::NO_CHECKS) } else { String::new() }))
                     }
                     Err(n) => {
                         let under: String = n.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
@@ -859,7 +953,8 @@ impl Mcp {
                             out.push_str(&format!("\nThese paths are guarded: {}.", n.guarded.join(", ")));
                         }
                         if n.reason == "approval" {
-                            out.push_str("\nYour proof is green; this repo needs a person's approval before landing. Say so in your final message and stop: a person will approve or refuse, and you will be asked to land again.");
+                            let green = if n.proof.is_some() { "Your proof is green; " } else { "" };
+                            out.push_str(&format!("\n{green}this repo needs a person's approval before landing, which no agent gives: a person approves it on {}/r/{repo}/tasks/{t} (or with `avp approve {t}`, which asks their password). Say so in your final message, with that page, and stop: a person will approve or refuse, and you will be asked to land again.", self.client.site()));
                         }
                         if let Some(w) = &n.word {
                             out.push_str(&format!("\nRefused by {}: {}\nAddress the reason, then avp_land again.", w.person, w.reason));
@@ -872,7 +967,7 @@ impl Mcp {
                 let t = self.task(&s)?;
                 let paths: Vec<String> = args["paths"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
                 let r: Vec<(String, Option<String>)> = self.client.post(&format!("/repos/{repo}/tasks/{t}/claim"), &json!({ "paths": paths }))?;
-                let mut out = r.iter().map(|(p, h)| format!("{p}: {}", h.as_ref().map(|h| format!("taken from {h}")).unwrap_or_else(|| "taken".into()))).collect::<Vec<_>>().join("\n");
+                let mut out = r.iter().map(|(p, h)| format!("{p}: {}", h.as_ref().map(|h| format!("yours now, taken from task {h} (it is told)")).unwrap_or_else(|| "yours".into()))).collect::<Vec<_>>().join("\n");
                 // About to write outside the scope: what the line remembers of those paths.
                 let c = crate::history::first_writes(&self.client, &repo, &t, &paths);
                 if !c.is_empty() {
@@ -1038,7 +1133,11 @@ impl Mcp {
                     None => {
                         let t = self.task(&s)?;
                         let st: TaskStatus = self.client.get(&format!("/repos/{repo}/tasks/{t}"))?;
-                        st.last_proof.context("this task has no proof yet: avp_land (or avp_check) runs one")?.id
+                        match (st.last_proof, st.progress) {
+                            (Some(p), _) => p.id,
+                            (None, Some(now)) => anyhow::bail!("this task's first proof is not done yet: {now}. avp_status shows where it stands"),
+                            (None, None) => anyhow::bail!("this task has no proof yet: avp_land (or avp_check) runs one"),
+                        }
                     }
                 };
                 self.proof_read(&repo, &id, args["step"].as_str(), args["lines"].as_u64().unwrap_or(60).clamp(5, 400) as usize)
@@ -1097,6 +1196,12 @@ impl Mcp {
                 Some(r) => crate::migrate::text(&r),
                 None => "no `avp migrate` report for this repo on this machine: a person runs `avp migrate` in a checkout of it (`--json` for an agent), then this tool returns what it found and what is left".into(),
             });
+        }
+        // A repo's settings: no task, the repo named or this folder's.
+        if name == "avp_repo" {
+            let key = args["repo"].as_str().map(String::from).or_else(|| view::load(&self.dir()).ok().map(|s| s.repo)).or_else(|| std::env::var("AVP_REPO").ok()).or_else(|| crate::up::repo_name(&self.dir())).context("repo: name the repo, this folder is no view of one")?;
+            let action = args["action"].as_str().unwrap_or("show");
+            return Ok(crate::repo_settings::text(action, &crate::repo_settings::ask(&self.client, &key, action, args)?));
         }
         let link = if view::load(&self.dir()).is_ok() { offline::flush(&self.client, &self.dir(), true) } else { offline::Link::default() };
         let task = view::load(&self.dir()).ok().and_then(|s| s.task);
@@ -1295,7 +1400,8 @@ impl Mcp {
                                 a.insert(k.clone(), v.as_str().map(|s| json!(clip(s, 200))).unwrap_or_else(|| v.clone()));
                             }
                             let task = view::load(&self.dir()).ok().and_then(|s| s.task);
-                            let (ok, text) = match &r { Ok(t) => (true, t.clone()), Err(e) => (false, format!("{e:#}")) };
+                            // A step's log as a runner colored it: the agent reads it without the escapes.
+                            let (ok, text) = match &r { Ok(t) => (true, crate::check::strip_ansi(t).into_owned()), Err(e) => (false, crate::check::strip_ansi(&format!("{e:#}")).into_owned()) };
                             self.log("call", json!({ "tool": name, "args": a, "ms": t0.elapsed().as_millis() as u64, "ok": ok, "out": clip(&text, if ok { 300 } else { 600 }), "dir": self.dir().display().to_string(), "task": task }));
                             if let Some(id) = id {
                                 let _ = reply(id, Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": !ok })));

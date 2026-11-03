@@ -112,7 +112,7 @@ fn a_github_deploy_job_becomes_the_commands_avp_runs() {
 fn a_python_repo_proves_from_a_virtualenv() {
     let (i, cfg) = import(&fixture("python"));
     let c = &cfg.check;
-    assert_eq!(c.setup.as_deref(), Some("python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt -r requirements-dev.txt"));
+    assert_eq!(c.setup.as_deref(), Some(format!("{} && .venv/bin/pip install -q -r requirements.txt -r requirements-dev.txt", avp::up::PY_VENV).as_str()));
     assert_eq!((c.setup_keys.as_slice(), c.setup_links.as_slice()), (&["requirements.txt".to_string(), "requirements-dev.txt".into()][..], &[".venv".to_string()][..]));
     // The project itself installs in the candidate, before its first Python step.
     assert_eq!(steps(&cfg), [("typecheck", ".venv/bin/pip install -q -e . && .venv/bin/python -m mypy src"), ("lint", ".venv/bin/python -m ruff check ."), ("tests", ".venv/bin/python -m pytest -q --cov=app")]);

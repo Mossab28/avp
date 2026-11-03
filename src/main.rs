@@ -32,8 +32,8 @@ enum Cmd {
     /// repo imported from its history, the checks its proofs run, a mirror that writes every
     /// landed task on a branch of its own, and AVP wired for every coding agent on this machine.
     Up {
-        /// Repo name on the server (default: the checkout's folder name).
-        #[arg(long)]
+        /// Repo name on the server (default: the checkout's folder name). `--as` says the same.
+        #[arg(long, visible_alias = "as")]
         name: Option<String>,
         /// The branch the mirror writes.
         #[arg(long, default_value = "avp/line")]
@@ -565,8 +565,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// Set your password (or change it), typed here: an account made with `avp user add` has none,
+    /// and a password is what lets it approve.
+    Password,
     /// Who the server takes you for, and your role on each repo.
     Whoami,
+    /// A repo's settings, as its settings page has them (its admins'): who reaches it, the tokens
+    /// made for it, its name, description and visibility, its space, archive and deletion, what
+    /// guards it, and the log of every change. Each answer says what to do next.
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
+        /// The repo (default: this view's).
+        #[arg(long, global = true)]
+        repo: Option<String>,
+    },
     /// AVP Cloud's organizations (a server with AVP_CLOUD=1): members and their org role (member:
     /// write on its repos, admin: admin), invitations, the plan, and the month's proof minutes.
     Org {
@@ -599,6 +612,10 @@ enum Cmd {
 enum OrgCmd {
     /// A new organization: you are its owner, on the free plan.
     Create { name: String },
+    /// Give an organization another name (its owners and admins).
+    Rename { org: String, to: String },
+    /// End an organization that holds no repo (its owners and admins).
+    Delete { org: String },
     /// The organizations you belong to: your role, the plan, the seats.
     List,
     /// An organization: its plan, members, repos, and for its admins the invitations unanswered.
@@ -639,6 +656,72 @@ enum OrgCmd {
         #[arg(long, default_value_t = 0)]
         since: i64,
     },
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// Everything at once: state, who reaches it, the tokens, the guards.
+    Show,
+    /// Give a person a role on it at once, by name or by email (they must have signed up).
+    Invite {
+        person: String,
+        /// read (the line, clone), write (open and land tasks), or admin (its settings too).
+        #[arg(long, default_value = "write")]
+        role: String,
+    },
+    /// Change a person's role: read, write, admin, or none.
+    Role { person: String, role: String },
+    /// Take a person's role away.
+    Rm { person: String },
+    /// Tokens made for this repo alone, for an agent or a CI.
+    Token {
+        #[command(subcommand)]
+        cmd: RepoTokenCmd,
+    },
+    /// A new name: the old one keeps reaching it, `git clone` included.
+    Rename { name: String },
+    /// Say what the repo is, in a line (empty: none).
+    Describe { description: String },
+    /// private (those given a role reach it) or public (anyone reads it; writing needs a role).
+    Visibility { visibility: String },
+    /// Move it to another space you own: yours, or an organization you administer (AVP Cloud).
+    Transfer { to: String },
+    /// Make it read-only (nothing opens nor lands); with --off, writable again.
+    Archive {
+        #[arg(long)]
+        off: bool,
+    },
+    /// Delete it: it answers as missing at once, its data goes after 7 days, restorable until then.
+    Delete {
+        /// Its name, typed: nothing is deleted by mistake.
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Bring back a repo deleted less than 7 days ago.
+    Restore,
+    /// Who changed a setting, a role, a token, a guard or a secret, and when, newest first.
+    Log {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoTokenCmd {
+    /// A token that reaches this repo alone, shown once: put it in the agent's or CI's AVP_TOKEN.
+    Create {
+        /// What it is for (a CI, an agent).
+        #[arg(long, default_value = "agent")]
+        name: String,
+        /// read or write.
+        #[arg(long, default_value = "read")]
+        role: String,
+        /// When it stops: 90d, 12h, a date, or never.
+        #[arg(long, default_value = "never")]
+        expires: String,
+    },
+    /// Stop a token made for this repo, at once.
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -811,9 +894,16 @@ fn versioned_files(dir: &Path) -> Result<std::collections::BTreeMap<String, (Str
 fn upload_dir(client: &Client, repo: &str, dir: &Path) -> Result<Vec<ImportEntry>> {
     let files = versioned_files(dir)?;
     let mut entries = Vec::with_capacity(files.len());
-    for (path, (hash, mode)) in files {
+    for (path, (mut hash, mode)) in files {
         if !client.has_object(repo, &hash)? {
-            client.put_object(repo, view::read_project(&dir.join(&path))?)?;
+            // The tree names what was sent: a file that changed since it was hashed (a live
+            // database, a log) is taken as it is read now, not left pointing at a blob never sent.
+            match view::read_project(&dir.join(&path)) {
+                Ok(bytes) => hash = client.put_object(repo, bytes)?,
+                // Gone since it was listed (a database's journal): nothing of it to keep.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
         entries.push(ImportEntry { path, blob: hash, mode });
     }
@@ -885,7 +975,11 @@ fn download_artifacts(client: &Client, repo: &str, id: &str, steps: &[(&Step, &s
 
 fn verdict_line(p: &Proof) -> String {
     let steps: Vec<String> = p.steps.iter().map(|s| format!("{} {} ({:.1}s)", if s.exit == 0 { "✓" } else { "✗" }, s.name, s.seconds)).collect();
-    let mut s = format!("{:?} on position {}: {}", p.verdict, p.base_position, steps.join(", "));
+    let mut s = if steps.is_empty() && p.verdict == Verdict::Green {
+        format!("No checks on position {}: avp.toml has no [[check.steps]], so this proof proved nothing", p.base_position)
+    } else {
+        format!("{:?} on position {}: {}", p.verdict, p.base_position, steps.join(", "))
+    };
     if let Some(t) = &p.timing {
         s.push_str(&format!("\n  {}", timing_line(t)));
     }
@@ -894,7 +988,8 @@ fn verdict_line(p: &Proof) -> String {
             s.push_str(&format!("\n  {f}{}", h.as_ref().map(|h| format!("  (held by {h})")).unwrap_or_default()));
         }
         if let Some(last) = p.steps.iter().find(|s| s.exit != 0) {
-            let tail: Vec<&str> = avp::check::red_part(&last.output).lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect();
+            let red = avp::check::strip_ansi(avp::check::red_part(&last.output));
+            let tail: Vec<&str> = red.lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect();
             s.push_str("\n  ---\n  ");
             s.push_str(&tail.join("\n  "));
         }
@@ -988,6 +1083,35 @@ fn secret_value(name: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// A line typed at this terminal, unseen.
+fn typed(what: &str) -> Result<String> {
+    let mut line = String::new();
+    eprint!("{what} (not shown, Enter ends it): ");
+    {
+        let _unseen = Unechoed::new();
+        std::io::stdin().read_line(&mut line)?;
+    }
+    eprintln!();
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// A person's word on a task. AVP Cloud takes it from a person, never from a token alone: their
+/// password goes with it, typed on this terminal (never read from the environment or a pipe, which
+/// an agent fills). Without a terminal, the task's page is where they give it.
+fn word(client: &Client, repo: &str, task: &str, approved: bool, reason: &str) -> Result<Approval> {
+    use std::io::IsTerminal;
+    let path = format!("/repos/{repo}/tasks/{task}/approve");
+    let mut body = serde_json::json!({ "person": actor().person, "approved": approved, "reason": reason });
+    // AVP Cloud signs in with passwords (`/auth` says so); a team server takes the word as before.
+    if client.get::<serde_json::Value>("/auth").is_ok_and(|w| w["password"] == true) {
+        let page = format!("{}/r/{repo}/tasks/{task}", client.site());
+        anyhow::ensure!(std::io::stdin().is_terminal(), "an approval is a person's: approve it on {page}, or run `avp approve {task}` in a terminal, which asks your password");
+        let password = typed("password")?;
+        body["password"] = password.into();
+    }
+    client.post(&path, &body)
+}
+
 /// The terminal's echo, off while this lives: a value typed is not shown.
 struct Unechoed(#[cfg(unix)] Option<libc::termios>);
 
@@ -1023,6 +1147,11 @@ impl Drop for Unechoed {
 /// A land or a check that waits for the server's update says so, apart from its answer.
 fn say_drain() -> std::sync::Arc<dyn Fn(&str) + Send + Sync> {
     std::sync::Arc::new(|line: &str| eprintln!("{line}"))
+}
+
+/// Where a land's or a check's proof stands, a line of its own on stderr each time it changes.
+fn tell_progress() -> std::sync::Arc<dyn Fn(&str) + Send + Sync> {
+    std::sync::Arc::new(|now: &str| eprintln!("proof: {now}"))
 }
 
 /// An answer given without the server: its first line says so. With --json, the JSON alone on
@@ -1067,7 +1196,40 @@ fn views_dir(views: Option<PathBuf>) -> PathBuf {
     views.or_else(|| std::env::var("AVP_VIEWS").ok().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("avp"))
 }
 
-fn main() -> Result<()> {
+/// A file this big in a task is most often a build output an agent left behind: said before it lands
+/// (every clone carries it after), never refused.
+const BIG_FILE: u64 = 10 * 1024 * 1024;
+fn warn_big_files(client: &Client, dir: &Path, repo: &str, task: &str) {
+    let Ok(st) = client.get::<TaskStatus>(&format!("/repos/{repo}/tasks/{task}")) else { return };
+    let mut big: Vec<(String, u64)> = st.writes.iter().filter(|w| !w.undone).filter_map(|w| {
+        let len = std::fs::metadata(dir.join(&w.path)).ok()?.len();
+        (len >= BIG_FILE).then(|| (w.path.clone(), len))
+    }).collect();
+    big.sort();
+    big.dedup();
+    for (path, len) in big {
+        eprintln!("warning: {path} is {} MB, and every clone of the line will carry it. A build output? `avp undo --path {path}` takes it out before landing.", len / (1024 * 1024));
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let mut said = vec![];
+            for c in e.chain() {
+                let c = c.to_string();
+                if !c.trim().is_empty() && said.last() != Some(&c) {
+                    said.push(c);
+                }
+            }
+            eprintln!("Error: {}", said.join(": "));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     avp::legacy_env();
     let matches = <Cli as clap::CommandFactory>::command().get_matches();
     // A server the command names (--server, AVP_SERVER), or none: then the one logged in to.
@@ -1174,6 +1336,10 @@ fn main() -> Result<()> {
         Cmd::ImportGit { name, history, policy, follow, remote, every, views } => {
             if client.get::<Repo>(&format!("/repos/{name}")).is_err() {
                 let (repo, last) = gitbridge::import_git(&client, &dir, &name, &policy, history)?;
+                // The commits themselves, for `git clone` from AVP to give them back as they are.
+                if let Err(e) = gitbridge::upload_history(&client, &repo.id, &dir) {
+                    eprintln!("the git history was not sent ({e:#}): a `git clone` from AVP writes the imported positions as new commits");
+                }
                 let tree: Tree = client.get(&format!("/repos/{}/tree/{last}", repo.id))?;
                 let state = view::ViewState { server: client.base.clone(), repo: repo.id.clone(), task: None, known: tree.iter().map(|(p, e)| (p.clone(), (e.blob.clone(), e.mode))).collect(), ..Default::default() };
                 view::save(&dir, &state)?;
@@ -1473,7 +1639,7 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
                 r => r?,
             };
             for w in r.puts.iter().chain(r.deletes.iter()) {
-                println!("{} {} [{}{}]", if w.write.kind == WriteKind::Delete { "-" } else { "+" }, w.write.path, w.lease, w.previous_holder.as_ref().map(|h| format!(" from {h}")).unwrap_or_default());
+                println!("{} {} [{}]{}", if w.write.kind == WriteKind::Delete { "-" } else { "+" }, w.write.path, lease_said(&w.lease, w.previous_holder.as_deref()), if w.write.kind == WriteKind::Delete { String::new() } else { view::size_note(&dir, &w.write.path) });
             }
             if r.puts.is_empty() && r.deletes.is_empty() {
                 println!("nothing to send");
@@ -1610,6 +1776,12 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
                 for (p, w) in &live {
                     out.push_str(&format!("\n  {} {p} (seq {})", match w.kind { WriteKind::Put => "+", WriteKind::Delete => "-", WriteKind::Conflict => "!" }, w.seq));
                 }
+                if let Some(now) = &s.progress {
+                    out.push_str(&format!("\nproof running: {now}"));
+                }
+                for t in &s.taken_over {
+                    out.push_str(&format!("\nlease lost: {t}"));
+                }
                 if let Some(p) = &s.last_proof {
                     out.push_str(&format!("\nlast proof: {}", verdict_line(p)));
                 }
@@ -1643,7 +1815,7 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
                 r => r?,
             };
             for (p, h) in &r {
-                println!("{p}: {}", h.as_ref().map(|h| format!("taken from {h}")).unwrap_or_else(|| "taken".into()));
+                println!("{p}: {}", h.as_ref().map(|h| format!("yours now, taken from task {h} (it is told)")).unwrap_or_else(|| "yours".into()));
             }
             // About to write outside the scope: what the line remembers of those paths.
             let c = avp::history::first_writes(&client, &state.repo, &task, &r.into_iter().map(|(p, _)| p).collect::<Vec<_>>());
@@ -1670,7 +1842,7 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
             let task = state.task.clone();
             let synced = offline::ask(down, task.as_deref(), || view::sync(&client, &dir, &mut state));
             let task = state.task.clone().context("no task open here")?;
-            let p: Proof = match synced.and_then(|_| avp::mcp::through_drain(&client, &task, say_drain(), || client.check(&state.repo, &task))) {
+            let p: Proof = match synced.and_then(|_| avp::mcp::through_drain(&client, &state.repo, &task, say_drain(), tell_progress(), || client.check(&state.repo, &task))) {
                 // Offline: avp.toml's steps on this machine, as the server runs them.
                 Err(e) if unreachable(&e) => {
                     offline::sync(&client.base, &dir, &mut state)?;
@@ -1714,7 +1886,8 @@ proven on this machine (the server proves it again when the land reaches it): {}
                 return Ok(());
             }
             let landed = view::sync(&client, &dir, &mut state).and_then(|_| {
-                avp::mcp::through_drain(&client, &task, say_drain(), || if with.is_empty() { client.land_as(&state.repo, &task, stack) } else { client.land_with(&state.repo, &task, &with) })
+                warn_big_files(&client, &dir, &state.repo, &task);
+                avp::mcp::through_drain(&client, &state.repo, &task, say_drain(), tell_progress(), || if with.is_empty() { client.land_as(&state.repo, &task, stack) } else { client.land_with(&state.repo, &task, &with) })
             });
             // The server went away during the proof: proven here, and queued.
             let landed = match landed {
@@ -1725,7 +1898,7 @@ proven on this machine (the server proves it again when the land reaches it): {}
                 Ok(l) => {
                     print(json, &l, |l| {
                         let under: String = l.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
-                        format!("{under}landed at position {}{}{} (proof {})", l.position, avp::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof)
+                        format!("{under}landed at position {}{}{} (proof {}{})", l.position, avp::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof, if l.checks == Some(0) { format!(": {NO_CHECKS}") } else { String::new() })
                     });
                     // The view becomes the line: teammates' landed files arrive here too.
                     let tree: Tree = client.get(&format!("/repos/{}/tree/{}", state.repo, l.position))?;
@@ -1772,7 +1945,9 @@ proven on this machine (the server proves it again when the land reaches it): {}
                             if !n.guarded.is_empty() {
                                 s.push_str(&format!("\n  guarded paths: {}", n.guarded.join(", ")));
                             }
-                            s.push_str("\n  green; waiting for a person's `avp approve <task>`");
+                            if n.proof.is_some() {
+                                s.push_str(&format!("\n  green; waiting for a person's approval, on {}/r/{}/tasks/{task} or with `avp approve {task}`: stop here, it lands when they approve", client.site(), state.repo));
+                            }
                         }
                         if n.reason == "empty" {
                             s.push_str("\n  nothing to land: the task has no live write");
@@ -2186,7 +2361,11 @@ proven on this machine (the server proves it again when the land reaches it): {}
                 None => {
                     let task = state.task.as_deref().context("no proof id given and no task open here")?;
                     let st: TaskStatus = client.get(&format!("/repos/{}/tasks/{task}", state.repo))?;
-                    st.last_proof.context("this task has no proof yet: `avp check` runs one")?.id
+                    match (st.last_proof, st.progress) {
+                        (Some(p), _) => p.id,
+                        (None, Some(now)) => anyhow::bail!("this task's first proof is not done yet: {now}"),
+                        (None, None) => anyhow::bail!("this task has no proof yet: `avp check` runs one"),
+                    }
                 }
             };
             // As the server says it: each step with its log's length and its artifacts, when kept.
@@ -2226,22 +2405,23 @@ proven on this machine (the server proves it again when the land reaches it): {}
                     s.push_str(&format!("\n  artifacts: {}", artifacts_line(a, &id, &st.name)));
                 }
             }
-            println!("{}", s.trim_start_matches('\n'));
+            println!("{}", avp::check::strip_ansi(s.trim_start_matches('\n')));
         }
         Cmd::Guard { patterns, repo } => {
             let r = repo_of(&dir, repo)?;
             let now: Vec<String> = client.post(&format!("/repos/{r}/guarded"), &serde_json::json!({ "add": patterns }))?;
-            println!("guarded: {}", now.join(", "));
+            println!("guarded: {}", [format!("{} (always)", engine::CHECK_FILES[0])].into_iter().chain(now).collect::<Vec<_>>().join(", "));
         }
         Cmd::Unguard { patterns, repo } => {
             let r = repo_of(&dir, repo)?;
             let now: Vec<String> = client.post(&format!("/repos/{r}/guarded"), &serde_json::json!({ "remove": patterns }))?;
-            println!("guarded: {}", if now.is_empty() { "nothing".into() } else { now.join(", ") });
+            println!("guarded: {}", [format!("{} (always)", engine::CHECK_FILES[0])].into_iter().chain(now).collect::<Vec<_>>().join(", "));
         }
         Cmd::Guarded { repo } => {
             let r = repo_of(&dir, repo)?;
             let now: Vec<String> = client.get(&format!("/repos/{r}/guarded"))?;
-            println!("guarded by AVP: {} (the checks: a change to them always waits for a person)", engine::CHECK_FILES.join(", "));
+            // trame.toml, the old name, is guarded too, but nobody writes one any more.
+            println!("guarded by AVP: {} (the checks: a change to them always waits for a person)", engine::CHECK_FILES[0]);
             println!("guarded: {}", if now.is_empty() { "nothing".into() } else { now.join(", ") });
             let open: Vec<Task> = client.get(&format!("/repos/{r}/tasks?state=open"))?;
             let evs: Vec<Event> = client.get(&format!("/repos/{r}/events?since=0&limit=100000"))?;
@@ -2256,12 +2436,12 @@ proven on this machine (the server proves it again when the land reaches it): {}
         }
         Cmd::Approve { task, repo } => {
             let r = repo_of(&dir, repo)?;
-            let a: Approval = client.post(&format!("/repos/{r}/tasks/{task}/approve"), &serde_json::json!({ "person": actor().person, "approved": true, "reason": "" }))?;
+            let a: Approval = word(&client, &r, &task, true, "")?;
             println!("{} approved by {}", a.task, a.person);
         }
         Cmd::Refuse { task, why, repo } => {
             let state = view::ViewState { repo: repo_of(&dir, repo)?, ..Default::default() };
-            let a: Approval = client.post(&format!("/repos/{}/tasks/{task}/approve", state.repo), &serde_json::json!({ "person": actor().person, "approved": false, "reason": why }))?;
+            let a: Approval = word(&client, &state.repo, &task, false, &why)?;
             println!("{} refused by {}: {}", a.task, a.person, a.reason);
         }
         Cmd::Landing { rule } => {
@@ -2319,14 +2499,51 @@ proven on this machine (the server proves it again when the land reaches it): {}
         }
         Cmd::User { cmd } => users(&client, &dir, cmd, json)?,
         Cmd::Org { cmd } => orgs(&client, &dir, cmd, json)?,
+        Cmd::Repo { cmd, repo } => {
+            let repo = repo_of(&dir, repo)?;
+            let (action, args) = match cmd {
+                RepoCmd::Show => ("show", serde_json::json!({})),
+                RepoCmd::Invite { person, role } => ("invite", serde_json::json!({ "person": person, "role": role })),
+                RepoCmd::Role { person, role } => ("role", serde_json::json!({ "person": person, "role": role })),
+                RepoCmd::Rm { person } => ("remove", serde_json::json!({ "person": person })),
+                RepoCmd::Token { cmd: RepoTokenCmd::Create { name, role, expires } } => ("token", serde_json::json!({ "name": name, "role": role, "expires": expires })),
+                RepoCmd::Token { cmd: RepoTokenCmd::Revoke { id } } => ("revoke", serde_json::json!({ "id": id })),
+                RepoCmd::Rename { name } => ("rename", serde_json::json!({ "name": name })),
+                RepoCmd::Describe { description } => ("describe", serde_json::json!({ "description": description })),
+                RepoCmd::Visibility { visibility } => ("visibility", serde_json::json!({ "visibility": visibility })),
+                RepoCmd::Transfer { to } => ("transfer", serde_json::json!({ "to": to })),
+                RepoCmd::Archive { off } => (if off { "unarchive" } else { "archive" }, serde_json::json!({})),
+                RepoCmd::Delete { confirm } => ("delete", serde_json::json!({ "confirm": confirm })),
+                RepoCmd::Restore => ("restore", serde_json::json!({})),
+                RepoCmd::Log { limit } => ("log", serde_json::json!({ "limit": limit })),
+            };
+            let v = avp::repo_settings::ask(&client, &repo, action, &args)?;
+            print(json, &v, |v| avp::repo_settings::text(action, v));
+        }
         Cmd::Token { cmd } => tokens(&client, cmd, json)?,
         Cmd::Login { to, token, no_browser } => login(to, token, no_browser, json)?,
         Cmd::Logout { from } => logout(from, json)?,
+        Cmd::Password => {
+            use std::io::IsTerminal;
+            anyhow::ensure!(std::io::stdin().is_terminal(), "a password is typed by a person: run `avp password` in a terminal");
+            let me: serde_json::Value = client.get("/me")?;
+            let mut body = serde_json::json!({});
+            if me["password"] == true {
+                body["current"] = typed("current password")?.into();
+            }
+            let new = typed("new password, 10 characters at least")?;
+            anyhow::ensure!(typed("again")? == new, "the two differ: nothing changed");
+            body["password"] = new.into();
+            let _: serde_json::Value = client.post("/me/password", &body)?;
+            println!("password set for {}", me["person"].as_str().unwrap_or("you"));
+        }
         Cmd::Whoami => {
             let logged = std::env::var_os("AVP_TOKEN").is_none() && avp::client::Credentials::load().get(&client.base).is_some();
             let mut me: serde_json::Value = client.get("/me").map_err(|e| match format!("{e:#}").starts_with("401") {
-                true => e.context(format!("not logged in to {}: `avp login {}`", client.shown(), client.base)),
-                false => e,
+                // A token in the environment wins over the login: it is that token the server refused.
+                true if std::env::var("AVP_TOKEN").is_ok_and(|t| !t.trim().is_empty()) => e.context(format!("{} refuses the AVP_TOKEN set in your environment (unknown, revoked or expired): set a valid one, or unset it and `avp login {}`", client.shown(), client.base)),
+                true if !logged => e.context(format!("not logged in to {}: `avp login {}`", client.shown(), client.base)),
+                _ => e,
             })?;
             me["server"] = serde_json::json!(client.shown());
             me["logged_in"] = serde_json::json!(logged);
@@ -2575,10 +2792,20 @@ fn org_event_text(e: &Event) -> String {
         "org.joined" => format!("{} joined {} as {}", s("person"), s("org"), s("role")),
         "org.declined" => format!("{} declined {}", s("person"), s("org")),
         "org.plan" => format!("{} on the {} plan (was {})", s("org"), s("plan"), s("was")),
-        "org.repo" => format!("{} brought into {}", s("repo"), s("org")),
+        "org.repo" => format!("{} moved into {}{}", s("repo"), s("org"), d["was"].as_str().map(|w| format!(" (from {w})")).unwrap_or_default()),
+        "org.repo.out" => format!("{} moved out of {} (to {})", s("repo"), s("org"), s("to")),
+        "org.repo.created" => format!("{} created in {}", s("repo"), s("org")),
+        "org.repo.deleted" => format!("{}/{} deleted", s("org"), s("repo")),
+        "org.repo.restored" => format!("{}/{} restored", s("org"), s("repo")),
         "user.password" => format!("{} set a password", s("name")),
         _ => format!("{} {}", e.kind, e.data),
     }
+}
+
+/// The seats an organization holds, `3 of 3 seats` on a plan that caps them (a server from before
+/// said the members alone).
+fn seats_text(o: &serde_json::Value) -> String {
+    o["seats_said"].as_str().map(String::from).unwrap_or_else(|| format!("{} seat{}", o["seats"], if o["seats"] == 1 { "" } else { "s" }))
 }
 
 /// A space's month of proof minutes, as `avp org usage` and `avp stats` say it.
@@ -2615,18 +2842,21 @@ fn orgs(client: &Client, dir: &Path, cmd: OrgCmd, json: bool) -> Result<()> {
                 if os.is_empty() {
                     return "no organization: `avp org create <name>` makes one, `avp org invites` shows those asking you in".into();
                 }
-                os.iter().map(|o| format!("{:<20} {:<8} {:<10} {} seat{}", o["name"].as_str().unwrap_or_default(), o["role"].as_str().unwrap_or("-"), o["plan"].as_str().unwrap_or_default(), o["seats"], if o["seats"] == 1 { "" } else { "s" })).collect::<Vec<_>>().join("\n")
+                os.iter().map(|o| format!("{:<20} {:<8} {:<10} {}", o["name"].as_str().unwrap_or_default(), o["role"].as_str().unwrap_or("-"), o["plan"].as_str().unwrap_or_default(), seats_text(o))).collect::<Vec<_>>().join("\n")
             });
         }
         OrgCmd::Show { name } => {
             let o: serde_json::Value = client.get(&format!("/orgs/{name}"))?;
             print(json, &o, |o| {
-                let mut out = format!("{name}: {} plan, {} seat{}, you are {}", o["plan"].as_str().unwrap_or_default(), o["seats"], if o["seats"] == 1 { "" } else { "s" }, o["role"].as_str().unwrap_or("no member (server admin)"));
+                let mut out = format!("{name}: {} plan, {}, you are {}", o["plan"].as_str().unwrap_or_default(), seats_text(o), o["role"].as_str().unwrap_or("no member (server admin)"));
                 for m in o["members"].as_array().into_iter().flatten() {
                     out.push_str(&format!("\n  {:<20} {}", m["person"].as_str().unwrap_or_default(), m["role"].as_str().unwrap_or_default()));
                 }
                 let repos: Vec<&str> = o["repos"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
                 out.push_str(&format!("\nrepos: {}", if repos.is_empty() { "none yet (`avp org repo <org> <repo>`)".to_string() } else { repos.join(", ") }));
+                for d in o["deleted"].as_array().into_iter().flatten() {
+                    out.push_str(&format!("\ndeleted, restorable until {} UTC: {name}/{} (`avp repo restore --repo {name}/{}`)", d["restorable_until"].as_str().unwrap_or_default(), d["name"].as_str().unwrap_or_default(), d["name"].as_str().unwrap_or_default()));
+                }
                 for i in o["invites"].as_array().into_iter().flatten() {
                     out.push_str(&format!("\ninvited, unanswered: {} as {} ({})", i["person"].as_str().or(i["email"].as_str()).unwrap_or_default(), i["role"].as_str().unwrap_or_default(), i["id"].as_str().unwrap_or_default()));
                 }
@@ -2659,6 +2889,14 @@ fn orgs(client: &Client, dir: &Path, cmd: OrgCmd, json: bool) -> Result<()> {
             let repo = repo_of(dir, repo)?;
             let r: Repo = client.post(&format!("/orgs/{org}/repos"), &serde_json::json!({ "repo": repo }))?;
             print(json, &r, |r| format!("{} is {org}'s: its members reach it by their org role, its proof minutes are {org}'s", r.name));
+        }
+        OrgCmd::Rename { org, to } => {
+            let o: serde_json::Value = client.post(&format!("/orgs/{org}/rename"), &serde_json::json!({ "name": to }))?;
+            print(json, &o, |_| format!("{org} is now {to}"));
+        }
+        OrgCmd::Delete { org } => {
+            let o: serde_json::Value = client.delete(&format!("/orgs/{org}"))?;
+            print(json, &o, |_| format!("{org} is gone"));
         }
         OrgCmd::Plan { org, plan } => {
             let o: serde_json::Value = client.post(&format!("/orgs/{org}/plan"), &serde_json::json!({ "plan": plan }))?;

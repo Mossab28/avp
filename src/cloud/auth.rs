@@ -169,7 +169,9 @@ fn github_login(s: &str) -> String {
 /// Adds a person, with a first token for them, shown once. The first person turns accounts on and
 /// is an admin of the server: nobody else could give rights then.
 pub fn add_user(db: &Db, name: &str, email: Option<&str>, github: Option<&str>, admin: bool, by: &str) -> Result<(User, NewToken)> {
-    add_person(db, name, email, github, admin || !on(db)?, by)
+    let u = add_person(db, name, email, github, admin || !on(db)?, by)?;
+    let token = create_token(db, name, "first", "token", None, by)?;
+    Ok((u, token))
 }
 
 /// A name of a person or an organization: letters, digits, `.`, `_` and `-`.
@@ -181,9 +183,22 @@ pub(crate) fn valid_name(name: &str, whose: &str) -> Result<()> {
     Ok(())
 }
 
+/// Names that are the server's own: the pages and routes at its root, and words that pass for the
+/// operator. No organization or signed-up person takes one.
+pub(crate) fn not_reserved(name: &str) -> Result<()> {
+    const RESERVED: [&str; 31] = [
+        "admin", "administrator", "root", "system", "support", "avp", "murmell", "official", "signup", "signin", "login", "logout", "settings", "api", "ui", "live", "repos", "r", "orgs", "org", "users", "user", "tokens", "invites", "install", "auth", "session", "me", "new", "static", "assets",
+    ];
+    anyhow::ensure!(!RESERVED.contains(&name.to_lowercase().as_str()), "{name} is kept by the server: choose another name");
+    Ok(())
+}
+
 /// A person whatever came before: one who signs up is never an admin, even the first.
-fn add_person(db: &Db, name: &str, email: Option<&str>, github: Option<&str>, admin: bool, by: &str) -> Result<(User, NewToken)> {
+fn add_person(db: &Db, name: &str, email: Option<&str>, github: Option<&str>, admin: bool, by: &str) -> Result<User> {
     valid_name(name, "a person's")?;
+    if super::orgs::on() {
+        not_reserved(name)?;
+    }
     anyhow::ensure!(user(db, name)?.is_none(), "{name} is already a person of this server: `avp user list`");
     // A repo's space is named by its organization or its person: one name, one of them.
     anyhow::ensure!(super::orgs::org(db, name)?.is_none(), "{name} is an organization's name: choose another");
@@ -199,8 +214,7 @@ fn add_person(db: &Db, name: &str, email: Option<&str>, github: Option<&str>, ad
         params![u.name, u.email, u.github, u.admin as i64, u.created_at, u.created_by],
     )?;
     db.emit(SERVER, "user.added", None, None, json!({ "name": u.name, "email": u.email, "github": u.github, "admin": u.admin, "by": by }))?;
-    let token = create_token(db, name, "first", "token", None, by)?;
-    Ok((u, token))
+    Ok(u)
 }
 
 /// Takes a person off the server: their tokens stop working, their roles go.
@@ -364,7 +378,7 @@ pub fn roles_of_user(db: &Db, person: &str) -> Result<Vec<(String, Role)>> {
     let mut st = db.conn.prepare(
         "SELECT COALESCE(COALESCE(r.org, r.owner) || '/', '') || r.name, COALESCE(x.role, CASE m.role WHEN 'member' THEN 'write' ELSE 'admin' END) FROM repos r \
          LEFT JOIN roles x ON x.repo = r.id AND x.person = ?1 LEFT JOIN members m ON m.org = r.org AND m.person = ?1 \
-         WHERE x.role IS NOT NULL OR m.role IS NOT NULL ORDER BY r.name",
+         WHERE (x.role IS NOT NULL OR m.role IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM repo_settings s WHERE s.repo = r.id AND s.deleted_at IS NOT NULL) ORDER BY r.name",
     )?;
     let rows = st.query_map(params![person], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter_map(|(p, r)| Some((p, Role::parse(&r).ok()??))).collect())
@@ -373,6 +387,7 @@ pub fn roles_of_user(db: &Db, person: &str) -> Result<Vec<(String, Role)>> {
 /// The repos a request may see: all of them but for a person who is no admin, who sees those they
 /// have a role on.
 pub fn readable(db: &Db, repos: Vec<Repo>, who: Option<&Who>) -> Result<Vec<Repo>> {
+    let repos = super::settings::live(db, repos)?;
     let Some(Who::Person(u)) = who.filter(|w| !w.root()) else { return Ok(repos) };
     let mine: std::collections::HashSet<String> = roles_of_user(db, &u.name)?.into_iter().map(|(r, _)| r).collect();
     Ok(repos.into_iter().filter(|r| mine.contains(&r.full_name())).collect())
@@ -383,6 +398,7 @@ pub fn readable(db: &Db, repos: Vec<Repo>, who: Option<&Who>) -> Result<Vec<Repo
 pub fn created(e: &Engine, repo: &Repo, who: Option<&Who>) -> Result<()> {
     if let Some(Who::Person(u)) = who {
         let db = e.db.lock().unwrap();
+        super::settings::created_by(&db, repo, &u.name)?;
         set_role(&db, repo, &u.name, Some(Role::Admin), &u.name)?;
         if super::orgs::on() {
             db.conn.execute("UPDATE repos SET owner = ?2 WHERE id = ?1", params![repo.id, u.name])?;
@@ -435,6 +451,9 @@ pub enum Need {
     /// A promotion or a rollback: one of the environment's `approvers` in avp.toml, or with none
     /// named, an admin of the repo.
     Promote(String, String),
+    /// A `git push`: a writer of the repo, or, when it does not exist yet, a person who may create
+    /// it in the space it names.
+    Push(String),
 }
 
 pub fn need(method: &Method, path: &str) -> Need {
@@ -443,17 +462,19 @@ pub fn need(method: &Method, path: &str) -> Need {
     match seg.as_slice() {
         // A device login's approval is a signed-in person's; starting and polling one, before any token.
         ["login", "device", "approve"] => Need::Person,
-        ["live"] | ["auth", ..] | ["login", ..] | ["install"] => Need::Nothing,
+        ["live"] | ["live.js"] | ["auth", ..] | ["login", ..] | ["install"] => Need::Nothing,
         ["session"] | ["signup"] if *method == Method::POST => Need::Nothing,
         // What the workers run is every organization's: on AVP Cloud, a server admin's to read.
         ["work"] | ["drain"] if read && !super::orgs::on() => Need::Person,
         ["orgs", _, "plan"] => Need::ServerAdmin,
         ["work", ..] | ["drain"] | ["users", ..] | ["accounts", ..] => Need::ServerAdmin,
-        // `git clone https://<server>/<repo>.git`: the repo's readers (the route refuses a push).
-        [key @ .., "info", "refs"] | [key @ .., "git-upload-pack" | "git-receive-pack"] if git_repo(key).is_some() => Need::Repo(git_repo(key).unwrap_or_default(), Role::Read),
+        // `git clone https://<server>/<repo>.git`: the repo's readers. A push lands: its writers (the
+        // gate reads its `info/refs?service=git-receive-pack` as this path).
+        [key @ .., "git-receive-pack"] if git_repo(key).is_some() => Need::Push(git_repo(key).unwrap_or_default()),
+        [key @ .., "info", "refs"] | [key @ .., "git-upload-pack"] if git_repo(key).is_some() => Need::Repo(git_repo(key).unwrap_or_default(), Role::Read),
         ["repos", repo, rest @ ..] => {
             let role = match rest {
-                ["secrets", ..] => Role::Admin,
+                ["secrets", ..] | ["settings", ..] => Role::Admin,
                 _ if read => Role::Read,
                 // POSTs that read: many objects, a diff, the line's memory of some paths.
                 ["objects"] | ["diff"] | ["history", "context"] => Role::Read,
@@ -529,6 +550,8 @@ struct Ask {
     session: Option<String>,
     /// From the server's own machine: a loopback address no proxy forwarded.
     machine: bool,
+    /// The server's address as people reach it, for a refusal to name a page of its site.
+    public: String,
 }
 
 fn json_refusal(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -543,14 +566,21 @@ fn unsigned(msg: impl Into<String>) -> Response {
 /// machine), whether they may, and the person the routes then read (`x-avp-user`), never one the
 /// client chose.
 pub async fn gate(State(g): State<Gate>, mut req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let (method, mut path) = (req.method().clone(), req.uri().path().to_string());
     let git = path.contains(".git/");
+    // A push's first look at the refs needs what the push itself needs.
+    if git && req.uri().query().unwrap_or("").contains("service=git-receive-pack") {
+        if let Some(repo) = path.strip_suffix("/info/refs") {
+            path = format!("{repo}/git-receive-pack");
+        }
+    }
     let h = req.headers();
     let live_ok = matches!(*req.method(), Method::GET | Method::HEAD) || h.contains_key("x-avp-live");
     let ask = Ask {
         authorization: h.get("authorization").and_then(|v| v.to_str().ok()).map(String::from),
         session: cookie(h, SESSION).filter(|_| live_ok),
         machine: machine(&req),
+        public: public_url(h),
     };
     req.extensions_mut().insert(g.known.clone());
     let engine = g.engine.clone();
@@ -570,6 +600,9 @@ pub async fn gate(State(g): State<Gate>, mut req: axum::extract::Request, next: 
             }
         }
         Ok(Err(mut refusal)) => {
+            if git {
+                refusal = for_git(refusal).await;
+            }
             // git sends its credentials only once asked for them.
             if git && refusal.status() == StatusCode::UNAUTHORIZED {
                 refusal.headers_mut().insert("www-authenticate", axum::http::HeaderValue::from_static("Basic realm=\"avp\""));
@@ -593,6 +626,20 @@ pub async fn gate(State(g): State<Gate>, mut req: axum::extract::Request, next: 
     next.run(req).await
 }
 
+/// A refusal as git shows it to the person: plain text, each line after `remote:`.
+async fn for_git(refusal: Response) -> Response {
+    let (mut parts, body) = refusal.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 16).await.unwrap_or_default();
+    let mut said = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or_else(|| String::from_utf8_lossy(&bytes).to_string());
+    // What git needs, not AVP_TOKEN: a token is its password, under any user name.
+    if parts.status == StatusCode::UNAUTHORIZED {
+        said = format!("{said}\ngit signs in with a token as its password, any user name: `git clone https://you:<token>@<this server>/<repo>.git`. Make a token on the Settings page or with `avp token create`.");
+    }
+    parts.headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/plain; charset=utf-8"));
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(format!("{said}\n")))
+}
+
 /// On AVP Cloud, what a role on the repo does not settle. One store holds every organization's
 /// objects, and a hash known is no right to read one: a person reads the objects their repo holds.
 /// A proof runs while the repo's space has minutes left on its plan.
@@ -612,13 +659,22 @@ async fn tenant(e: Engine, who: &Who, req: axum::extract::Request, next: axum::m
                 name: String,
                 #[serde(default)]
                 policy: Option<LeasePolicy>,
+                #[serde(default)]
+                start: bool,
+                #[serde(default)]
+                readme: Option<String>,
             }
             let asked: New = match serde_json::from_slice(&bytes) {
                 Ok(n) => n,
                 Err(x) => return json_refusal(StatusCode::BAD_REQUEST, format!("a repo is asked for by its name and policy: {x}")),
             };
             let who = who.clone();
-            match tokio::task::spawn_blocking(move || super::orgs::create_repo(&e, &asked.name, asked.policy.unwrap_or(LeasePolicy::Advisory), &who)).await {
+            match tokio::task::spawn_blocking(move || {
+                let r = super::orgs::create_repo(&e, &asked.name, asked.policy.unwrap_or(LeasePolicy::Advisory), &who)?;
+                crate::server::start_line(&e, &r, asked.start, asked.readme.as_deref(), who.person())?;
+                Ok(r)
+            })
+            .await {
                 Ok(Ok(r)) => Json(r).into_response(),
                 Ok(Err(x)) => crate::server::err(x),
                 Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
@@ -635,17 +691,18 @@ async fn tenant(e: Engine, who: &Who, req: axum::extract::Request, next: axum::m
         }
         // A batch names its objects in its body: read here, then handed on as it came.
         ["repos", repo, "objects"] if method == Method::POST && reader => {
-            let repo = repo.to_string();
-            let (parts, body) = req.into_parts();
-            let Ok(bytes) = axum::body::to_bytes(body, 64 << 20).await else { return json_refusal(StatusCode::BAD_REQUEST, "the list of objects is too long") };
-            let hashes: Vec<String> = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| serde_json::from_value(v["hashes"].clone()).ok()).unwrap_or_default();
-            let e2 = e.clone();
-            match tokio::task::spawn_blocking(move || holds(&e2, &repo, &hashes)).await {
-                Ok(Ok(None)) => next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))).await,
-                Ok(Ok(Some(h))) => missing(&h),
-                Ok(Err(x)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}")),
-                Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
-            }
+            let hashes = |v: &serde_json::Value| serde_json::from_value(v["hashes"].clone()).unwrap_or_default();
+            body_holds(e, repo.to_string(), req, next, hashes).await
+        }
+        // A write or an import names a blob by its hash: one the repo does not hold would put another
+        // organization's file in its tree, to read from there. The CLI sends what the repo lacks first.
+        ["repos", repo, "tasks", _, "writes"] if method == Method::POST && reader => {
+            let blob = |v: &serde_json::Value| v["blob"].as_str().map(String::from).into_iter().collect();
+            body_holds(e, repo.to_string(), req, next, blob).await
+        }
+        ["repos", repo, "import"] if method == Method::POST && reader => {
+            let blobs = |v: &serde_json::Value| v["entries"].as_array().into_iter().flatten().filter_map(|x| x["blob"].as_str().map(String::from)).collect();
+            body_holds(e, repo.to_string(), req, next, blobs).await
         }
         // Sent to the repo: from now on it holds it.
         ["repos", repo, "objects", hash] if method == Method::PUT => {
@@ -667,15 +724,40 @@ async fn tenant(e: Engine, who: &Who, req: axum::extract::Request, next: axum::m
         }
         ["repos", repo, "tasks", _, "land" | "check" | "speculate"] | ["repos", repo, "full"] if method == Method::POST => {
             let repo = repo.to_string();
-            match tokio::task::spawn_blocking(move || super::orgs::may_prove(&e, &repo)).await {
-                Ok(Ok(Ok(()))) => next.run(req).await,
-                Ok(Ok(Err(over))) => json_refusal(StatusCode::PAYMENT_REQUIRED, over),
-                // A repo the gate let through but cannot find: the route says so.
-                Ok(Err(_)) => next.run(req).await,
-                Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
-            }
+            may_prove(e, repo, req, next).await
+        }
+        // A push to a repo that exists is proven as a landing is.
+        [key @ .., "git-receive-pack"] if method == Method::POST && git_repo(key).is_some() => {
+            let repo = git_repo(key).unwrap_or_default();
+            may_prove(e, repo, req, next).await
         }
         _ => next.run(req).await,
+    }
+}
+
+/// Hands the request on, its body as it came, when the repo holds every object `hashes` reads in it.
+async fn body_holds(e: Engine, repo: String, req: axum::extract::Request, next: axum::middleware::Next, hashes: fn(&serde_json::Value) -> Vec<String>) -> Response {
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 256 << 20).await else { return json_refusal(StatusCode::BAD_REQUEST, "the body is too long") };
+    let named = serde_json::from_slice::<serde_json::Value>(&bytes).map(|v| hashes(&v)).unwrap_or_default();
+    match tokio::task::spawn_blocking(move || holds(&e, &repo, &named)).await {
+        Ok(Ok(None)) => next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))).await,
+        Ok(Ok(Some(h))) => json_refusal(StatusCode::NOT_FOUND, format!("no object {h}")),
+        Ok(Err(x)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}")),
+        Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+    }
+}
+
+/// A proof runs while the repo's space has minutes left on its plan.
+async fn may_prove(e: Engine, repo: String, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let git = req.uri().path().contains(".git/");
+    match tokio::task::spawn_blocking(move || super::orgs::may_prove(&e, &repo)).await {
+        Ok(Ok(Ok(()))) => next.run(req).await,
+        Ok(Ok(Err(over))) if git => for_git(json_refusal(StatusCode::PAYMENT_REQUIRED, over)).await,
+        Ok(Ok(Err(over))) => json_refusal(StatusCode::PAYMENT_REQUIRED, over),
+        // A repo the gate let through but cannot find (a push creates it): the route says so.
+        Ok(Err(_)) => next.run(req).await,
+        Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
     }
 }
 
@@ -727,25 +809,89 @@ impl Gate {
     /// Who asks, whether they may, and on AVP Cloud the path with the repo it names said by its id
     /// (see `named`).
     fn decide(&self, ask: &Ask, method: &Method, path: &str) -> Result<(Option<Who>, Option<String>), Response> {
-        let on = self.known.on(&self.engine.db).map_err(|e| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        let original = path;
+        let failed = |e: anyhow::Error| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+        let on = self.known.on(&self.engine.db).map_err(failed)?;
+        // A repo said by a name it had (renamed, moved to another space) is said by its id.
+        let aliased = super::settings::aliased(&self.engine.db.lock().unwrap(), path).map_err(failed)?;
+        let path = aliased.as_deref().unwrap_or(path);
         if !on {
             // As before accounts: the server's token when it has one, nothing otherwise.
-            return match &self.key {
-                None => Ok((Some(Who::Anyone), None)),
+            let who = match &self.key {
+                None => Who::Anyone,
                 Some(key) => match token_user(ask.authorization.as_deref(), key) {
-                    Some(person) => Ok((Some(Who::Server(Some(person))), None)),
-                    None => Err((StatusCode::UNAUTHORIZED, [("www-authenticate", "Basic realm=\"avp\"")], "AVP_TOKEN required").into_response()),
+                    Some(person) => Who::Server(Some(person)),
+                    None => return Err((StatusCode::UNAUTHORIZED, [("www-authenticate", "Basic realm=\"avp\"")], "AVP_TOKEN required").into_response()),
                 },
             };
+            self.open(method, path)?;
+            return Ok((Some(who), aliased));
         }
-        let who = match self.identify(ask) {
-            Ok(who) => who,
-            Err(_) if need(method, path) == Need::Nothing => return Ok((None, None)),
+        let presented = presented(ask.authorization.as_deref()).or(ask.session.clone());
+        // Signed out, a public repo still reads: as a guest, refused as before for anything else.
+        let (mut who, signed_out) = match self.identify(ask) {
+            Ok(who) => (who, false),
+            Err(_) if need(method, path) == Need::Nothing => return Ok((None, aliased)),
+            Err(_) if presented.is_none() && matches!(need(method, path), Need::Repo(_, Role::Read)) => (Who::Person(guest()), true),
             Err(refusal) => return Err(refusal),
         };
-        let named = if super::orgs::on() { self.named(path, &who)? } else { None };
-        self.allow(&who, &need(method, named.as_deref().unwrap_or(path)))?;
-        Ok((Some(who), named))
+        // What a guest the repo does not let read is told: to sign in, as before (git then asks for a token).
+        let refused = |r: Response| if signed_out { self.identify(ask).err().unwrap_or(r) } else { r };
+        // A token made for one repo reaches it alone, to its role: whatever its person may elsewhere.
+        let scope = match &presented {
+            Some(t) => super::settings::scope(&self.engine.db.lock().unwrap(), t).map_err(failed)?,
+            None => None,
+        };
+        if let (Some(_), Who::Person(u)) = (&scope, &mut who) {
+            u.admin = false;
+        }
+        let named = if super::orgs::on() { self.named(path, &who).map_err(refused)? } else { None };
+        // A refusal names the repo as it was asked for: never the id it stands for, so that one
+        // that exists out of reach and one that does not answer the same.
+        let asked = self.asked(original).map_err(failed)?;
+        let path = named.as_deref().unwrap_or(path);
+        let need = need(method, path);
+        self.allow(&who, &need, asked.as_deref()).map_err(refused)?;
+        if let Some(s) = &scope {
+            self.within(s, method, path, &need, &ask.public)?;
+        }
+        self.open(method, path)?;
+        Ok((Some(who), named.or(aliased)))
+    }
+
+    /// Refuses what an archived or a deleted repo does not take, whoever asks (settings.rs).
+    fn open(&self, method: &Method, path: &str) -> Result<(), Response> {
+        match super::settings::closed(&self.engine.db.lock().unwrap(), method, path) {
+            Ok(None) => Ok(()),
+            Ok(Some((code, said))) => Err(json_refusal(code, said)),
+            Err(e) => Err(json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+        }
+    }
+
+    /// What a token made for one repo may ask: that repo, to its role, and who it is; never a
+    /// person's approval, which stays a person's.
+    fn within(&self, scope: &super::settings::Scope, method: &Method, path: &str, need: &Need, public: &str) -> Result<(), Response> {
+        let db = self.engine.db.lock().unwrap();
+        let ok = match need {
+            Need::Nothing => true,
+            Need::Person => *method == Method::GET && path == "/me",
+            Need::Repo(key, want) => *want <= scope.role && db.repo(key).is_ok_and(|r| r.id == scope.repo) && !path.ends_with("/approve"),
+            _ => false,
+        };
+        if ok {
+            return Ok(());
+        }
+        let name = db.repo(&scope.repo).map(|r| r.full_name()).unwrap_or_else(|_| scope.repo.clone());
+        // Its own repo's approval: refused as any token's is, with where the person gives it.
+        if let (Need::Repo(key, _), [.., "tasks", task, "approve"]) = (need, path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice()) {
+            if db.repo(key).is_ok_and(|r| r.id == scope.repo) {
+                return Err(json_refusal(StatusCode::FORBIDDEN, only_a_person(&format!("{public}/r/{name}/tasks/{task}"))));
+            }
+        }
+        Err(json_refusal(
+            StatusCode::FORBIDDEN,
+            format!("this token was made for {name} alone, to {}: it reaches nothing else, and never approves. A person's own token (`avp token create`) reaches all their repos", scope.role.as_str()),
+        ))
     }
 
     /// On AVP Cloud, a path to a repo with the repo said by its id: `/repos/acme/shop/line` (or
@@ -791,14 +937,39 @@ impl Gate {
         }
     }
 
+    /// The repo a path names, as the asker said it: `<space>/<name>` or a name alone, whether a repo
+    /// has it or not. None: the path names no repo.
+    fn asked(&self, path: &str) -> Result<Option<String>> {
+        let trimmed = path.trim_start_matches('/');
+        if let Some((key, _)) = trimmed.split_once(".git/") {
+            return Ok(Some(key.to_string()));
+        }
+        let Some(rest) = trimmed.strip_prefix("repos/") else { return Ok(None) };
+        let seg: Vec<String> = rest.split('/').map(|s| s.replace("%2F", "/").replace("%2f", "/")).collect();
+        let db = self.engine.db.lock().unwrap();
+        Ok(match seg.as_slice() {
+            [first, ..] if first.contains('/') => Some(first.clone()),
+            // `/repos/<space>/<name>/...`: a space's repo, there or not, unless a repo is named as the space.
+            [space, name, ..] if db.repo(space).is_err() && (super::orgs::org(&db, space)?.is_some() || user(&db, space)?.is_some()) => Some(format!("{space}/{name}")),
+            [first, ..] => Some(first.clone()),
+            [] => None,
+        })
+    }
+
     fn identify(&self, ask: &Ask) -> Result<Who, Response> {
         let presented = presented(ask.authorization.as_deref()).or(ask.session.clone());
         if let Some(t) = &presented {
             let checked = check_token(&self.engine.db.lock().unwrap(), t).map_err(|e| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             match checked {
                 Checked::Person(u) => return Ok(Who::Person(u)),
-                Checked::Revoked => return Err(unsigned("this token was revoked: `avp token create` makes another (signed in another way), or a server admin's `avp token create --user <you>`")),
-                Checked::Expired(at) => return Err(unsigned(format!("this token expired on {} UTC: `avp token create` makes another (signed in another way), or a server admin's `avp token create --user <you>`", crate::blame::utc(at)))),
+                Checked::Revoked => {
+                    // One made for a repo is made again there, by an admin of it.
+                    if let Some(repo) = super::settings::made_for(&self.engine.db.lock().unwrap(), t).ok().flatten() {
+                        return Err(unsigned(format!("this token was revoked: it was made for {repo} alone, and an admin of {repo} makes another (`avp repo token create --repo {repo}`)")));
+                    }
+                    return Err(unsigned("this token was revoked: `avp token create` makes another (signed in another way), or a server admin's `avp token create --user <you>`"));
+                }
+                Checked::Expired(at) => return Err(unsigned(format!("this token expired on {} UTC: `avp login` again for a new one; `avp token create` makes another (signed in another way), or a server admin's `avp token create --user <you>`", crate::blame::utc(at)))),
                 Checked::Unknown => {}
             }
         }
@@ -814,7 +985,7 @@ impl Gate {
         }))
     }
 
-    fn allow(&self, who: &Who, need: &Need) -> Result<(), Response> {
+    fn allow(&self, who: &Who, need: &Need, asked: Option<&str>) -> Result<(), Response> {
         let Who::Person(u) = who else { return Ok(()) };
         if u.admin {
             return Ok(());
@@ -823,9 +994,26 @@ impl Gate {
         match need {
             Need::Nothing | Need::Person => Ok(()),
             Need::ServerAdmin => Err(forbidden(format!("{} is no admin of this server: people, tokens of others and workers are theirs (`avp user admin {}`, by one)", u.name, u.name))),
-            Need::Repo(key, want) => self.repo_role(u, key, *want).map(|_| ()),
+            Need::Repo(key, want) => self.repo_role(u, key, *want, asked).map(|_| ()),
+            Need::Push(key) => {
+                let missing = self.engine.db.lock().unwrap().repo(key).is_err();
+                if !missing {
+                    return self.repo_role(u, key, Role::Write, asked).map(|_| ());
+                }
+                // A repo the push creates: on AVP Cloud in the person's own space or an organization
+                // of theirs (the route checks they may), anywhere else as `avp repo create` would.
+                let space = key.split_once('/').map(|(s, _)| s);
+                let theirs = match space {
+                    Some(s) if super::orgs::on() && s != u.name => super::orgs::member(&self.engine.db.lock().unwrap(), s, &u.name).ok().flatten().is_some(),
+                    _ => true,
+                };
+                if theirs {
+                    return Ok(());
+                }
+                Err(json_refusal(StatusCode::NOT_FOUND, format!("no repo {key} (or none you have a role on: an admin of it gives one, `avp repo role {} write --repo {key}`)", u.name)))
+            }
             Need::Promote(key, env) => {
-                let (repo, has) = self.repo_role(u, key, Role::Read)?;
+                let (repo, has) = self.repo_role(u, key, Role::Read, asked)?;
                 if has == Role::Admin {
                     return Ok(());
                 }
@@ -840,20 +1028,45 @@ impl Gate {
     }
 
     /// The repo and the person's role on it, at least `want`. A repo they have no role on answers
-    /// as one that does not exist: no hint that the name is taken.
-    fn repo_role(&self, u: &User, key: &str, want: Role) -> Result<(Repo, Role), Response> {
+    /// as one that does not exist, by the name asked (`asked`): no hint that the name is taken. One
+    /// who reached it before is told their access was removed.
+    fn repo_role(&self, u: &User, key: &str, want: Role, asked: Option<&str>) -> Result<(Repo, Role), Response> {
         let db = self.engine.db.lock().unwrap();
-        let none = || json_refusal(StatusCode::NOT_FOUND, format!("no repo {key} (or none you have a role on: an admin of it gives one, `avp user role {} read --repo {key}`)", u.name));
+        let shown = asked.unwrap_or(key);
+        let none = || json_refusal(StatusCode::NOT_FOUND, format!("no repo {shown}"));
         let Ok(repo) = db.repo(key) else { return Err(none()) };
-        match role(&db, &repo.id, &u.name).map_err(|e| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+        let failed = |e: anyhow::Error| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+        match role(&db, &repo.id, &u.name).map_err(failed)? {
+            // A public repo: anyone reads it, nobody writes without a role.
+            None if want == Role::Read && super::settings::public(&db, &repo.id).map_err(failed)? => Ok((repo, Role::Read)),
+            None if reached(&db, &repo.id, &u.name).map_err(failed)? => Err(json_refusal(
+                StatusCode::FORBIDDEN,
+                format!("your access to {} was removed: an admin of it gives it back (`avp repo role {} write`), until then nothing of yours opens nor lands there", repo.full_name(), u.name),
+            )),
             None => Err(none()),
             Some(has) if has < want => Err(json_refusal(
                 StatusCode::FORBIDDEN,
-                format!("{} has {} on {} ({}): this needs {} ({}). An admin of {} gives it: `avp user role {} {} --repo {}`", u.name, has.as_str(), repo.name, has.does(), want.as_str(), want.does(), repo.name, u.name, want.as_str(), repo.name),
+                format!("{} has {} on {} ({}): this needs {} ({}). An admin of {} gives it: `avp repo role {} {} --repo {}`", u.name, has.as_str(), repo.name, has.does(), want.as_str(), want.does(), repo.name, u.name, want.as_str(), repo.full_name()),
             )),
             Some(has) => Ok((repo, has)),
         }
     }
+}
+
+/// Whether a person once reached the repo: given a role on it, or one of their tasks is on it.
+/// Being told their access went tells them nothing they did not know.
+fn reached(db: &Db, repo: &str, person: &str) -> Result<bool> {
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE repo = ?1 AND kind = 'role.set' AND json_extract(data, '$.person') = ?2) \
+         OR EXISTS (SELECT 1 FROM tasks WHERE repo = ?1 AND json_extract(actor, '$.person') = ?2)",
+        params![repo, person],
+        |r| r.get(0),
+    )?)
+}
+
+/// Who reads a public repo signed out: no person, no right but reading it.
+fn guest() -> User {
+    User { name: super::settings::GUEST.into(), email: None, github: None, admin: false, created_at: 0, created_by: String::new() }
 }
 
 /// The token a request carries: `Bearer <token>`, or the password of Basic auth (whatever the name).
@@ -905,6 +1118,7 @@ pub(crate) async fn run<T: Serialize + Send + 'static>(f: impl FnOnce() -> Resul
 pub fn routes() -> Router<Engine> {
     Router::new()
         .route("/me", get(me))
+        .route("/me/password", post(set_password_route))
         .route("/users", get(list_users).post(add_user_route))
         .route("/users/{name}/remove", post(remove_user_route))
         .route("/users/{name}/admin", post(admin_route))
@@ -928,23 +1142,34 @@ pub fn routes() -> Router<Engine> {
 async fn me(State(e): S, Extension(who): Extension<Who>, headers: HeaderMap) -> Response {
     run(move || {
         let db = e.db.lock().unwrap();
-        let roles = match &who {
+        // A token made for one repo shows that repo alone, to its role: whatever else its person reaches.
+        let scope = match presented(headers.get("authorization").and_then(|v| v.to_str().ok())) {
+            Some(t) => super::settings::scope(&db, &t)?,
+            None => None,
+        };
+        let mut roles = match &who {
             Who::Person(u) => roles_of_user(&db, &u.name)?,
             _ => vec![],
         };
+        if let Some(s) = &scope {
+            let name = db.repo(&s.repo).map(|r| r.full_name()).unwrap_or_default();
+            roles = roles.into_iter().filter(|(r, _)| *r == name).map(|(r, has)| (r, has.min(s.role))).collect();
+        }
         let person = match &who {
             Who::Person(u) => Some(u.name.clone()),
             Who::Server(p) => p.clone(),
             Who::Anyone => headers.get("x-avp-user").and_then(|v| v.to_str().ok()).map(String::from),
         };
         let orgs = match &who {
-            Who::Person(u) if super::orgs::on() => super::orgs::orgs_of(&db, &u.name)?.into_iter().map(|(o, r)| json!({ "org": o.name, "role": r, "plan": o.plan })).collect(),
+            Who::Person(u) if super::orgs::on() && scope.is_none() => super::orgs::orgs_of(&db, &u.name)?.into_iter().map(|(o, r)| json!({ "org": o.name, "role": r, "plan": o.plan })).collect(),
             _ => vec![],
         };
         Ok(json!({
             "accounts": on(&db)?, "person": person, "admin": who.root(), "via": who.via(), "github": github_app().is_some(),
             "roles": roles.iter().map(|(r, role)| json!({ "repo": r, "role": role })).collect::<Vec<_>>(),
             "cloud": super::orgs::on(), "orgs": orgs,
+            "password": matches!(&who, Who::Person(u) if matches!(password_of(&db, &u.name), Ok(Some((_, Some(_)))))),
+            "scope": scope.map(|s| json!({ "repo": db.repo(&s.repo).map(|r| r.full_name()).unwrap_or_default(), "role": s.role })),
         }))
     })
     .await
@@ -1117,6 +1342,11 @@ async fn sign_in(State(e): S, ext: Extensions, headers: HeaderMap, Json(b): Json
         if !on(&db)? {
             return Ok(Err(json_refusal(StatusCode::BAD_REQUEST, "this server has no accounts: AVP Live needs no sign-in")));
         }
+        // A token made for one repo (CI, a deploy key) never becomes its owner's session: that
+        // session would reach every repo, mint tokens and approve, all the scope was there to deny.
+        if super::settings::scope(&db, b.token.trim())?.is_some() {
+            return Ok(Err(unsigned("this token was made for one repo alone: it opens no session. Sign in with your name and password, or a person's own token (`avp token create`)")));
+        }
         match check_token(&db, b.token.trim())? {
             Checked::Person(u) => Ok(Ok(session(&db, &u.name, "live")?)),
             _ => Ok(Err(unsigned("this token is none of this server's, or no longer works: `avp token create` makes one"))),
@@ -1173,19 +1403,30 @@ async fn sign_out(State(e): S, Extension(who): Extension<Who>, headers: HeaderMa
 /// (the last of `x-forwarded-for`, the ones before it are the client's to make up), else the peer's.
 fn address(h: &HeaderMap, ext: &Extensions) -> String {
     let forwarded = h.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).filter(|v| !v.is_empty()).last().map(String::from);
-    forwarded
+    let one = forwarded
         .or_else(|| h.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|v| v.trim().to_string()))
         .or_else(|| ext.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip().to_canonical().to_string()))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // One machine on IPv6 holds a whole /64: counted per address, it would never meet a limit.
+    match one.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()) {
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        _ => one,
+    }
 }
 
 /// Sign-ups an address may make an hour, and sign-ins it may try in 10 minutes: an open server is
 /// not a script's to fill with accounts or to guess passwords on.
 const SIGNUPS_AN_HOUR: usize = 5;
 const SIGNINS_IN_10_MIN: usize = 10;
+/// Wrong passwords one account may be tried with in 10 minutes, from every address together: many
+/// addresses (a botnet) guess no faster. Its tokens still work meanwhile.
+const FAILS_IN_10_MIN: usize = 20;
 
-/// Whether `address` may try `what` once more: at most `most` in `window_ms`.
-fn within_limit(what: &str, address: &str, most: usize, window_ms: i64) -> bool {
+/// How many times `key` tried `what` in the last `window_ms`, this one counted when `count`.
+fn tries(what: &str, key: &str, window_ms: i64, count: bool) -> usize {
     type Tries = std::collections::HashMap<(String, String), Vec<i64>>;
     static TRIES: std::sync::Mutex<Option<Tries>> = std::sync::Mutex::new(None);
     let now = now_ms();
@@ -1195,17 +1436,53 @@ fn within_limit(what: &str, address: &str, most: usize, window_ms: i64) -> bool 
     if all.len() > 10_000 {
         all.retain(|_, at| at.iter().any(|t| now - t < 3_600_000));
     }
-    let at = all.entry((what.to_string(), address.to_string())).or_default();
+    let at = all.entry((what.to_string(), key.to_string())).or_default();
     at.retain(|t| now - t < window_ms);
-    if at.len() >= most {
+    if count {
+        at.push(now);
+    }
+    at.len()
+}
+
+/// Whether `address` may try `what` once more: at most `most` in `window_ms`.
+fn within_limit(what: &str, address: &str, most: usize, window_ms: i64) -> bool {
+    if tries(what, address, window_ms, false) >= most {
         return false;
     }
-    at.push(now);
+    tries(what, address, window_ms, true);
     true
 }
 
 fn too_many(what: &str) -> Response {
     json_refusal(StatusCode::TOO_MANY_REQUESTS, format!("too many {what} from this address: try again later"))
+}
+
+#[derive(Deserialize)]
+struct NewPassword {
+    password: String,
+    /// The one it replaces: asked when the account has one.
+    current: Option<String>,
+}
+
+/// A person sets their own password: an account made with `avp user add` has none, and cannot
+/// approve (an approval is a person's) until it does. Changing one takes the current one.
+async fn set_password_route(State(e): S, Extension(who): Extension<Who>, Json(b): Json<NewPassword>) -> Response {
+    run(move || {
+        let Who::Person(u) = &who else { anyhow::bail!("a password belongs to a person: sign in with a token of theirs") };
+        let account = u.name.to_lowercase();
+        let db = e.db.lock().unwrap();
+        if let Some((_, Some(hash))) = password_of(&db, &u.name)? {
+            anyhow::ensure!(tries("signin-fail", &account, 600_000, false) < FAILS_IN_10_MIN, Forbidden("too many wrong passwords for this account: try again in 10 minutes".into()));
+            let right = b.current.as_deref().is_some_and(|c| password_matches(Some(&hash), c));
+            if !right {
+                tries("signin-fail", &account, 600_000, true);
+                anyhow::bail!(Forbidden("this account has a password: give the current one to change it".into()));
+            }
+        }
+        set_password(&db, &u.name, &b.password)?;
+        Ok(json!({ "person": u.name }))
+    })
+    .await
 }
 
 /// A password as the server keeps it: argon2id, salted, never the password.
@@ -1229,20 +1506,39 @@ pub fn set_password(db: &Db, person: &str, password: &str) -> Result<()> {
     Ok(())
 }
 
-/// The person a name or an email and a password sign in, if they do.
-pub fn check_password(db: &Db, name: &str, password: &str) -> Result<Option<User>> {
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+/// The person a name or an email names, and their password's hash when they have one.
+fn password_of(db: &Db, name: &str) -> Result<Option<(String, Option<String>)>> {
     let name = name.trim();
     let person: Option<String> = db.conn.query_row("SELECT name FROM users WHERE name = ?1 OR (?1 LIKE '%@%' AND lower(email) = lower(?1))", params![name], |r| r.get(0)).optional()?;
     let Some(person) = person else { return Ok(None) };
     let hash: Option<String> = db.conn.query_row("SELECT hash FROM passwords WHERE person = ?1", params![person], |r| r.get(0)).optional()?;
-    let ok = hash.is_some_and(|h| PasswordHash::new(&h).is_ok_and(|h| argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok()));
-    if ok { user(db, &person) } else { Ok(None) }
+    Ok(Some((person, hash)))
+}
+
+/// Whether `password` is the one `hash` keeps. Without a hash (no such person, no password) the
+/// same work is done on one that matches nothing: the time of an answer does not tell a name taken.
+fn password_matches(hash: Option<&str>, password: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    static NOBODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let nobody = NOBODY.get_or_init(|| password_hash("no password signs this in").unwrap_or_default());
+    let ok = PasswordHash::new(hash.unwrap_or(nobody)).is_ok_and(|h| argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok());
+    ok && hash.is_some()
+}
+
+/// The person a name or an email and a password sign in, if they do.
+pub fn check_password(db: &Db, name: &str, password: &str) -> Result<Option<User>> {
+    let found = password_of(db, name)?;
+    let ok = password_matches(found.as_ref().and_then(|(_, h)| h.as_deref()), password);
+    match found {
+        Some((person, _)) if ok => user(db, &person),
+        _ => Ok(None),
+    }
 }
 
 /// One who signs up on AVP Cloud: a person who is no admin, whose repos are their own until they
-/// bring them into an organization.
-pub fn sign_up_person(db: &Db, name: &str, email: &str, password: &str) -> Result<(User, NewToken)> {
+/// bring them into an organization. A token comes with it for a terminal (`avp user signup`) only:
+/// the browser signs in with its session, and a token nobody saw would only sit in the list.
+pub fn sign_up_person(db: &Db, name: &str, email: &str, password: &str, token: bool) -> Result<(User, Option<NewToken>)> {
     anyhow::ensure!(super::orgs::signup_open(), Forbidden("signing up is closed on this server: a server admin adds people (`avp user add`)".into()));
     let email = email.trim();
     anyhow::ensure!(email.contains('@') && !email.contains(char::is_whitespace), "{email:?} is no email address");
@@ -1250,8 +1546,9 @@ pub fn sign_up_person(db: &Db, name: &str, email: &str, password: &str) -> Resul
     anyhow::ensure!(!taken, "{email} already signs a person in: sign in with it (`avp user login {email}`)");
     // The password is checked before anyone is added.
     let hash = password_hash(password)?;
-    let (u, token) = add_person(db, name, Some(email), None, false, "sign-up")?;
+    let u = add_person(db, name, Some(email), None, false, "sign-up")?;
     db.conn.execute("INSERT INTO passwords (person, hash, set_at) VALUES (?1, ?2, ?3)", params![u.name, hash, now_ms()])?;
+    let token = if token { Some(create_token(db, name, "first", "token", None, "sign-up")?) } else { None };
     Ok((u, token))
 }
 
@@ -1271,9 +1568,9 @@ async fn sign_up(State(e): S, Extension(known): Extension<Known>, ext: Extension
         return too_many("sign-ups");
     }
     let live = headers.contains_key("x-avp-live");
-    let out = tokio::task::spawn_blocking(move || -> Result<(User, NewToken, Option<NewToken>)> {
+    let out = tokio::task::spawn_blocking(move || -> Result<(User, Option<NewToken>, Option<NewToken>)> {
         let db = e.db.lock().unwrap();
-        let made = sign_up_person(&db, b.name.trim(), &b.email, &b.password);
+        let made = sign_up_person(&db, b.name.trim(), &b.email, &b.password, !live);
         known.forget();
         let (u, token) = made?;
         let s = if live { Some(session(&db, &u.name, "sign-up")?) } else { None };
@@ -1301,10 +1598,20 @@ async fn password_sign_in(e: Engine, address: String, headers: HeaderMap, name: 
     if !within_limit("signin", &address, SIGNINS_IN_10_MIN, 600_000) {
         return too_many("sign-ins");
     }
+    let account = name.trim().to_lowercase();
+    if tries("signin-fail", &account, 600_000, false) >= FAILS_IN_10_MIN {
+        return json_refusal(StatusCode::TOO_MANY_REQUESTS, "too many wrong passwords for this account: try again in 10 minutes, or sign in with a token");
+    }
     let live = headers.contains_key("x-avp-live");
     let out = tokio::task::spawn_blocking(move || -> Result<Option<NewToken>> {
+        // The hash is checked with the database free: every other request waits on it otherwise.
+        let found = password_of(&e.db.lock().unwrap(), &name)?;
+        if !password_matches(found.as_ref().and_then(|(_, h)| h.as_deref()), &password) {
+            tries("signin-fail", &account, 600_000, true);
+            return Ok(None);
+        }
         let db = e.db.lock().unwrap();
-        let Some(u) = check_password(&db, &name, &password)? else { return Ok(None) };
+        let Some(u) = found.and_then(|(person, _)| user(&db, &person).transpose()).transpose()? else { return Ok(None) };
         Ok(Some(if live { session(&db, &u.name, "password")? } else { create_token(&db, &u.name, "signed in", "token", Some(now_ms() + 90 * 86_400_000), &u.name)? }))
     })
     .await;
@@ -1314,6 +1621,60 @@ async fn password_sign_in(e: Engine, address: String, headers: HeaderMap, name: 
         Ok(Ok(None)) => unsigned("no such name (or email) and password here"),
         Ok(Err(x)) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}")),
         Err(x) => json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()),
+    }
+}
+
+/// What a token is told when it asks for what only a person does: where that person does it.
+pub(crate) fn only_a_person(page: &str) -> String {
+    format!("an approval is a person's: approve it on {page} or with `avp approve`, which asks your password")
+}
+
+/// On AVP Cloud, whether the person is there, for what an agent never does even with their token
+/// (an approval): their web session, opened by signing in (a password, GitHub, the sign-up) and not
+/// by a token, or their password, checked now and limited as a sign-in is. A token, theirs or a
+/// repo's, is what an agent holds. Elsewhere (a team server, none without accounts) as before.
+pub(crate) async fn person_present(e: Engine, who: &Who, headers: &HeaderMap, ext: &Extensions, password: Option<String>, page: &str) -> Result<(), Response> {
+    let Who::Person(u) = who else { return Ok(()) };
+    if !super::orgs::on() {
+        return Ok(());
+    }
+    let refused = || json_refusal(StatusCode::FORBIDDEN, only_a_person(page));
+    // The gate reads the cookie only when no token comes with it: one that does is what it went by.
+    if !headers.contains_key("authorization") {
+        if let Some(s) = cookie(headers, SESSION) {
+            let db = e.db.lock().unwrap();
+            let name: Option<String> = db.conn.query_row("SELECT name FROM tokens WHERE hash = ?1 AND kind = 'session' AND revoked_at IS NULL", params![hash(&s)], |r| r.get(0)).optional().map_err(|x| json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string()))?;
+            return match name {
+                Some(n) if n != "AVP Live (live)" => Ok(()),
+                // A session a token opened is that token again.
+                _ => Err(refused()),
+            };
+        }
+    }
+    let Some(password) = password.filter(|p| !p.is_empty()) else { return Err(refused()) };
+    if !within_limit("signin", &address(headers, ext), SIGNINS_IN_10_MIN, 600_000) {
+        return Err(too_many("sign-ins"));
+    }
+    let account = u.name.to_lowercase();
+    if tries("signin-fail", &account, 600_000, false) >= FAILS_IN_10_MIN {
+        return Err(json_refusal(StatusCode::TOO_MANY_REQUESTS, "too many wrong passwords for this account: try again in 10 minutes, or approve on the web"));
+    }
+    let person = u.name.clone();
+    let ok = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
+        // The hash is checked with the database free, as at sign-in.
+        let found = password_of(&e.db.lock().unwrap(), &person)?;
+        Ok(found.filter(|(_, h)| h.is_some()).map(|(p, h)| p == person && password_matches(h.as_deref(), &password)))
+    })
+    .await;
+    match ok {
+        Ok(Ok(Some(true))) => Ok(()),
+        Ok(Ok(None)) => Err(json_refusal(StatusCode::FORBIDDEN, format!("{} has no password yet: `avp password` sets one, and `avp approve` takes it", u.name))),
+        Ok(Ok(Some(false))) => {
+            tries("signin-fail", &account, 600_000, true);
+            Err(json_refusal(StatusCode::FORBIDDEN, format!("that is not {}'s password: an approval is a person's, approve it on {page} or with `avp approve` again", u.name)))
+        }
+        Ok(Err(x)) => Err(json_refusal(StatusCode::INTERNAL_SERVER_ERROR, format!("{x:#}"))),
+        Err(x) => Err(json_refusal(StatusCode::INTERNAL_SERVER_ERROR, x.to_string())),
     }
 }
 
@@ -1389,7 +1750,7 @@ async fn github_back(State(e): S, Extension(known): Extension<Known>, ext: Exten
                 let made = add_person(&db, &login, None, Some(&login), false, "sign-up");
                 known.forget();
                 match made {
-                    Ok((u, _)) => Ok(Ok(session(&db, &u.name, "github")?)),
+                    Ok(u) => Ok(Ok(session(&db, &u.name, "github")?)),
                     Err(x) => Ok(Err(format!("{x:#}: sign up with an email and another name, then ask a server admin to link {login}"))),
                 }
             }
@@ -1609,7 +1970,9 @@ async fn device_token(State(e): S, Json(b): Json<DevicePoll>) -> Response {
 
 /// The page a person approves a login on, signed in to this server.
 async fn device_page() -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], DEVICE_PAGE).into_response()
+    // Never in another site's frame: approving is one click that logs a machine in as the reader.
+    let csp = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"), (axum::http::header::CONTENT_SECURITY_POLICY, csp)], DEVICE_PAGE).into_response()
 }
 
 /// `curl -fsSL <server>/install | sh`: install.sh, with this server as the one it logs in to.
@@ -1744,6 +2107,8 @@ mod tests {
         assert_eq!(need(Method::POST, "/users"), Need::ServerAdmin);
         assert_eq!(need(Method::GET, "/live"), Need::Nothing);
         assert_eq!(need(Method::POST, "/repos"), Need::Person, "a person creates a repo, and is its admin");
+        assert_eq!(need(Method::GET, "/acme/web.git/info/refs"), Need::Repo("acme/web".into(), Role::Read), "a clone reads");
+        assert_eq!(need(Method::POST, "/acme/web.git/git-receive-pack"), Need::Push("acme/web".into()), "a push lands");
     }
 
     #[test]
@@ -1775,6 +2140,20 @@ mod tests {
         assert!(matches!(check_token(&db, &other.token).unwrap(), Checked::Revoked), "a person removed: their tokens stop");
         let kinds: Vec<String> = account_events(&db, 0, 100).unwrap().into_iter().map(|e| format!("{} by {}", e.kind, e.data["by"].as_str().unwrap())).collect();
         assert!(kinds.contains(&"user.added by server".into()) && kinds.contains(&"token.revoked by bob".into()) && kinds.contains(&"user.removed by ada".into()), "{kinds:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_made_account_sets_a_password_and_server_names_are_kept() {
+        let dir = std::env::temp_dir().join(format!("avp-pw-{}", new_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("avp.sqlite")).unwrap();
+        add_user(&db, "ada", None, None, false, "server").unwrap();
+        assert!(matches!(password_of(&db, "ada").unwrap(), Some((_, None))), "an account made by `avp user add` has no password");
+        set_password(&db, "ada", "a long enough one").unwrap();
+        let (_, hash) = password_of(&db, "ada").unwrap().unwrap();
+        assert!(password_matches(hash.as_deref(), "a long enough one") && !password_matches(hash.as_deref(), "another one!!"));
+        assert!(not_reserved("admin").is_err() && not_reserved("Signup").is_err() && not_reserved("acme").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

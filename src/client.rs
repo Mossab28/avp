@@ -218,6 +218,14 @@ impl Client {
         }
     }
 
+    /// The server's site, for a page a person opens: its address without the credentials it may carry.
+    pub fn site(&self) -> String {
+        match self.base.split_once("://") {
+            Some((scheme, rest)) => format!("{scheme}://{}", rest.rsplit_once('@').map(|(_, host)| host).unwrap_or(rest)),
+            None => self.base.clone(),
+        }
+    }
+
     fn take<T: DeserializeOwned>(r: Response) -> Result<T> {
         let status = r.status();
         let text = r.text()?;
@@ -264,6 +272,10 @@ impl Client {
         let mut q = vec![("path", path.to_string())];
         q.extend(at.map(|a| ("at", a.to_string())));
         Self::take(self.http.get(format!("{}/repos/{repo}/history/blame", self.base)).query(&q).send()?)
+    }
+
+    pub fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        Self::take(self.http.delete(format!("{}{path}", self.base)).send()?)
     }
 
     /// A POST whose answer may be "nothing" (204, a long poll that found no work).

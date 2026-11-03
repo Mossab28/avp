@@ -3,17 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AVP</title>
+<title>AVP Cloud</title>
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23000'/%3E%3Cpath d='M6 16h20' stroke='%23444' stroke-width='2'/%3E%3Ccircle cx='9' cy='16' r='3.2' fill='%23f4f4f4'/%3E%3Ccircle cx='16' cy='16' r='3.2' fill='%23f4f4f4'/%3E%3Ccircle cx='23' cy='16' r='3.2' fill='none' stroke='%23f4f4f4' stroke-width='1.6'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/ui/site.css">
 </head>
 <body>
 <header class="top">
-  <a class="brand" href="/">AVP</a>
-  <nav class="crumbs" id="crumbs"></nav>
+  <a class="brand" href="/" aria-label="AVP home"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M5 16h22" stroke="currentColor" stroke-opacity=".3" stroke-width="2"/><circle cx="8.5" cy="16" r="3.4" fill="currentColor"/><circle cx="16" cy="16" r="3.4" fill="currentColor"/><circle cx="23.5" cy="16" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg><span>AVP</span></a>
+  <nav class="crumbs" id="crumbs" aria-label="Where you are"></nav>
+  <div class="tools" id="tools"></div>
   <div class="me" id="me"></div>
 </header>
-<main id="page"><div class="loading">Loading</div></main>
+<div class="shell" id="shell">
+  <nav class="side" id="side" aria-label="Repository" hidden></nav>
+  <main id="page"><div class="loading">Loading</div></main>
+</div>
+<div id="layer"></div>
 <noscript><main><p>AVP's website needs JavaScript. Everything it shows, the CLI says too: <code>avp log</code>, <code>avp show</code>, <code>avp tasks</code>.</p></main></noscript>
+<script src="/ui/field.js"></script>
 <script src="/ui/site.js"></script>
 <script src="/ui/repo.js"></script>
 </body>

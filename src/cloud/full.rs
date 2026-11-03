@@ -420,6 +420,10 @@ impl Engine {
             let Some(head) = self.db().head(&repo.id)? else { continue };
             // An avp.toml that does not read: every proof of the repo says why.
             let Ok(cfg) = read_config(&self.objects.get_tree(&head.tree)?, &self.objects) else { continue };
+            // On AVP Cloud a space past its plan's minutes starts no proof, scheduled ones neither.
+            if !cfg.check.schedule.is_empty() && !matches!(super::orgs::may_prove(self, &repo.id), Ok(Ok(()))) {
+                continue;
+            }
             for s in cfg.check.schedule {
                 let today = now - now.rem_euclid(DAY) + s.minute * 60_000;
                 let due = if today > now { today - DAY } else { today };

@@ -18,8 +18,9 @@ check stays per repo.
 
 | Route | Who | Body / answer |
 |---|---|---|
-| `POST /repos` | any person | `{"name": "shop"}` in their own space, or `{"name": "acme/shop"}` in an organization they administer; `"policy"` as before → the repo. 400 `acme/shop already exists: choose another name` when the space has one |
+| `POST /repos` | any person | `{"name": "shop"}` in their own space, or `{"name": "acme/shop"}` in an organization they administer; `"policy"` as before; `"readme": "# shop\n"` (position 0 holds that README.md) or `"start": true` (an empty position 0), as the website's New repo does, so an agent can `avp open --repo` it at once; neither, and the line waits for `avp init` or `avp up` → the repo. 400 `acme/shop already exists: choose another name` when the space has one |
 | `GET /{space}/{repo}.git/info/refs` | readers | `git clone https://<server>/acme/shop.git` |
+| `POST /{space}/{repo}.git/git-receive-pack` | writers | `git push https://<server>/acme/shop.git main`: a task from the pushed commits, landed through the proof; the ref is `ok` once landed, `ng` (red, conflict, waits for approval with the task id) otherwise, the why in git's sideband. A repo not there yet is created in the asker's space, its history imported. 402 past the plan's proof minutes |
 
 ## Accounts
 
@@ -79,5 +80,36 @@ A usage, for the calendar month (UTC):
 only when `over`. Past the cap, `POST /repos/{repo}/tasks/{task}/check`, `.../land`,
 `.../speculate` and `POST /repos/{repo}/full` answer 402 with `said` as the error.
 
+## A repo's settings
+
+Its admins' (the settings page, `avp repo`, the `avp_repo` tool); every answer that changes something
+carries `said`, a sentence saying what changed and what to do next.
+
+| Route | Body → answer |
+|---|---|
+| `GET /repos/{repo}/settings` | → `{"repo", "name": "acme/shop", "description", "visibility": "private"\|"public", "archived": {"at", "by"} or null, "deleted": {"at", "by", "purge_at"} or null, "names_before": ["acme/old"], "collaborators": [{"person", "role", "via": "repo"\|"org", "org_role"?}], "org", "tokens": [{"id", "person", "name", "role", "scope", "created_at", "expires_at", "used_at", "revocable"}], "security": {"guarded", "always_guarded", "landing", "approvers"}, "spaces", "said"}` |
+| `POST /repos/{repo}/settings/collaborators` | `{"person": "bob" or "bob@example.com", "role": "read"\|"write"\|"admin"\|"none"}` → `{"person", "role", "was", "said"}`; at once, to a person signed up. 400 when it would leave the repo no admin (outside an organization) |
+| `POST /repos/{repo}/settings/tokens` | `{"name": "ci", "role": "read"\|"write", "expires": "90d"}` → `{"token": "avp_...", "info", "role", "said"}`, the token shown this once |
+| `POST /repos/{repo}/settings/tokens/{id}/revoke` | → `{"id", "revoked_at", "said"}`: a token made for this repo |
+| `POST /repos/{repo}/settings/general` | any of `{"name", "description", "visibility"}` → `{"repo", "name", "said"}`. An old name keeps reaching the repo (routes and `git clone`) until another repo takes it |
+| `POST /repos/{repo}/settings/transfer` | `{"to": "acme"}`, the asker's own space or an organization they administer → `{"repo", "name", "said"}` |
+| `POST /repos/{repo}/settings/archive` | `{"archived": true}` → `{"said"}`. Archived, any change but its settings answers 403, saying so |
+| `POST /repos/{repo}/settings/delete` | `{"confirm": "shop"}`, its name → `{"said"}`. Deleted, it answers 404 to everything but its settings, log and restore; purged after 7 days |
+| `POST /repos/{repo}/settings/restore` | → `{"said"}` |
+| `GET /repos/{repo}/settings/audit?before=&limit=` | → `[{"id", "at", "kind", "by", "what", "data"}]`, newest first: `repo.*`, `role.set`, `secret.*` |
+
+A token made for a repo (`kind: "repo"`) reaches that repo alone, to its role at most, `GET /me`
+besides; anything else, an approval included, answers 403. A public repo answers its reads to anyone,
+with no token; its writes still need one with a role.
+
 Objects: `GET`, `HEAD /repos/{repo}/objects/{hash}` and `POST /repos/{repo}/objects` answer 404 for
 an object the repo does not hold, whatever other repo holds it.
+
+## A task's files from a browser
+
+`PUT /repos/{repo}/tasks/{task}/files/{path}`, writers of the repo: the file's bytes as the body,
+written to the open task as `POST .../writes` writes it (same answer, same leases, the same guarded
+paths when it lands). For a client that cannot hash with blake3 before sending, as AVP Cloud's
+editor and uploads; `?mode=33261` makes it executable, none keeps the mode the file has at the
+task's base. The website saves a change as any agent does: `POST /repos/{repo}/tasks?base=<position>`
+with the message as the goal, these writes (a delete through `.../writes`), then `.../land`.

@@ -79,7 +79,7 @@ try:
     lead = Mcp(f"{W}/lead")
     lead.wait(lead.send("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "claude-code"}}))
     listed = lead.wait(lead.send("tools/list", {}))[0]["result"]["tools"]
-    check("every tool but avp_open takes `task`", all(("task" in t["inputSchema"]["properties"]) == (t["name"] not in ("avp_open", "avp_migrate_report")) for t in listed))
+    check("every tool but avp_open takes `task`", all(("task" in t["inputSchema"]["properties"]) == (t["name"] not in ("avp_open", "avp_migrate_report", "avp_repo")) for t in listed))
 
     # Three subagents of one lead, each opening its own task through the lead's server.
     opened = {}

@@ -46,6 +46,7 @@ fn no_worker_claims_a_proof_while_the_server_drains() {
     std::thread::spawn(move || tx.send(e2.check(&id).map(|p| p.verdict).ok()).unwrap());
     until("the proof waits in the queue", || get("/work")["waiting"] == 1);
     assert_eq!(get(&format!("/drain?task={}", t.id))["held"], true, "a land waiting for it hears why");
+    assert_eq!(e.status(&t.id).unwrap().progress.as_deref(), Some("queued, next for a machine"), "its status says it is queued");
 
     let none = claim();
     assert_eq!(none.status().as_u16(), 204, "no claim gets a job while the server drains");
@@ -60,6 +61,8 @@ fn no_worker_claims_a_proof_while_the_server_drains() {
     let work = get("/work");
     assert_eq!((&work["waiting"], &work["running"], &work["draining"]), (&serde_json::json!(0), &serde_json::json!(1), &serde_json::json!(false)), "{work}");
     assert_eq!(get(&format!("/drain?task={}", t.id))["held"], false);
+    http.post(format!("{base}/work/{}/alive", job.id)).json(&serde_json::json!({ "phase": "running step lint" })).send().unwrap();
+    assert_eq!(e.status(&t.id).unwrap().progress.as_deref(), Some("running step lint"), "its status says what its worker runs");
 
     let steps = vec![Step { name: "lint".into(), command: "true".into(), exit: 0, seconds: 0.1, output: String::new() }];
     let done: serde_json::Value = http.post(format!("{base}/work/{}/result", job.id)).json(&serde_json::json!({ "steps": steps })).send().unwrap().json().unwrap();

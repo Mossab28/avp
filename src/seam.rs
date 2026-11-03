@@ -66,10 +66,21 @@ pub fn created(e: &Engine, repo: &Repo, asker: &Extensions) -> Result<()> {
     side::created(e, repo, asker)
 }
 
+/// A repo a `git push` creates (`<space>/<name>` or `<name>`): on AVP Cloud in that space, which
+/// must be the person's own or an organization they administer; its creator is its admin.
+pub fn create_pushed(e: &Engine, key: &str, asker: &Extensions) -> Result<Repo> {
+    side::create_pushed(e, key, asker)
+}
+
 /// Where a proof runs: its steps when it ran elsewhere (proof workers), None when this server runs
 /// it itself.
 pub fn prove_away(job: Job, speculative: bool) -> Result<Option<Vec<Step>>> {
     side::prove_away(job, speculative)
+}
+
+/// Where the proof of `name` stands away from this server (queued for a worker, on one), if it does.
+pub fn proof_progress(name: &str) -> Option<String> {
+    side::proof_progress(name)
 }
 
 /// The proofs of `name` on another tree than `tree_hash` are worth nothing now: stopped wherever
@@ -105,6 +116,12 @@ pub fn left_out(e: &Engine, repo: &str, rule: &crate::check::AutoSkip) -> Vec<St
 /// paths). None: it lands when green.
 pub fn landing_gate(e: &Engine, task: &Task, writes: &[Write], candidate: &Tree, proof: &Proof) -> Result<Option<NotLanded>> {
     side::landing_gate(e, task, writes, candidate, proof)
+}
+
+/// Before a proof: the guarded paths of a task that waits for a person's word whatever its proof
+/// says. None: its proof decides (the small avp gates nothing).
+pub fn waits_for_word(e: &Engine, task: &Task, writes: &[Write], candidate: &Tree) -> Result<Option<Vec<String>>> {
+    side::waits_for_word(e, task, writes, candidate)
 }
 
 /// What follows a landing at `position`: the full suite, and the environments that follow it.
@@ -184,8 +201,16 @@ mod small {
         Ok(())
     }
 
+    pub(super) fn create_pushed(e: &Engine, key: &str, _: &Extensions) -> Result<Repo> {
+        e.create_repo(key, LeasePolicy::Advisory)
+    }
+
     pub(super) fn prove_away(_: Job, _: bool) -> Result<Option<Vec<Step>>> {
         Ok(None)
+    }
+
+    pub(super) fn proof_progress(_: &str) -> Option<String> {
+        None
     }
 
     pub(super) fn cancel_other(_: &str, _: &str) {}
@@ -205,6 +230,10 @@ mod small {
     }
 
     pub(super) fn landing_gate(_: &Engine, _: &Task, _: &[Write], _: &Tree, _: &Proof) -> Result<Option<NotLanded>> {
+        Ok(None)
+    }
+
+    pub(super) fn waits_for_word(_: &Engine, _: &Task, _: &[Write], _: &Tree) -> Result<Option<Vec<String>>> {
         Ok(None)
     }
 

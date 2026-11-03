@@ -372,6 +372,27 @@ deploy = { github_workflow = "deploy-production.yml", approve_environment = "pro
 }
 
 #[test]
+fn the_guessed_virtualenv_works_on_a_python_without_ensurepip() {
+    // A python3 that refuses `-m venv .venv` as Debian's does without python3-venv. The fallback
+    // borrows the system's pip: a machine without one (the image's build stage) has nothing to test.
+    if !std::process::Command::new("python3").args(["-m", "pip", "--version"]).output().is_ok_and(|o| o.status.success()) {
+        eprintln!("no python3 with pip here: skipped");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("avp-test-venv-{}", ulid::Ulid::new()));
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let real = String::from_utf8(std::process::Command::new("sh").args(["-c", "command -v python3"]).output().unwrap().stdout).unwrap();
+    std::fs::write(bin.join("python3"), format!("#!/bin/sh\n[ \"$*\" = '-m venv .venv' ] && {{ echo 'ensurepip is not available' >&2; exit 1; }}\nexec {} \"$@\"\n", real.trim())).unwrap();
+    std::process::Command::new("chmod").args(["+x", bin.join("python3").to_str().unwrap()]).status().unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = std::process::Command::new("sh").arg("-c").arg(format!("{} && .venv/bin/pip --version", avp::up::PY_VENV)).current_dir(&dir).env("PATH", path).output().unwrap();
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("pip"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::read_to_string(dir.join(".venv/pyvenv.cfg")).unwrap().contains("include-system-site-packages = true"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn avp_up_guesses_the_checks_of_a_python_project() {
     let base = std::env::temp_dir().join(format!("avp-test-py-{}", ulid::Ulid::new()));
     let uv = base.join("uv");

@@ -69,7 +69,8 @@ pub fn work(client: &Client, data: &Path) -> Result<()> {
             eprintln!("avp worker: asked to stop, no proof in hand: leaving");
             return Ok(());
         }
-        let claimed: Option<Claimed> = match client.post_maybe("/work/claim", &serde_json::json!({ "wait_s": 25, "parts": true })) {
+        // Said, so that a server whose proofs are strangers' code hands none to a worker without one.
+        let claimed: Option<Claimed> = match client.post_maybe("/work/claim", &serde_json::json!({ "wait_s": 25, "parts": true, "sandbox": sandbox.as_ref().map(|s| s.tool) })) {
             Ok(j) => j,
             // A server built without the cloud has no queue: claiming again will not make one.
             Err(e) if crate::client::cloud_only(&e) => return Err(e),
@@ -107,7 +108,8 @@ pub fn work(client: &Client, data: &Path) -> Result<()> {
             // answer is also how the worker hears that the proof is no longer wanted.
             scope.spawn(|| {
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    let beat = client.post::<serde_json::Value>(&format!("/work/{}/alive", job.id), &serde_json::json!({}));
+                    // With where the proof stands, which its task's status shows.
+                    let beat = client.post::<serde_json::Value>(&format!("/work/{}/alive", job.id), &serde_json::json!({ "phase": crate::check::phase(&job.name) }));
                     // The task's files changed: this tree is not worth finishing.
                     if beat.is_ok_and(|b| b["cancel"].as_bool() == Some(true)) {
                         crate::check::cancel_other(&job.name, "");

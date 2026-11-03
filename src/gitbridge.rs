@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 /// nor in a file.
 static GIT_ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_env(dir, args, &[])
 }
 
@@ -53,7 +53,7 @@ fn git_env(dir: &Path, args: &[&str], env: &[(&str, String)]) -> Result<String> 
 /// `git ls-tree -r` of one commit: path -> (git blob sha, mode), regular files only. Symlinks and
 /// submodules are git objects the line does not carry: the export starts from a commit that has
 /// them and never touches them, so they survive the round trip unchanged.
-fn tree_of(dir: &Path, commit: &str) -> Result<BTreeMap<String, (String, u32)>> {
+pub(crate) fn tree_of(dir: &Path, commit: &str) -> Result<BTreeMap<String, (String, u32)>> {
     let mut map = BTreeMap::new();
     for (path, (kind, mode, sha)) in ls_tree(dir, commit)? {
         if kind == "blob" && (mode == 0o100644 || mode == 0o100755) {
@@ -131,10 +131,23 @@ pub fn import_git(client: &Client, dir: &Path, name: &str, policy: &str, history
         let subject = git(dir, &["log", "-1", "--format=%h %s (%an, %as)", sha])?;
         let entry: LineEntry = client.post(&format!("/repos/{}/import", repo.id), &serde_json::json!({ "entries": entries, "note": subject.trim(), "git": sha }))?;
         last = entry.position;
-        eprint!("\r{}/{} positions", i + 1, commits.len());
+        counted(i + 1, commits.len(), "positions");
     }
-    eprintln!();
     Ok((repo, last))
+}
+
+/// `done` of `all` on stderr: rewritten in place at a terminal, the last line ending it; a plain
+/// line every 100 and at the end elsewhere (a log, an agent's pipe), where `\r` piles up unread.
+fn counted(done: usize, all: usize, what: &str) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        eprint!("\r{done}/{all} {what}");
+        if done == all {
+            eprintln!();
+        }
+    } else if done % 100 == 0 || done == all {
+        eprintln!("{done}/{all} {what}");
+    }
 }
 
 pub struct Exported {
@@ -259,10 +272,7 @@ pub fn mirror(client: &Client, dir: &Path, repo: &str, branch: &str, remote: Opt
         sha = git(&wt, &["rev-parse", "HEAD"])?.trim().to_string();
         let _: LineEntry = client.post(&format!("/repos/{}/line/{pos}/git", r.id), &serde_json::json!({ "sha": sha }))?;
         written += 1;
-        eprint!("\r{written}/{} positions written", head.position - base.position);
-    }
-    if written > 0 {
-        eprintln!();
+        counted(written, (head.position - base.position) as usize, "positions written");
     }
 
     // The exported tree must be the head of the line, file by file, before anything leaves.
@@ -943,7 +953,7 @@ fn commit_writes(client: &Client, repo: &str, dir: &Path, parent: Option<&str>, 
 }
 
 /// The bytes of git blobs, by sha, through one `git cat-file --batch`.
-fn cat_blobs(dir: &Path, shas: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+pub(crate) fn cat_blobs(dir: &Path, shas: &[String]) -> Result<HashMap<String, Vec<u8>>> {
     let mut out = HashMap::new();
     if shas.is_empty() {
         return Ok(out);
@@ -1061,10 +1071,10 @@ pub fn served_root(data: &Path) -> PathBuf {
 }
 
 /// One sync at a time: two clones at once would write the same commits twice.
-static SERVED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static SERVED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The bare repo of `repo`, made on first use.
-fn served_repo(data: &Path, repo: &str) -> Result<PathBuf> {
+pub(crate) fn served_repo(data: &Path, repo: &str) -> Result<PathBuf> {
     let dir = served_root(data).join(format!("{repo}.git"));
     if !dir.join("HEAD").exists() {
         std::fs::create_dir_all(&dir)?;
@@ -1075,7 +1085,7 @@ fn served_repo(data: &Path, repo: &str) -> Result<PathBuf> {
 }
 
 /// The position `main` was last written up to, and its commit, as the last sync left them.
-const SYNCED: &str = "avp-position";
+pub(crate) const SYNCED: &str = "avp-position";
 
 /// Takes the git history `avp import` sends (a bundle of HEAD) as the start of `main`: the
 /// positions that remember its commits then clone as those very commits.

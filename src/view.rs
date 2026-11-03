@@ -925,6 +925,15 @@ pub struct SyncReport {
     pub deletes: Vec<WriteOutcome>,
 }
 
+/// Beside a synced file of 10 MB or more: most often a build output or a dump an agent left, which
+/// the line would carry in every clone from now on.
+pub fn size_note(dir: &Path, path: &str) -> String {
+    match std::fs::metadata(dir.join(path)).map(|m| m.len()) {
+        Ok(n) if n >= 10 * 1024 * 1024 => format!(" ({} MB: every clone carries it from now on; if it is a build output, add it to .gitignore and delete it)", n / (1024 * 1024)),
+        _ => String::new(),
+    }
+}
+
 /// Sends every difference between the directory and what the view knows as writes.
 pub fn sync(client: &Client, dir: &Path, state: &mut ViewState) -> Result<SyncReport> {
     let task = state.task.clone().context("no open task in this view: avp open first")?;

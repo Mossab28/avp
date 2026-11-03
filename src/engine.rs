@@ -394,10 +394,27 @@ impl Engine {
         let task = db.task(task_id)?;
         let head = db.head(&task.repo)?.map(|h| h.position).unwrap_or(-1);
         let with = Self::landed_with(&db, &task)?;
-        let status = TaskStatus { writes: db.writes(task_id)?, leases: db.leases_of(task_id)?, last_proof: db.last_proof(task_id)?, approval: db.approval(task_id)?, task, head_position: head, stack: None, with };
+        let leases = db.leases_of(task_id)?;
+        // The paths another task took over since this one opened, and holds still.
+        let taken_over = if task.state == TaskState::Open {
+            db.events_of(&task.repo, &["lease.taken_over"], task.created_at)?
+                .into_iter()
+                .filter(|e| e.task.as_deref() == Some(task_id))
+                .filter_map(|e| Some((e.path?, e.data["by"].as_str()?.to_string())))
+                .filter(|(p, _)| self.holder(&db, &task.repo, p, task_id).is_ok_and(|h| h.is_some()))
+                .map(|(p, by)| format!("{p}: task {by} writes it too now, the later of you to land replays on the other"))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            vec![]
+        };
+        let status = TaskStatus { writes: db.writes(task_id)?, leases, last_proof: db.last_proof(task_id)?, approval: db.approval(task_id)?, task, head_position: head, stack: None, with, progress: None, taken_over };
         drop(db);
-        let stack = if status.task.state == TaskState::Open { self.stack_word(&status.task)? } else { None };
-        Ok(TaskStatus { stack, ..status })
+        let open = status.task.state == TaskState::Open;
+        let stack = if open { self.stack_word(&status.task)? } else { None };
+        let progress = open.then(|| crate::seam::proof_progress(task_id).or_else(|| crate::check::phase(task_id))).flatten();
+        Ok(TaskStatus { stack, progress, ..status })
     }
 
     /// What a task changes, file by file, against the position it stands on: what a person reads
@@ -508,7 +525,8 @@ impl Engine {
             p = &p[..i];
             candidates.push(p.to_string());
         }
-        for c in candidates {
+        // A scope says a directory with its slash or without (`--scope src/`): both are its lease.
+        for c in candidates.iter().flat_map(|c| [c.trim_end_matches('/').to_string(), format!("{}/", c.trim_end_matches('/'))]) {
             if let Some(l) = db.lease(repo, &c)? {
                 if l.task != except && l.expires_at > now_ms() {
                     return Ok(Some(l.task));
@@ -597,6 +615,10 @@ impl Engine {
             }
             db.set_lease(&task.repo, p, task_id, LEASE_TTL_MS)?;
             db.emit(&task.repo, "lease.taken", Some(task_id), Some(p), serde_json::json!({ "previous_holder": holder }))?;
+            // The task that held it hears it, as when a write takes a lease over.
+            if let Some(h) = &holder {
+                db.emit(&task.repo, "lease.taken_over", Some(h), Some(p), serde_json::json!({ "by": task_id }))?;
+            }
             out.push((p.clone(), holder));
         }
         Ok(out)
@@ -920,6 +942,24 @@ impl Engine {
         true
     }
 
+    /// The proof of a task that waits for a person's word whatever it says, if it is over within
+    /// `AVP_WORD_WAIT_S` seconds (20 by default): a land then answers as usual. Longer, the land answers
+    /// at once (None) and the proof goes on; once over, the task lands again on its own, so a word
+    /// given meanwhile lands it, and a person is told it waits for theirs.
+    fn check_awaiting_word(&self, task_id: &str) -> Option<Result<Proof>> {
+        let wait = std::env::var("AVP_WORD_WAIT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        let (done, proved) = std::sync::mpsc::channel();
+        let (e, t) = (self.clone(), task_id.to_string());
+        std::thread::spawn(move || {
+            let p = e.check(&t);
+            // Nobody waits for it any more: the task's land goes on here.
+            if let Err(std::sync::mpsc::SendError(Ok(_))) = done.send(p) {
+                let _ = e.land(&t);
+            }
+        });
+        proved.recv_timeout(std::time::Duration::from_secs(wait)).ok()
+    }
+
     fn task_lock(&self, task_id: &str) -> Arc<Mutex<()>> {
         self.task_locks.lock().unwrap_or_else(|e| e.into_inner()).entry(task_id.to_string()).or_default().clone()
     }
@@ -1143,7 +1183,7 @@ impl Engine {
     fn already_landed(db: &Db, t: &Task) -> Result<Option<LandOutcome>> {
         let (TaskState::Landed, Some(position)) = (t.state, t.landed_position) else { return Ok(None) };
         let e = db.line_at(&t.repo, position)?;
-        Ok(Some(LandOutcome::Landed(Landed { position, tree: e.tree, proof: e.proof.unwrap_or_default(), replayed: false, stack: vec![], with: Self::landed_with(db, t)? })))
+        Ok(Some(LandOutcome::Landed(Landed { position, tree: e.tree, proof: e.proof.unwrap_or_default(), replayed: false, stack: vec![], with: Self::landed_with(db, t)?, checks: None })))
     }
 
     /// The other tasks a landed task landed with, at its position (`avp land --with`).
@@ -1252,7 +1292,22 @@ impl Engine {
             }
             _ => false,
         };
-        let proof = if reusable { last.unwrap() } else { self.check(task_id)? };
+        let proof = if reusable {
+            last.unwrap()
+        } else if let Some(guarded) = crate::seam::waits_for_word(self, &task, &writes, &candidate)? {
+            match self.check_awaiting_word(task_id) {
+                Some(p) => p?,
+                None => {
+                    let note = format!(
+                        "{} its proof runs now on the head, and a person's word is needed whatever it says: once it is green, a repo admin's `avp approve {task_id}` lands it (`avp status` follows the proof). Say so and stop here",
+                        if guarded.is_empty() { "this repo lands nothing without a person's approval:".to_string() } else { format!("it changes guarded paths ({}):", guarded.join(", ")) }
+                    );
+                    return Ok(LandOutcome::NotLanded(NotLanded { guarded, reason: "approval".into(), conflicts: vec![], proof: None, waits_for: vec![], word: None, note: Some(note), stack: vec![] }));
+                }
+            }
+        } else {
+            self.check(task_id)?
+        };
         // What holds a green proof back (a person's approval, in AVP Cloud), or a red one proven
         // without the secrets it names.
         if let Some(n) = crate::seam::landing_gate(self, &task, &writes, &candidate, &proof)? {
@@ -1300,7 +1355,7 @@ impl Engine {
             entry
         };
         crate::seam::after_landing(self, &task, entry.position, &candidate_hash);
-        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: candidate_hash, proof: proof.id, replayed, stack: vec![], with: vec![] }))
+        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: candidate_hash, checks: Some(proof.steps.len()), proof: proof.id, replayed, stack: vec![], with: vec![] }))
     }
 
     // ---- tasks that need each other ----
@@ -1583,7 +1638,7 @@ impl Engine {
         };
         drop(turn);
         crate::seam::after_landing(self, lead_task, entry.position, &hash);
-        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: hash, proof: proof.id, replayed: lead_task.base_position != head.position, stack: vec![], with: others }))
+        Ok(LandOutcome::Landed(Landed { position: entry.position, tree: hash, checks: Some(proof.steps.len()), proof: proof.id, replayed: lead_task.base_position != head.position, stack: vec![], with: others }))
     }
 
     /// The reverts of the last day a task should hear of as it opens: those of positions that
@@ -1928,7 +1983,18 @@ fn shown(url: &str) -> String {
 /// half a minute still hears of it. A 4xx answer other than 429 is the request's fault, not tried again.
 fn post_webhook(named: &str, body: &serde_json::Value) -> Result<()> {
     let url = webhook_url(named)?;
-    let http = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let mut http = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(10));
+    // On AVP Cloud the URL is a stranger's: it must not reach the server's own machine, its VPC or
+    // the cloud's metadata. The address checked is the one posted to (no second lookup to rebind),
+    // and no redirect may lead elsewhere.
+    if crate::cloud::orgs::on() {
+        let parsed = reqwest::Url::parse(&url)?;
+        let host = parsed.host_str().unwrap_or("").to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let addr = outside_address(&host, port)?;
+        http = http.redirect(reqwest::redirect::Policy::none()).resolve(&host, addr);
+    }
+    let http = http.build()?;
     let mut last = String::new();
     for wait in [0, 1, 5, 25] {
         std::thread::sleep(std::time::Duration::from_secs(wait));
@@ -1941,6 +2007,20 @@ fn post_webhook(named: &str, body: &serde_json::Value) -> Result<()> {
         }
     }
     anyhow::bail!("{} did not take it in 4 tries: {last}", shown(&url))
+}
+
+/// The first address of `host` when every one it has is on the internet: none loopback, private,
+/// link-local (the metadata), shared (100.64/10), unspecified or multicast.
+fn outside_address(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    let inside = |ip: IpAddr| match ip {
+        IpAddr::V4(v) => v.is_loopback() || v.is_private() || v.is_link_local() || v.is_unspecified() || v.is_multicast() || v.is_broadcast() || (v.octets()[0] == 100 && (64..128).contains(&v.octets()[1])) || v.octets()[0] == 0,
+        IpAddr::V6(v) => v.is_loopback() || v.is_unspecified() || v.is_multicast() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80 || v.to_ipv4_mapped().is_some_and(|m| m.is_loopback() || m.is_private() || m.is_link_local()),
+    };
+    let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(|e| anyhow!("{host}: {e}"))?.collect();
+    anyhow::ensure!(!addrs.is_empty(), "{host} has no address");
+    anyhow::ensure!(addrs.iter().all(|a| !inside(a.ip())), "{host} is on a local or private network: AVP Cloud posts webhooks to the internet only");
+    Ok(addrs[0])
 }
 
 /// Open tasks as `avp tasks` lists them: each stack together, every task right after the one it is
@@ -2052,4 +2132,15 @@ fn line_before(old: &str, new: &str, n: usize) -> Option<usize> {
         offset = o as isize - w as isize;
     }
     Some((n as isize + offset) as usize)
+}
+
+#[cfg(test)]
+mod webhook_tests {
+    #[test]
+    fn a_cloud_webhook_never_reaches_inside() {
+        for inside in ["127.0.0.1", "169.254.169.254", "10.0.1.5", "172.31.0.2", "192.168.1.1", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "::ffff:127.0.0.1"] {
+            assert!(super::outside_address(inside, 80).is_err(), "{inside}");
+        }
+        assert!(super::outside_address("1.1.1.1", 443).is_ok());
+    }
 }

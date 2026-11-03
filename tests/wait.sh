@@ -5,8 +5,10 @@ set -u
 T=${AVP:-$HOME/Projects/avp/target/release/avp}
 W=$(mktemp -d "${1:?usage: tests/wait.sh <scratch dir>}/wt.XXXX") && cd "$W" || exit 1
 export AVP_SERVER=http://127.0.0.1:7199
-$T serve --listen 127.0.0.1:7199 --data "$W/data" >"$W/server.log" 2>&1 & SP=$!
-trap 'kill $SP 2>/dev/null' EXIT
+# The server keeps its data and log beside the folder `avp init` imports, never inside it: a database
+# that changes while it is read is a blob the server never gets.
+$T serve --listen 127.0.0.1:7199 --data "$W.data" >"$W.log" 2>&1 & SP=$!
+trap 'kill $SP 2>/dev/null; rm -rf "$W.data" "$W.log"' EXIT
 sleep 1
 ok(){ if eval "$2" >/dev/null 2>&1; then echo "PASS $1"; else echo "FAIL $1"; fi; }
 mkdir src && printf 'a\n' > src/a.txt && $T init w >/dev/null
