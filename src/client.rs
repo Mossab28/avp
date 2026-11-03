@@ -29,7 +29,7 @@ fn token_header(base: &str) -> Option<reqwest::header::HeaderValue> {
 /// avp runs, else as it was built, else AVP's own.
 pub fn cloud_url() -> String {
     let set = |v: Option<String>| v.map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty());
-    set(std::env::var("AVP_CLOUD_URL").ok()).or_else(|| set(option_env!("AVP_CLOUD_URL").map(String::from))).unwrap_or_else(|| "https://cloud.murmell.com".into())
+    set(std::env::var("AVP_CLOUD_URL").ok()).or_else(|| set(option_env!("AVP_CLOUD_URL").map(String::from))).unwrap_or_else(|| "https://avp.murmell.com".into())
 }
 
 /// A server's address as credentials know it: `https://` when none is said, no trailing slash.

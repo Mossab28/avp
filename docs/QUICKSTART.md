@@ -11,12 +11,12 @@ names change. You need git, and the tools your tests need. No GitHub account, no
 ## 1. Install (1 minute)
 
 ```sh
-curl -fsSL https://cloud.murmell.com/install | sh
+curl -fsSL https://avp.murmell.com/install | sh
 ```
 
 ```
 avp 0.6.1 installed in ~/.local/bin
-next: avp login https://cloud.murmell.com
+next: avp login https://avp.murmell.com
 then, in a git checkout: avp up (your agents work on AVP Cloud)
 ```
 
@@ -30,10 +30,10 @@ avp login
 ```
 
 ```
-Open https://cloud.murmell.com/login/device?code=KXQD-TMRB
+Open https://avp.murmell.com/login/device?code=KXQD-TMRB
 and approve this machine: the page shows the code KXQD-TMRB, check it is the one here.
 Waiting for your approval (10 minutes at most)...
-logged in to https://cloud.murmell.com as alice: the token is kept in ~/.config/avp/credentials (yours alone to read)
+logged in to https://avp.murmell.com as alice: the token is kept in ~/.config/avp/credentials (yours alone to read)
 next, in a git checkout: `avp up`, then ask your agent for a change
 ```
 
@@ -56,7 +56,7 @@ avp up
 3/3 positions
 landing avp.toml (tests): its first proof installs the dependencies once...
 AVP is on for ~/shop
-  server   https://cloud.murmell.com (running), as alice
+  server   https://avp.murmell.com (running), as alice
   repo     shop, imported: the last 3 commits of HEAD are positions 0 to 2, in acme
   checks   avp.toml landed at position 3: tests
   mirror   none from this checkout: the team server mirrors its line (--mirror to run one here)
@@ -202,7 +202,7 @@ settles them and lands again.
 
 ## 6. AVP Live (1 minute)
 
-Open <https://cloud.murmell.com/live> in a browser (<http://127.0.0.1:7117/live> for a local
+Open <https://avp.murmell.com/live> in a browser (<http://127.0.0.1:7117/live> for a local
 server). It shows the line as it moves: each landing, the
 tasks at work, and what each position changed (click one). Its left rail has six views: Overview,
 Line, Review (what waits for a person), Stats, Environments and Setup. It shows the newest repo of
