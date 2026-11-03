@@ -35,7 +35,8 @@ ok "so does the first write outside the scope, once" '[[ "$sent" == *"+ README.m
 mkdir agent && mcp=$(cd agent && printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"e2e"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"avp_context","arguments":{"paths":["src/"]}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"avp_open","arguments":{"goal":"docs over mcp","scope":["docs/"]}}}' | AVP_REPO=cx AVP_VIEWS="$W/views" $T mcp)
-answer(){ python3 -c "import json,sys; print([json.loads(l) for l in sys.argv[1].splitlines()][int(sys.argv[2])]['result']['content'][0]['text'])" "$mcp" "$1"; }
+# By id, not by place: an MCP server may answer two calls in either order (tools run side by side).
+answer(){ python3 -c "import json,sys; print({d.get('id'): d for d in map(json.loads, sys.argv[1].splitlines())}[int(sys.argv[2]) + 1]['result']['content'][0]['text'])" "$mcp" "$1"; }
 ok "the avp_context tool answers the same lines, before any task is open" '[[ "$(answer 1)" == *"src/a.txt"*"say TWO"*"src/b.txt  held by open task"* ]]'
 ok "avp_open ends with them" '[[ "$(answer 2)" == *"newest first"*"docs/d.md  held by open task task_"*"(claude-code): more of a"* ]]'
 ok "and the MCP instructions point to it" '[[ "$mcp" == *"avp_context says the same of any path: read it before exploring the code"* ]]'
