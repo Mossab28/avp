@@ -114,6 +114,7 @@ h3 { font-weight: 500; font-size: 17px; letter-spacing: -.01em; margin: 14px 0 8
 .big { font-weight: 500; font-size: clamp(60px, 12vw, 184px); line-height: .88; letter-spacing: -.06em; }
 .big .unit { color: var(--mut); }
 .foot { margin-top: 18px; }
+.foot.c { text-align: center; }
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 64px; }
 .stat { border-left: 1px solid var(--line2); padding: 0 16px; }
 .stat b { display: block; font-weight: 500; font-size: clamp(40px, 5vw, 64px); letter-spacing: -.04em; line-height: 1; margin-top: 56px; font-variant-numeric: tabular-nums; }
@@ -221,11 +222,11 @@ footer .links { display: flex; gap: 20px; }
 
 <section id="how" class="light" data-theme="light">
   <div class="wrap">
-    <div class="frame rise"><h2 class="c">Branches Were Made<br>For People.</h2></div>
+    <div class="frame rise"><h2 class="c">Branches Were Made<br>For People.</h2><p class="mono foot c" style="margin-top:18px">Three verbs. That is the whole of it.</p></div>
     <div class="cols">
-      <div class="col rise"><canvas class="draw" data-draw="tasks" aria-hidden="true"></canvas><span class="mono">Tasks, not branches</span><h3>Open, write, land.</h3><p>An agent opens a task on the head of the line and writes. No branch to name, no merge, no pull request to babysit.</p></div>
-      <div class="col rise"><canvas class="draw" data-draw="proof" aria-hidden="true"></canvas><span class="mono">Proven, then landed</span><h3>The line never goes red.</h3><p>Every change is proven on the exact head it lands on. Only the checks it touches run, side by side, in a sandbox of its own.</p></div>
-      <div class="col rise"><canvas class="draw" data-draw="line" aria-hidden="true"></canvas><span class="mono">One line</span><h3>Agents see each other.</h3><p>Who holds which file, who waits for whom, what just landed. Conflicts are settled before they happen, not after.</p></div>
+      <div class="col rise"><canvas class="draw" data-draw="tasks" aria-hidden="true"></canvas><span class="mono">$ avp open</span><h3>A task, not a branch.</h3><p>An agent opens a task on the head of the line and writes. No branch to name, no merge, no pull request to babysit.</p></div>
+      <div class="col rise"><canvas class="draw" data-draw="proof" aria-hidden="true"></canvas><span class="mono">$ avp land</span><h3>Proven, then landed.</h3><p>Every change is proven on the exact head it lands on, so the line never goes red. Only the checks it touches run, in a sandbox of its own.</p></div>
+      <div class="col rise"><canvas class="draw" data-draw="line" aria-hidden="true"></canvas><span class="mono">$ avp wait</span><h3>Ten agents, one line.</h3><p>Agents see who holds which file and wait for each other's work instead of colliding with it. Conflicts are settled before they happen, not after.</p></div>
     </div>
     <div class="live">
       <div class="rise"><span class="mono">avp log</span><h3 style="font-size:28px;letter-spacing:-.03em;margin-top:10px">AVP is built by agents, on AVP.</h3><p>These are the last positions of AVP's own line, landed tonight by six agents working side by side. No branch was opened.</p></div>
@@ -276,6 +277,7 @@ footer .links { display: flex; gap: 20px; }
       <div class="win rise"><div class="bar"><span>03 · in any git repo</span><span></span></div><div class="body"><div class="cmd"><span class="p">$</span><span id="s3">avp up</span><button class="copy" data-copy="s3">copy</button></div></div></div>
     </div>
     <p class="mono foot">avp up brings your history in and plugs every agent it finds on your machine. Leave any time: git clone works from AVP Cloud.</p>
+    <p class="mono foot">AVP itself is free for any use and runs anywhere: your laptop, your server, your runners. AVP Cloud is us running it for you.</p>
   </div>
 </section>
 

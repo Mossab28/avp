@@ -9,7 +9,7 @@ use avp::{engine, gitbridge, mcp, server, up, view};
 /// What `avp --version` says: a build without the cloud feature says so (tests/ci.sh needs one with it).
 const VERSION: &str = if cfg!(feature = "cloud") { env!("CARGO_PKG_VERSION") } else { concat!(env!("CARGO_PKG_VERSION"), " (without the cloud feature)") };
 
-/// Version control for agents: open, write, check, land.
+/// Version control for agents: open, land, wait.
 #[derive(Parser)]
 #[command(name = "avp", version = VERSION, about)]
 struct Cli {
@@ -1229,9 +1229,42 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// What `avp --help` shows, in this order: the loop an agent runs, then how a person starts, then
+/// what one reads. Every other command works the same, listed by `avp help --all`.
+const CORE: [&str; 17] = [
+    "open", "status", "claim", "land", "wait", "undo", "abandon",
+    "up", "clone", "login", "whoami", "password",
+    "log", "why", "proof", "show", "diff",
+];
+
+/// The command line, its help cut to the core unless `all`.
+fn cli_command(all: bool) -> clap::Command {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let total = cmd.get_subcommands().filter(|c| !c.is_hide_set()).count();
+    let names: Vec<String> = cmd.get_subcommands().map(|c| c.get_name().to_string()).collect();
+    for name in names {
+        let at = CORE.iter().position(|c| *c == name);
+        cmd = cmd.mut_subcommand(&name, |c| match at {
+            Some(i) => c.display_order(i),
+            None if all => c.display_order(CORE.len()),
+            None => c.hide(true),
+        });
+    }
+    if all {
+        cmd.after_help(format!("All {total} commands. The core alone: `avp --help`."))
+    } else {
+        cmd.after_help(format!("An agent opens a task, writes, lands it proven on the head, and waits for the others: open, land, wait.\nThe {} other commands (environments, secrets, imports, a server of your own...): `avp help --all`.", total - CORE.len()))
+    }
+}
+
 fn run() -> Result<()> {
     avp::legacy_env();
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "help" && args[2] == "--all" {
+        cli_command(true).print_help()?;
+        return Ok(());
+    }
+    let matches = cli_command(false).get_matches();
     // A server the command names (--server, AVP_SERVER), or none: then the one logged in to.
     let named = !matches!(matches.value_source("server"), None | Some(clap::parser::ValueSource::DefaultValue));
     let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
