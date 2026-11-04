@@ -345,6 +345,27 @@ fn free_view(client: &Client, base: &Path, repo: &str) -> Option<(PathBuf, view:
     })
 }
 
+/// Free views of `repo` under `base` other than `keep` and `mine` (the folders of this session:
+/// subagents share one `avp mcp`, so `hold` cannot tell them apart): removed, so landed tasks
+/// leave one free folder behind (the one the next task reuses, with its install), not one per
+/// task. A view whose task is open, or that a live session holds, stays.
+fn prune_free_views(client: &Client, base: &Path, repo: &str, keep: &Path, mine: &[PathBuf]) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for dir in entries.flatten().map(|e| e.path()) {
+        if dir == keep || mine.contains(&dir) {
+            continue;
+        }
+        let Some(v) = view::load(&dir).ok().filter(|v| v.repo == repo && v.server == client.base) else { continue };
+        let closed = match &v.task {
+            Some(t) => client.get::<TaskStatus>(&format!("/repos/{repo}/tasks/{t}")).is_ok_and(|st| st.task.state != TaskState::Open),
+            None => true,
+        };
+        if closed && hold(&dir) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 fn slug(goal: &str) -> String {
     let mut out = String::new();
     for c in goal.chars() {
@@ -422,6 +443,13 @@ impl Mcp {
     /// The folder's slot, made on first use.
     fn slot(&self, dir: &Path) -> Slot {
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).entry(dir.to_path_buf()).or_default().clone()
+    }
+
+    /// The folders this session (its agent and subagents) works in.
+    fn my_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.slots.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+        dirs.push(self.dir.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        dirs
     }
 
     /// The tasks open in this session's folders, each with its folder.
@@ -634,14 +662,16 @@ impl Mcp {
             let key = wanted.context("this folder is not an AVP view: pass `repo` (or set AVP_REPO)")?;
             let r: Repo = self.client.get(&format!("/repos/{key}"))?;
             // A folder another session left, with its install: the agent does not start from nothing.
-            match free_view(&self.client, &base, &r.id) {
+            let (dir, v) = match free_view(&self.client, &base, &r.id) {
                 Some(found) => found,
                 None => {
                     let name = slug(&r.name);
                     let dir = (1..).map(|n| base.join(format!("{name}-{n}"))).find(|d| !d.exists() && hold(d)).unwrap();
                     (dir, view::ViewState { server: self.client.base.clone(), repo: r.id, task: None, known: BTreeMap::new(), ..Default::default() })
                 }
-            }
+            };
+            prune_free_views(&self.client, &base, &v.repo, &dir, &self.my_dirs());
+            (dir, v)
         };
         let repo = s.repo.clone();
         let actor = self.actor();
@@ -910,6 +940,11 @@ impl Mcp {
                         if crate::checkout::is_checkout_view(&self.dir()) {
                             let (client, dir, repo, position) = (self.client.clone(), self.dir(), repo.clone(), l.position);
                             std::thread::spawn(move || crate::checkout::align_when_written(&client, &dir, &repo, position, std::time::Duration::from_secs(120)));
+                        }
+                        // This folder is now the free one; the others a landed task left go.
+                        let base = crate::up::views();
+                        if self.dir().starts_with(&base) {
+                            prune_free_views(&self.client, &base, &repo, &self.dir(), &self.my_dirs());
                         }
                         let under: String = l.stack.iter().map(|b| format!("task {} landed at position {}\n", b.task, b.position)).collect();
                         Ok(format!("{waited}sync: {synced}\n{under}landed at position {}{}{} (proof {}{}). The task is closed; open a new one for the next piece of work.", l.position, crate::wait::together(&l.with), if l.replayed { ", replayed on the moved line" } else { "" }, l.proof, if l.checks == Some(0) { format!(": {}", crate::model::NO_CHECKS) } else { String::new() }))

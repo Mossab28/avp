@@ -105,8 +105,18 @@ try:
     db2, _ = b.open("change b again")
     check("B's next task stays in its folder", db2 == db)
     check("and sees C's landing", os.path.exists(f"{db2}/src/c.txt"))
+    check("C's landed folder is not taken from C's live session", os.path.isdir(dc))
+    open(f"{db2}/src/b.txt", "w").write("b again\n")
+    out = b.tool("avp_land", {})
+    check("session B lands again", "landed at position" in out, out[:300])
     b.end()
     c.end()
+    # Two free folders now: the next session takes the last used and removes the other.
+    d = Session(W)
+    dd, _ = d.open("change d")
+    check("session D takes the last used free folder", dd == db, dd)
+    check("and the other free folder is gone", not os.path.exists(dc), dc)
+    d.end()
 finally:
     server.terminate()
 print(f"views PASS: {sum(results)}/{len(results)}")
