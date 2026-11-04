@@ -2109,6 +2109,11 @@ proven on this machine (the server proves it again when the land reaches it): {}
         Cmd::Undo { to, path, save: None } => {
             let mut state = view::load(&dir)?;
             let task = state.task.clone().context("no task open here")?;
+            // An edit the folder has not sent yet is a write too: sent first, so `undo` undoes it (as `land`
+            // sends before it lands). Offline, the undo below works on what the folder holds.
+            if let Err(e) = view::sync(&client, &dir, &mut state) {
+                anyhow::ensure!(unreachable(&e), e);
+            }
             let r: serde_json::Value = match offline::ask(down, Some(&task), || client.post(&format!("/repos/{}/tasks/{task}/undo", state.repo), &serde_json::json!({ "to": to, "path": path }))) {
                 Err(e) if unreachable(&e) => {
                     println!("{}", offline::undo(&client.base, &dir, &mut state, to, path)?);

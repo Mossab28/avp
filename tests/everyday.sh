@@ -34,6 +34,10 @@ $T -C v undo --to 1 >/dev/null
 ok "undo --to goes back to a save" '[ "$(cat v/src/a.txt)" = "$(printf "one\nTWO\nthree")" ] && [ -f v/src/c.txt ]'
 $T -C v undo --to THREE >/dev/null
 ok "and forward to a later one, by its message" '[ "$(cat v/src/a.txt)" = "$(printf "one\nTWO\nTHREE")" ] && [ ! -e v/src/c.txt ]'
+printf 'unsent\n' > v/src/a.txt
+$T -C v undo --path src/a.txt >/dev/null
+ok "undo takes an edit not sent yet" '[ "$(cat v/src/a.txt)" = "$(printf "one\ntwo\nthree")" ]'
+$T -C v undo --to THREE >/dev/null
 $T -C v land >/dev/null
 ok "save points never land as positions" '[ "$($T -C v log | wc -l | tr -d " ")" = 2 ]'
 ok "diff between two positions" '[[ "$($T -C v diff 0 1)" == *"+THREE"* && "$($T -C v diff 0 1)" != *c.txt* ]]'
