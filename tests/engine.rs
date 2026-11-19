@@ -585,6 +585,28 @@ fn a_monorepo_typechecks_its_packages() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
+/// A step with `parts` always runs as that many jobs side by side, each with its `{shard}`,
+/// whatever the task touched: a suite whose runner cuts itself, with no test file to count.
+#[test]
+fn a_step_with_parts_runs_as_that_many_jobs() {
+    let (e, _d) = engine();
+    let r = e.create_repo("parts", LeasePolicy::Advisory).unwrap().id;
+    let checks = "[check]\n[[check.steps]]\nname = \"build\"\nrun = \"true\"\n[[check.steps]]\nname = \"tests\"\nrun = \"echo ran {shard}\"\nparts = 4\n";
+    let entries: Vec<ImportEntry> = [("avp.toml", checks), ("README.md", "one\n")].iter().map(|(p, c)| ImportEntry { path: (*p).into(), blob: e.objects.put(c.as_bytes()).unwrap(), mode: 0o100644 }).collect();
+    e.import(&r, &entries, "imported").unwrap();
+    let t = open(&e, &r, "touch the readme", &[]);
+    put(&e, &t.id, "README.md", "two\n");
+    let p = e.check(&t.id).unwrap();
+    assert_eq!(p.verdict, Verdict::Green, "{:?}", p.steps);
+    assert_eq!(p.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["build", "tests"]);
+    for shard in ["1/4", "2/4", "3/4", "4/4"] {
+        assert!(p.steps[1].output.contains(&format!("ran {shard}")), "{}", p.steps[1].output);
+    }
+    // A command that never reads its share would run the same thing in every job: refused.
+    let same = "[check]\n[[check.steps]]\nname = \"tests\"\nrun = \"true\"\nparts = 4\n";
+    assert!(toml::from_str::<avp::check::AvpConfig>(same).unwrap().check.validate().is_err());
+}
+
 /// A step with `split` runs as several jobs side by side when the task reaches more related tests
 /// than one job's share, beside one job for the other steps. The first part to go red stops the
 /// others: the agent reads the failure without waiting for the rest.

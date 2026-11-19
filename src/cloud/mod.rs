@@ -128,6 +128,7 @@ pub(crate) fn start(engine: &Engine) {
         Err(e) => eprintln!("secrets not resealed: {e:#}"),
     }
     engine.run_schedules();
+    engine.resume_full_suites();
     // Deleted repos whose days are up go, now and every hour.
     let e = engine.clone();
     std::thread::spawn(move || loop {

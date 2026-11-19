@@ -82,6 +82,9 @@ h1 .soft { color: var(--mut); }
 .cmd .p { color: var(--mut); }
 .copy { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--mut); background: none; border: 1px solid var(--line2); padding: 2px 8px; cursor: pointer; border-radius: 4px; transition: color .2s; }
 .copy:hover { color: var(--fg); }
+.agent-prompt { margin-top: 16px; }
+.agent-prompt .bar .copy { color: var(--invfg); border-color: currentColor; padding: 0 8px; }
+.agent-prompt pre { margin: 0; font: inherit; line-height: 1.6; white-space: pre-wrap; color: var(--fg2); }
 
 /* sections, crop marks */
 section { position: relative; padding: clamp(80px, 11vw, 150px) 0; }
@@ -276,6 +279,12 @@ footer .links { display: flex; gap: 20px; }
       <div class="win rise"><div class="bar"><span>02 · sign in</span><span></span></div><div class="body"><div class="cmd"><span class="p">$</span><span id="s2">avp login</span><button class="copy" data-copy="s2">copy</button></div></div></div>
       <div class="win rise"><div class="bar"><span>03 · in any git repo</span><span></span></div><div class="body"><div class="cmd"><span class="p">$</span><span id="s3">avp up</span><button class="copy" data-copy="s3">copy</button></div></div></div>
     </div>
+    <div class="win agent-prompt rise"><div class="bar"><span>or paste this to your agent</span><button class="copy" data-copy="s4">copy</button></div><div class="body"><pre id="s4">Try AVP on this repository without changing anything others depend on.
+1. Install it: curl -fsSL cloud.murmell.com/install | sh
+2. Run `avp up` here. Leave `main` and the CI as they are: AVP mirrors to the branch avp/line only.
+3. Read the avp.toml it landed. A proof should be the typecheck and the tests related to a change, in seconds to a minute. Fix any check that is wrong or too slow, in a task.
+4. Do one small real change from this repo through avp_open and avp_land, then tell me what the proof ran, how long it took, and what our CI would have run for the same change.
+If anything goes wrong, `avp down` stops it. Docs: https://github.com/Mossab28/avp</pre></div></div>
     <p class="mono foot">avp up brings your history in and plugs every agent it finds on your machine. Leave any time: git clone works from AVP Cloud.</p>
     <p class="mono foot">AVP itself is free for any use and runs anywhere: your laptop, your server, your runners. AVP Cloud is us running it for you.</p>
   </div>

@@ -107,6 +107,12 @@ pub struct Stats {
     pub full_suites: usize,
     pub full_red: usize,
     pub flaky: usize,
+    /// Shards of full suites not run again because their inputs were those of a green run
+    /// (`inputs`), the machine minutes those runs took, and the reds found where a green stood
+    /// (`line.reuse_missed`: an input is missing).
+    pub shards_reused: usize,
+    pub reuse_saved_minutes: f64,
+    pub reuse_missed: usize,
     /// The full suites red in the window as long just before this one: when what the proofs miss
     /// grows, the test files `[check] auto_skip` leaves out are the first suspects.
     pub full_red_before: Option<usize>,
@@ -274,6 +280,9 @@ pub fn text(s: &Stats) -> String {
         rows.push(("  end to end".into(), format!("{}; waiting {}, preparing {} (median), dependencies installed {}", median_p90(&s.proof_total), duration(s.proof_wait.median_s), duration(s.proof_prep.median_s), count(s.setup_misses, "time"))));
     }
     rows.push(("Full suite".into(), format!("{} (median) after landing; {}, {} red, {}", duration(s.landed_to_full.median_s), count(s.full_suites, "run"), s.full_red, count(s.flaky, "flaky rerun"))));
+    if s.shards_reused > 0 || s.reuse_missed > 0 {
+        rows.push(("  shards reused".into(), format!("{}, about {} min of machine not spent; {} where a red was found behind a reused green", s.shards_reused, thousands(s.reuse_saved_minutes), s.reuse_missed)));
+    }
     let m = &s.machine_minutes;
     rows.push(("CI machine time".into(), format!("{} min: {} in proofs, {} in full suites", thousands(m.total), thousands(m.proofs), thousands(m.full_suites))));
     if let (Some(all), Some(one)) = (s.cost_usd, s.cost_per_landing_usd) {

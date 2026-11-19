@@ -89,6 +89,12 @@ share: AVP counts them through the imports, runs that many shares side by side w
 `i/n`, beside one job for the other steps, and stops every part as soon as one is red. The test
 runner still decides which tests are related, so the proof runs the same tests, sooner.
 
+A step with `parts` always runs as that many jobs, whatever the task touched: `parts = 8` with
+`run = "cargo nextest run --partition count:{shard}"` (or Playwright's and jest's
+`--shard={shard}`, or a script of yours that reads `i/n`) runs eight shares of the suite side by
+side, each on a worker when there are workers, and the proof takes the longest share's time, not
+their sum. It is for a suite no import graph cuts: Rust, Go, a browser suite.
+
 Slow test files that never fail leave the proofs by themselves: a test file green in each of its
 last `after` runs (proofs and full suites alike, 100 by default) whose median run takes
 `min_seconds` or more (5) is left out of the proofs, and the step gets it in `{skip_files}`, the
@@ -126,6 +132,58 @@ the shard `web` makes `web (node 20)` and `web (node 22)`, whose command reads t
 `$MATRIX_NODE` (a key `node-version`, as `$MATRIX_NODE_VERSION`). With several keys, every
 combination runs. A value is a string, a number or a boolean.
 
+A shard that says what it reads does not run again on what it already ran green on:
+
+```toml
+[[check.full_shards]]
+name = "web"
+run = "pnpm --filter web test"
+inputs = ["apps/web/", "packages/protocol/", "scripts/", "!**/*.md"]
+
+[[check.full_shards]]
+name = "lint"
+run = "sh scripts/lint.sh {changed}"
+inputs = ["**", "!docs/"]
+```
+
+`inputs` are written as guarded paths are (`dir/`, `*`, `**`, `?`), a `!` in front taking paths back
+out, the last pattern that matches a path deciding. A position whose inputs are those of a position
+where the shard ran green takes that run's verdict: the shard's output says `reused`, from which
+position, and the suite waits for the other shards only. AVP adds what a shard reads without saying
+so: its command, its matrix values, its services and secrets (their names), the setup and the files
+that key it (`setup_keys`, every `package.json`), the image. A change to any of them and it runs.
+
+`{changed}` in a shard's command is its inputs that changed since its last green run, for a tool
+that judges each file alone (a linter, a scanner, a formatter): the run sets `AVP_CHANGED_SINCE` to
+that run's position, and `{changed}` may then be empty (files only left). Without that variable the
+shard runs whole and `{changed}` is empty: no green run yet, more than 500 files changed, its hours
+are up. A script reads the variable, not the list, to know which.
+
+A tool that judges each file alone still has files that say how it judges: its rules, its ignore
+file, the script that runs it. Name them in `whole_when` (written as `inputs`): one of them changed,
+added or gone, and the shard runs whole. Without it a new rule would only ever judge the files that
+change after it: `whole_when = [".eslintrc*", ".semgrepignore", "scripts/lint.sh"]`.
+
+What keeps it honest:
+
+- A green run stands for `reuse_hours` (24 unless said, 168 at most), counted from the last time
+  the shard ran on all its inputs. What no input says (a tool the machine updated, a service
+  outside, a test that reads the date) is wrong for a day at most.
+- Only a green at the first run stands. A flaky shard runs again on the next position, a red one too.
+- `avp full` and the scheduled suites run every shard, whole. A red there where a green stood says
+  so: `line.reuse_missed` names the shard, the position its green came from, and the files that
+  changed since outside its inputs. One of them is an input it did not say.
+- `reuse = "audit"` on a shard runs it on every position as before and only tells what `"on"` would
+  have reused (`reusable` in the verdict's event) and missed (`line.reuse_missed`): how to find a
+  shard's inputs on a real line before trusting them. `reuse = "off"`: as without inputs.
+- A pattern that matches no file is a typo: the shard runs on every position and its output says
+  which pattern. A shard with `artifacts` always runs.
+- The proofs of tasks never reuse anything: what gates a landing runs.
+- When a shard goes red twice, the bisection starts from the last position it ran green on, not
+  from one that reused that green.
+
+`avp stats` counts the shards reused, the machine minutes they would have taken, and the misses.
+
 A full suite, or one of its `full_shards`, that goes red runs once more on the same tree: a browser
 that did not start or a test that fails under load is not the position's fault. Green the second
 time, the position's full suite is flaky: it counts as green for `avp promote` and `follow`, never
@@ -133,6 +191,14 @@ as red. `avp log` says `Flaky`, the event `line.flaky` names the shard and the f
 the red run (the lines with FAIL, `×` or `✗`), and AVP Live marks the position apart and lists the
 flaky tests of the last 7 days. Red twice is red. A task's proof never runs again: it gates a
 landing, and a red there is the agent's to read.
+
+A shard with a `retry` runs again only the test files its red names, not the whole shard:
+`retry = "pnpm vitest run {files}"`, `{files}` being those files. A flaky test then costs its own
+seconds instead of the shard's minutes. A red that names no test file (a crash, a browser that did
+not start) runs the whole shard again, as without `retry`.
+
+A suite run again by hand (`avp full`) on an older position gives its turn to a newer position
+whose suite is waiting: the newer one holds it, and the event `line.full_covered` says so.
 
 A full suite red twice after a landing does not leave the line red: with agents landing every few
 minutes, the next ones would build on it. AVP finds the position that broke it. The batch is what
@@ -1162,6 +1228,10 @@ avp land
 avp import-git my-project --history 200                          # from a Git checkout
 avp mirror --repo my-project --branch avp/line --remote origin   # back to Git
 ```
+
+`avp mirror --branch main --deliver pull_request` reaches `main` by a pull request instead of a
+push: the commits go to `avp/main`, and one pull request to `main`, already green (the status
+`avp/proof`), carries them; see [MIGRATE.md](MIGRATE.md#3-main-becomes-the-mirror).
 
 `avp mcp` keeps a journal of what agents do with it (`~/.local/state/avp/mcp.jsonl`): which
 client, which tool, how long, what came back. It is how we know agents reach for AVP by themselves.

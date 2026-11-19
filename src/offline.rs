@@ -782,7 +782,7 @@ pub fn add_paths(server: &str, dir: &Path, state: &mut ViewState, paths: &[Strin
     let mut ops = Vec::new();
     for p in paths {
         let full = dir.join(p);
-        let meta = fs::metadata(&full).with_context(|| format!("{p} is not a file here"))?;
+        let meta = fs::symlink_metadata(&full).with_context(|| format!("{p} is not a file here"))?;
         let (blob, mode) = (r.objects.put(&view::read_project(&full)?)?, view::mode_of(&meta));
         let was = state.known.get(p).map(|w| w.0.clone());
         ops.push(Op::Write { path: p.clone(), kind: WriteKind::Put, blob: Some(blob.clone()), mode, was });

@@ -11,14 +11,14 @@ Before you open one:
 
 ## Contributor license agreement
 
-AVP is published under the Elastic License 2.0 by IntrudR, which may also offer it under other
+AVP is published under the Elastic License 2.0 by Murmell Inc., a Delaware corporation, which may also offer it under other
 terms (a commercial license, AVP Cloud). To keep that possible, every contribution
 comes with this agreement. Opening a pull request means you accept it; say so once in the pull
 request ("I accept the CLA in CONTRIBUTING.md").
 
 1. You wrote the contribution, or you have the right to submit it, and your employer, if it has
    rights to it, agrees.
-2. You keep the copyright of your contribution. You grant IntrudR, and those who receive AVP
+2. You keep the copyright of your contribution. You grant Murmell Inc., and those who receive AVP
    from it, a perpetual, worldwide, non-exclusive, royalty-free, irrevocable license to use,
    copy, modify, publish, sublicense and distribute it, under the Elastic License 2.0 or any other license,
    including a commercial one.

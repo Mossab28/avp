@@ -313,7 +313,7 @@ impl CheckConfig {
     /// `full` alone. Empty: there is no suite.
     pub fn shards(&self) -> Vec<Shard> {
         if self.full_shards.is_empty() {
-            return self.full.iter().map(|run| Shard { name: "full".into(), run: run.clone(), env: vec![], services: None, secrets: vec![], artifacts: vec![] }).collect();
+            return self.full.iter().map(|run| Shard { name: "full".into(), run: run.clone(), env: vec![], services: None, secrets: vec![], artifacts: vec![], retry: None, inputs: vec![], reuse: Reuse::Off, reuse_hours: REUSE_HOURS, whole_when: vec![] }).collect();
         }
         let mut out = Vec::new();
         for s in &self.full_shards {
@@ -325,7 +325,7 @@ impl CheckConfig {
             for combo in combos {
                 let name = if combo.is_empty() { s.name.clone() } else { format!("{} ({})", s.name, combo.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")) };
                 let env = combo.iter().map(|(k, v)| (matrix_var(k), v.to_string())).collect();
-                out.push(Shard { name, run: s.run.clone(), env, services: s.services.clone(), secrets: s.secrets.clone(), artifacts: s.artifacts.clone() });
+                out.push(Shard { name, run: s.run.clone(), env, services: s.services.clone(), secrets: s.secrets.clone(), artifacts: s.artifacts.clone(), retry: s.retry.clone(), inputs: s.inputs.clone(), reuse: s.reuse.unwrap_or_default(), reuse_hours: s.reuse_hours.unwrap_or(REUSE_HOURS), whole_when: s.whole_when.clone() });
             }
         }
         out
@@ -343,9 +343,29 @@ impl CheckConfig {
                 anyhow::ensure!(seen.contains(needed.as_str()), "the shard {:?} needs the service {needed:?}, and no [[check.services]] is named so", s.name);
             }
         }
+        for s in &self.full_shards {
+            let name = &s.name;
+            if s.inputs.is_empty() {
+                anyhow::ensure!(s.reuse.is_none() && s.reuse_hours.is_none(), "the shard {name:?} has `reuse` and no `inputs`: a run stands for another position only by the files it says it reads");
+                anyhow::ensure!(!s.run.contains("{changed}"), "the shard {name:?} reads `{{changed}}` and has no `inputs`: changed among which files");
+                anyhow::ensure!(s.whole_when.is_empty(), "the shard {name:?} has `whole_when` and no `inputs`: it always runs whole");
+                continue;
+            }
+            anyhow::ensure!(s.whole_when.is_empty() || s.run.contains("{changed}"), "the shard {name:?} has `whole_when` and its command never reads `{{changed}}`: it always runs whole");
+            anyhow::ensure!(s.inputs.iter().all(|p| !p.trim_start_matches('!').trim().is_empty()), "the shard {name:?}: an input is a path or a pattern, `!` in front to take paths out");
+            anyhow::ensure!(s.inputs.iter().any(|p| !p.starts_with('!')), "the shard {name:?}: its inputs only take paths out (`!`), none says what it reads (`**`: everything)");
+            anyhow::ensure!(s.reuse_hours.is_none_or(|h| (1..=168).contains(&h)), "the shard {name:?}: reuse_hours is 1 to 168 (a week)");
+            anyhow::ensure!(s.artifacts.is_empty() || s.reuse == Some(Reuse::Off), "the shard {name:?} has `inputs` and `artifacts`: a run that is not made again leaves no artifact (reuse = \"off\" keeps `{{changed}}` out too)");
+        }
         let mut names = BTreeSet::new();
         for s in self.shards() {
             anyhow::ensure!(names.insert(s.name.clone()), "two shards of the whole suite are named {:?}", s.name);
+        }
+        for s in &self.steps {
+            let Some(n) = s.parts else { continue };
+            anyhow::ensure!(s.split.is_none(), "the step {:?} has `parts` and `split`: one says how many jobs, the other lets AVP count", s.name);
+            anyhow::ensure!((2..=64).contains(&n), "the step {:?}: parts = {n} is not between 2 and 64", s.name);
+            anyhow::ensure!(s.run.contains("{shard}"), "the step {:?} has `parts` and its command never reads `{{shard}}`: every job would run the same thing", s.name);
         }
         for (name, paths) in self.steps.iter().map(|s| (&s.name, &s.artifacts)).chain(self.full_shards.iter().map(|s| (&s.name, &s.artifacts))) {
             for p in paths {
@@ -379,7 +399,50 @@ pub struct FullShard {
     /// What it makes that is kept with its proof, as a step's `artifacts`.
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// Runs again only the test files a red run names, `{files}` being them:
+    /// `retry = "pnpm vitest run {files}"`. Without it, or when the red names no test file (the
+    /// machine: a browser that did not start, a download cut), the whole shard runs again.
+    #[serde(default)]
+    pub retry: Option<String>,
+    /// The files it reads, as guarded paths are written (`apps/web/`, `**/*.sql`), a `!` in front
+    /// taking paths back out, the last pattern that matches a path deciding: `["**", "!docs/"]` is
+    /// everything but the docs. With them, a suite does not run the shard again on a position
+    /// whose inputs are those of one where it ran green (`reuse`), and `{changed}` in its command
+    /// is the inputs that changed since. None: it reads anything, and always runs.
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// `"on"` (unless said): a green run stands for every position with the same inputs. `"audit"`:
+    /// it runs anyway, and a red where a green would have stood is told (`line.reuse_missed`), with
+    /// the files that changed outside its inputs. `"off"`: as without inputs.
+    #[serde(default)]
+    pub reuse: Option<Reuse>,
+    /// How long a green run stands, in hours (24 unless said, a week at most): past it the shard
+    /// runs whole again, whatever its inputs. What no input says (a tool the machine updated, a
+    /// service outside, the date) is then wrong for a day at most.
+    #[serde(default)]
+    pub reuse_hours: Option<u64>,
+    /// The inputs that say how the shard judges the others (the rules of a linter, its ignore
+    /// file, the script that runs it), as `inputs` are written: one of them changed, added or
+    /// gone, and the shard runs whole instead of on `{changed}`. Without them a new rule would
+    /// only ever judge the files that change after it.
+    #[serde(default)]
+    pub whole_when: Vec<String>,
 }
+
+/// A shard's `reuse`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reuse {
+    #[default]
+    On,
+    Audit,
+    Off,
+}
+
+/// A green run stands this long unless the shard's `reuse_hours` says otherwise.
+pub const REUSE_HOURS: u64 = 24;
+/// More inputs changed than this: the shard runs whole, `{changed}` would not fit a command.
+pub const CHANGED_MAX: usize = 500;
 
 fn matrix<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BTreeMap<String, Vec<String>>, D::Error> {
     let raw = BTreeMap::<String, Vec<toml::Value>>::deserialize(d)?;
@@ -413,6 +476,87 @@ pub struct Shard {
     pub services: Option<Vec<String>>,
     pub secrets: Vec<String>,
     pub artifacts: Vec<String>,
+    /// `retry` of its `[[check.full_shards]]`.
+    pub retry: Option<String>,
+    /// `inputs`, `reuse` and `reuse_hours` of its `[[check.full_shards]]`.
+    pub inputs: Vec<String>,
+    pub reuse: Reuse,
+    pub reuse_hours: u64,
+    pub whole_when: Vec<String>,
+}
+
+impl Shard {
+    /// The command of a whole run: `{changed}` names nothing.
+    pub fn whole(&self) -> String {
+        self.run.replace("{changed}", "")
+    }
+
+    /// Whether a green run of it may stand for another position: it says what it reads, and makes
+    /// nothing to keep (a reused shard would have no artifact).
+    pub fn reusable(&self) -> bool {
+        !self.inputs.is_empty() && self.reuse != Reuse::Off && self.artifacts.is_empty()
+    }
+}
+
+/// A shard's inputs in a tree: the entries the last matching pattern keeps. Err names a pattern
+/// that matches no file (a typo would otherwise make inputs that never change).
+pub fn shard_inputs<'a>(tree: &'a Tree, patterns: &[String]) -> std::result::Result<Vec<(&'a String, &'a Entry)>, String> {
+    let read: Vec<(bool, PathPattern)> = patterns.iter().map(|p| (p.starts_with('!'), PathPattern::new(p.trim_start_matches('!')))).collect();
+    let mut hit = vec![false; read.len()];
+    let mut out = Vec::new();
+    for (path, entry) in tree {
+        let mut keep = false;
+        for (i, (not, pattern)) in read.iter().enumerate() {
+            if pattern.matches(path) {
+                hit[i] = true;
+                keep = !not;
+            }
+        }
+        if keep {
+            out.push((path, entry));
+        }
+    }
+    match hit.iter().position(|h| !h) {
+        Some(i) => Err(patterns[i].clone()),
+        None => Ok(out),
+    }
+}
+
+/// What a shard's verdict hangs on, as two prints: what it is (its command, its matrix values, its
+/// services and secrets, the setup and the files that key it, the image) and what it reads (its
+/// inputs in the tree). Both the same as a green run's: the verdict is that run's. The first alone:
+/// the same shard on other files, and `{changed}` names them.
+pub fn shard_prints(cfg: &CheckConfig, shard: &Shard, tree: &Tree) -> std::result::Result<(String, String), String> {
+    let inputs = shard_inputs(tree, &shard.inputs)?;
+    let mut what = blake3::Hasher::new();
+    let services: Vec<&Service> = cfg.services.iter().filter(|s| shard.services.as_ref().is_none_or(|named| named.contains(&s.name))).collect();
+    let secrets: BTreeSet<&String> = cfg.secrets.iter().chain(&shard.secrets).collect();
+    what.update(format!("1\0{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}", shard.run, shard.env, services, secrets, cfg.setup, cfg.setup_links, cfg.image, shard.inputs, shard.retry, shard.whole_when).as_bytes());
+    // What keys the setup (see `setup`): another lockfile is another install under the same files.
+    for (path, e) in tree {
+        if cfg.setup_keys.contains(path) || path.ends_with("package.json") || path.ends_with("pnpm-workspace.yaml") || path.ends_with(".npmrc") {
+            what.update(format!("\0{path}\0{}\0{}", e.blob, e.mode).as_bytes());
+        }
+    }
+    let mut reads = blake3::Hasher::new();
+    for (path, e) in inputs {
+        reads.update(format!("{path}\0{}\0{}\0", e.blob, e.mode).as_bytes());
+    }
+    Ok((what.finalize().to_hex().to_string(), reads.finalize().to_hex().to_string()))
+}
+
+/// The inputs of `shard` in `tree` that `before` does not hold as they are, for `{changed}`. None:
+/// too many of them, one a shell would not read as one word, or one of `whole_when` among what
+/// changed or left, and the shard runs whole.
+pub fn shard_changed(shard: &Shard, tree: &Tree, before: &Tree) -> Option<Vec<String>> {
+    let changed: Vec<String> = shard_inputs(tree, &shard.inputs).ok()?.into_iter().filter(|(p, e)| before.get(*p) != Some(*e)).map(|(p, _)| p.clone()).collect();
+    let whole: Vec<PathPattern> = shard.whole_when.iter().map(|p| PathPattern::new(p)).collect();
+    let gone = before.keys().filter(|p| !tree.contains_key(*p));
+    if changed.iter().chain(gone).any(|p| whole.iter().any(|w| w.matches(p))) {
+        return None;
+    }
+    let plain = |p: &String| p.chars().all(|c| c.is_alphanumeric() || "/._-+@=,[]()".contains(c));
+    (changed.len() <= CHANGED_MAX && changed.iter().all(plain)).then_some(changed)
 }
 
 /// `[[check.services]]`: a database, a cache, anything the tests reach on a port. Each proof gets its
@@ -564,6 +708,11 @@ pub struct ConfiguredStep {
     /// still decides which tests are related, so a proof runs the same tests, sooner.
     #[serde(default)]
     pub split: Option<usize>,
+    /// Always this many jobs side by side, each with `{shard}` as `i/n`, whatever the task touched:
+    /// for a suite whose runner cuts itself (nextest's `--partition count:{shard}`, Playwright's and
+    /// jest's `--shard={shard}`) or a script that reads its share. Each job takes a worker.
+    #[serde(default)]
+    pub parts: Option<usize>,
     /// Runs as its own job, beside the job of the other steps instead of after them: a long
     /// typecheck stops waiting for a scan. It costs a machine more for the proof's length.
     #[serde(default)]
@@ -674,6 +823,11 @@ pub struct Part {
     /// before ignores it, and runs them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip_files: Vec<String>,
+    /// Test files a red full suite named lately, in the packages the task touches: run as if the
+    /// task touched them, for a test the related ones never reach (one that reads every file of
+    /// its package) goes red in the proof, before the landing. A worker from before ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_files: Vec<String>,
 }
 
 impl Part {
@@ -891,7 +1045,7 @@ struct Laid {
 }
 
 fn stamp(path: &Path) -> Option<Stamp> {
-    fs::symlink_metadata(path).ok().filter(|m| m.is_file()).map(|m| crate::view::stamp_of(&m))
+    fs::symlink_metadata(path).ok().filter(crate::view::carried).map(|m| crate::view::stamp_of(&m))
 }
 
 /// Lays `tree` out in `dir` as a fresh checkout would hold it, reusing what is already there: a
@@ -901,6 +1055,9 @@ fn stamp(path: &Path) -> Option<Stamp> {
 pub fn materialize(objects: &Objects, tree: &Tree, dir: &Path, keep: &[String]) -> Result<()> {
     if let Some(bad) = tree.keys().find(|p| !safe_path(p)) {
         anyhow::bail!("a path outside the candidate: {bad:?}");
+    }
+    if let Some(bad) = crate::view::through_link(tree) {
+        anyhow::bail!("a path that goes through a symbolic link: {bad:?}");
     }
     fs::create_dir_all(dir)?;
     let marker = dir.join(".avp-laid");
@@ -2336,6 +2493,23 @@ pub fn tests_naming(objects: &Objects, tree: &Tree, files: &[String]) -> Vec<Str
         .collect()
 }
 
+/// A test file by its name or its folder: a source file a stack trace names is not one to run.
+pub fn is_test_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let dirs = &path[..path.len() - name.len()];
+    [".test.", ".spec.", "_test.", "_spec.", ".e2e."].iter().any(|m| name.contains(m))
+        || name.starts_with("test_")
+        || dirs.split('/').any(|d| matches!(d, "test" | "tests" | "__tests__" | "e2e"))
+}
+
+/// Whether `path` sits in the package of one of `files`: the same first two folders
+/// (`apps/daemon/...`), or the same first one for a path that has only one.
+pub fn same_package(path: &str, files: &[String]) -> bool {
+    let root = |p: &str| p.split('/').take(if p.matches('/').count() >= 2 { 2 } else { 1 }).collect::<Vec<_>>().join("/");
+    let mine = root(path);
+    files.iter().any(|f| root(f) == mine)
+}
+
 pub fn is_code(path: &str) -> bool {
     Regex::new(r"\.(tsx?|jsx?|mjs|cjs|mts|cts|vue|svelte|py|rs|go)$").unwrap().is_match(path)
 }
@@ -2358,10 +2532,25 @@ pub fn failed_files(output: &str, known: &Tree) -> Vec<String> {
             let p = c[1].trim_start_matches("./").to_string();
             if known.contains_key(&p) {
                 out.insert(p);
+            } else if let Some(full) = by_suffix(&p, known) {
+                out.insert(full);
             }
         }
     }
     out.into_iter().collect()
+}
+
+/// The one file of the tree whose path ends with `named`: a runner started in a package's folder
+/// (`pnpm --filter daemon exec vitest`) names `test/a.test.ts` for `apps/daemon/test/a.test.ts`. A
+/// bare file name, or one that two files end with, is no one's.
+fn by_suffix(named: &str, known: &Tree) -> Option<String> {
+    if !named.contains('/') {
+        return None;
+    }
+    let tail = format!("/{named}");
+    let mut found = known.keys().filter(|k| k.ends_with(&tail));
+    let first = found.next()?;
+    found.next().is_none().then(|| first.clone())
 }
 
 /// The lines of a red output that name a failing test (a runner's FAIL, vitest's `×`, `✗`), each
@@ -2499,7 +2688,7 @@ enum Given {
 /// (its part names its secrets), one part of a task's proof, or every step.
 fn steps_of(cfg: &CheckConfig, steps_override: Option<&str>, part: Option<&Part>) -> Vec<ConfiguredStep> {
     let mut steps: Vec<ConfiguredStep> = match (steps_override, part) {
-        (Some(cmd), p) => vec![ConfiguredStep { name: "full".into(), run: cmd.to_string(), needs_files: false, split: None, own_job: false, secrets: p.map(|p| p.secrets.clone()).unwrap_or_default(), artifacts: p.map(|p| p.artifacts.clone()).unwrap_or_default() }],
+        (Some(cmd), p) => vec![ConfiguredStep { name: "full".into(), run: cmd.to_string(), needs_files: false, split: None, parts: None, own_job: false, secrets: p.map(|p| p.secrets.clone()).unwrap_or_default(), artifacts: p.map(|p| p.artifacts.clone()).unwrap_or_default() }],
         (None, Some(Part { step: Some(only), .. })) => cfg.steps.iter().filter(|s| &s.name == only).cloned().collect(),
         (None, Some(p)) => cfg.steps.iter().filter(|s| !p.skip.contains(&s.name)).cloned().collect(),
         (None, None) => cfg.steps.clone(),
@@ -2830,7 +3019,16 @@ impl Workspace {
         }
         // Every file the task leaves in the tree, code or not: a security scan must see the
         // Dockerfiles, workflows and charts a typecheck has no use for.
-        let all: Vec<&str> = files.iter().map(String::as_str).filter(|f| tree.contains_key(*f)).collect();
+        let mut all: Vec<&str> = files.iter().map(String::as_str).filter(|f| tree.contains_key(*f)).collect();
+        // The tests a red full suite named lately, in the task's packages: as if touched.
+        for t in part.iter().flat_map(|p| &p.also_files).map(String::as_str).filter(|t| tree.contains_key(*t)) {
+            if !code.contains(&t) {
+                code.push(t);
+            }
+            if !all.contains(&t) {
+                all.push(t);
+            }
+        }
         // A test file the task writes runs, however long it never failed: the change may be what breaks it.
         let skipped: Vec<&str> = part.iter().flat_map(|p| &p.skip_files).map(String::as_str).filter(|f| tree.contains_key(*f) && !code.contains(f) && !all.contains(f)).collect();
         let mut out = Vec::new();
@@ -3166,7 +3364,7 @@ mod tests {
         assert_eq!(shards[1].env, env(&[("MATRIX_NODE", "22"), ("MATRIX_OS_NAME", "linux")]));
         assert_eq!((shards[1].services.clone(), shards[2].services.clone(), shards[2].env.clone()), (Some(vec!["db".to_string()]), Some(vec![]), vec![]));
         let full: AvpConfig = toml::from_str("[check]\nfull = \"make test\"\n").unwrap();
-        assert_eq!(full.check.shards(), [Shard { name: "full".into(), run: "make test".into(), env: vec![], services: None, secrets: vec![], artifacts: vec![] }]);
+        assert_eq!(full.check.shards(), [Shard { name: "full".into(), run: "make test".into(), env: vec![], services: None, secrets: vec![], artifacts: vec![], retry: None, inputs: vec![], reuse: Reuse::Off, reuse_hours: REUSE_HOURS, whole_when: vec![] }]);
         // What a field alone cannot say.
         let invalid = |toml: &str| toml::from_str::<AvpConfig>(toml).map_err(|e| e.to_string()).and_then(|c| c.check.validate().map_err(|e| e.to_string())).unwrap_err();
         assert!(invalid("[[check.full_shards]]\nname = \"web\"\nrun = \"t\"\nmatrix = { node = [] }").contains("matrix.node has no value"));
@@ -3222,6 +3420,22 @@ mod tests {
         let known: Tree = ["test/a.test.ts", "test/b.test.ts", "src/b.ts"].iter().map(|p| (p.to_string(), Entry { blob: String::new(), mode: 0o100644 })).collect();
         let out = "\x1b[32m✓\x1b[39m test/a.test.ts \x1b[2m(3 tests)\x1b[22m\n \x1b[31m❯\x1b[39m test/b.test.ts \x1b[2m(2 tests | \x1b[22m\x1b[31m1 failed\x1b[39m\x1b[2m)\x1b[22m\n \x1b[31mFAIL\x1b[39m test/b.test.ts > b > sums\n \x1b[36m❯\x1b[39m src/b.ts:4:10\n";
         assert_eq!(failed_files(out, &known), vec!["src/b.ts".to_string(), "test/b.test.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_test_joins_the_proofs_of_its_package_only() {
+        let touched = ["apps/daemon/src/disk.ts".to_string()];
+        assert!(same_package("apps/daemon/test/childenv.test.ts", &touched));
+        assert!(!same_package("apps/web/src/a.test.ts", &touched));
+        assert!(is_test_file("apps/daemon/test/childenv.test.ts") && !is_test_file("apps/daemon/src/env.ts"));
+    }
+
+    /// vitest started in a package's folder names its files from there.
+    #[test]
+    fn failed_files_found_from_a_package_folder() {
+        let known: Tree = ["apps/daemon/test/env.test.ts", "apps/web/src/a.ts", "apps/daemon/src/a.ts"].iter().map(|p| (p.to_string(), Entry { blob: String::new(), mode: 0o100644 })).collect();
+        let out = " FAIL  test/env.test.ts > every MURMELL_* variable\n ❯ src/a.ts:3:1\n";
+        assert_eq!(failed_files(out, &known), vec!["apps/daemon/test/env.test.ts".to_string()]);
     }
 
     /// What vitest, cargo and a `✗` runner print for a failing test, colored or not, once each and

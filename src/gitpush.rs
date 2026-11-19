@@ -430,7 +430,7 @@ fn writes_of(e: &Engine, repo: &str, scratch: &Path, base: i64, base_sha: &str, 
     let tree = e.tree_at(repo, base)?;
     let out = git(scratch, &["diff-tree", "-r", "-z", "--no-renames", base_sha, sha])?;
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
-    let regular = |mode: &str| mode == "100644" || mode == "100755";
+    let regular = |mode: &str| mode == "100644" || mode == "100755" || mode == "120000";
     let mut changes = vec![];
     while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
         let m: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();

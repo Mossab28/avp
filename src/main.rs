@@ -205,6 +205,11 @@ enum Cmd {
         /// Keep mirroring, every this many seconds (one line printed per change).
         #[arg(long)]
         follow: Option<u64>,
+        /// How the commits reach the branch: `push` writes the branch itself; `pull_request`
+        /// writes `avp/<branch>` and keeps one pull request to the branch open on GitHub
+        /// (GH_TOKEN), green from the start since every position was proven before it landed.
+        #[arg(long, value_enum, default_value = "push")]
+        deliver: gitbridge::Deliver,
     },
     /// Create a repo on the server from this directory (position 0 of its line).
     Init {
@@ -877,8 +882,8 @@ fn versioned_files(dir: &Path) -> Result<std::collections::BTreeMap<String, (Str
                         continue;
                     }
                     let full = dir.join(&rel);
-                    let Ok(meta) = std::fs::metadata(&full) else { continue };
-                    if !meta.is_file() {
+                    let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+                    if !view::carried(&meta) {
                         continue;
                     }
                     let bytes = view::read_project(&full)?;
@@ -1512,16 +1517,25 @@ fn run() -> Result<()> {
         Cmd::Worker { data } => {
             avp::worker::work(&client, &data)?;
         }
-        Cmd::Mirror { repo, branch, remote, committer, follow } => {
+        Cmd::Mirror { repo, branch, remote, committer, follow, deliver } => {
             let mut last = String::new();
             loop {
-                let line = match gitbridge::mirror(&client, &dir, &repo, &branch, remote.as_deref(), &committer) {
+                let line = match gitbridge::mirror(&client, &dir, &repo, &branch, remote.as_deref(), &committer, deliver) {
                     Ok(x) => format!(
-                        "{} new commit(s); position {} is {}, identical to the line{}{}",
+                        "{} new commit(s); position {} is {}, identical to the line{}{}{}",
                         x.written,
                         x.head,
                         &x.sha[..12.min(x.sha.len())],
-                        if x.pushed { format!(", pushed to {} {branch}", remote.clone().unwrap_or_default()) } else { String::new() },
+                        match (x.pushed, deliver) {
+                            (false, _) => String::new(),
+                            (true, gitbridge::Deliver::Push) => format!(", pushed to {} {branch}", remote.clone().unwrap_or_default()),
+                            (true, gitbridge::Deliver::PullRequest) => format!(", pushed to {} {}", remote.clone().unwrap_or_default(), gitbridge::delivery_branch(&branch)),
+                        },
+                        match &x.pull_request {
+                            Some(pr) => format!(", delivered to {branch} by pull request {pr}"),
+                            None if deliver == gitbridge::Deliver::PullRequest => format!("; {branch} has every position"),
+                            None => String::new(),
+                        },
                         x.tags.iter().map(|t| format!("; {t}")).collect::<String>()
                     ),
                     Err(e) if follow.is_some() => format!("mirror failed: {e:#}"),
@@ -1689,7 +1703,7 @@ nothing new to queue ({n} waiting)", offline::notice_of(&client.base, &state.rep
             let mut sent = Vec::new();
             for p in paths.clone() {
                 let full = dir.join(&p);
-                let meta = std::fs::metadata(&full).with_context(|| format!("{p} is not a file here"))?;
+                let meta = std::fs::symlink_metadata(&full).with_context(|| format!("{p} is not a file here"))?;
                 let bytes = view::read_project(&full)?;
                 let mode = view::mode_of(&meta);
                 let blob = match offline::ask(down, Some(&task), || client.put_object(&state.repo, bytes.clone())) {

@@ -50,13 +50,14 @@ fn git_env(dir: &Path, args: &[&str], env: &[(&str, String)]) -> Result<String> 
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// `git ls-tree -r` of one commit: path -> (git blob sha, mode), regular files only. Symlinks and
-/// submodules are git objects the line does not carry: the export starts from a commit that has
-/// them and never touches them, so they survive the round trip unchanged.
+/// `git ls-tree -r` of one commit: path -> (git blob sha, mode), files and symbolic links (a link's
+/// blob is the path it points to, on the line as in git). Submodules are git objects the line does
+/// not carry: the export starts from a commit that has them and never touches them, so they survive
+/// the round trip unchanged.
 pub(crate) fn tree_of(dir: &Path, commit: &str) -> Result<BTreeMap<String, (String, u32)>> {
     let mut map = BTreeMap::new();
     for (path, (kind, mode, sha)) in ls_tree(dir, commit)? {
-        if kind == "blob" && (mode == 0o100644 || mode == 0o100755) {
+        if kind == "blob" && (mode == 0o100644 || mode == 0o100755 || mode == LINK) {
             map.insert(path, (sha, mode));
         }
     }
@@ -159,6 +160,88 @@ pub struct Exported {
     pub pushed: bool,
     /// What this run did to git's tags, one line each: written, moved, deleted, or left as git has it.
     pub tags: Vec<String>,
+    /// `Deliver::PullRequest`: the pull request that carries what the branch does not have yet
+    /// (none: the branch has every position).
+    pub pull_request: Option<String>,
+}
+
+/// How the line's commits reach the branch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Deliver {
+    /// The mirror pushes them to the branch itself (fast-forward only): the shortest way, the
+    /// proof of each position being the check.
+    #[default]
+    Push,
+    /// The mirror pushes them to `avp/<branch>` and keeps one pull request to the branch open on
+    /// GitHub, green from the start: each of its commits was proven before it landed. People (or
+    /// GitHub's auto-merge) merge it, with a merge commit; the next landing opens the next one.
+    #[value(name = "pull_request", alias = "pull-request")]
+    PullRequest,
+}
+
+/// The branch `Deliver::PullRequest` pushes to, whose pull request targets `branch`.
+pub fn delivery_branch(branch: &str) -> String {
+    format!("avp/{branch}")
+}
+
+/// One position a pull request delivers, read back from its commit.
+#[derive(Debug, PartialEq)]
+struct Delivered {
+    position: String,
+    proof: String,
+    author: String,
+    goal: String,
+}
+
+/// The title and the body of the pull request that delivers `ds` (oldest first) to `branch`.
+fn delivery_text(ds: &[Delivered], branch: &str) -> (String, String) {
+    let (first, last) = (ds.first().map_or("", |d| d.position.as_str()), ds.last().map_or("", |d| d.position.as_str()));
+    let title = match ds.len() {
+        1 => format!("AVP: position {first}, proven: {}", ds[0].goal),
+        n => format!("AVP: positions {first} to {last} ({n} changes, each proven before it landed)"),
+    };
+    let mut body = format!("Each commit below is a position of the AVP line: its checks ran on exactly this tree before it landed, so this pull request is green from the start. Merge it with a merge commit: `{branch}` then holds what the line holds.\n\n| Position | Change | By | Proof |\n|---|---|---|---|\n");
+    // GitHub cuts a body at 65536 characters: the newest positions, the count of the rest.
+    const ROWS: usize = 200;
+    for d in ds.iter().rev().take(ROWS) {
+        let cell = |s: &str| s.replace('|', "\\|");
+        body.push_str(&format!("| {} | {} | {} | {} |\n", d.position, cell(&d.goal), cell(&d.author), if d.proof.is_empty() { "-" } else { &d.proof }));
+    }
+    if ds.len() > ROWS {
+        body.push_str(&format!("\nAnd {} older position(s), in the commits.\n", ds.len() - ROWS));
+    }
+    (title, body)
+}
+
+/// `Deliver::PullRequest`, once `sha` is on `to`: what `branch` does not have yet is marked proven
+/// (the commit status `avp/proof`) and carried by one open pull request from `to` to `branch`,
+/// opened or brought up to date. Its address, none when the branch has every position.
+fn deliver_pr(dir: &Path, remote: &str, branch: &str, to: &str, sha: &str) -> Result<Option<String>> {
+    git(dir, &["fetch", "-q", remote, branch]).with_context(|| format!("{branch} is not on {remote}: a pull request needs the branch it targets"))?;
+    let tip = git(dir, &["rev-parse", "FETCH_HEAD"])?.trim().to_string();
+    let log = git(dir, &["log", "--reverse", "--format=%(trailers:key=AVP-Position,valueonly,separator=%x2C)%x1f%(trailers:key=AVP-Proof,valueonly,separator=%x2C)%x1f%an%x1f%s", &format!("{tip}..{sha}")])?;
+    let ds: Vec<Delivered> = log
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(4, '\x1f');
+            let d = Delivered { position: f.next()?.trim().to_string(), proof: f.next()?.trim().to_string(), author: f.next()?.to_string(), goal: f.next()?.to_string() };
+            (!d.position.is_empty()).then_some(d)
+        })
+        .collect();
+    if ds.is_empty() {
+        return Ok(None);
+    }
+    let slug = github_slug(dir, remote)?;
+    let said = if ds.len() == 1 { "1 position, proven before it landed".to_string() } else { format!("{} positions, each proven before it landed", ds.len()) };
+    github(reqwest::Method::POST, &format!("/repos/{slug}/statuses/{sha}"), Some(serde_json::json!({ "state": "success", "context": "avp/proof", "description": said })))?;
+    let (title, body) = delivery_text(&ds, branch);
+    let owner = slug.split('/').next().unwrap_or_default();
+    let open = github(reqwest::Method::GET, &format!("/repos/{slug}/pulls?state=open&head={owner}:{to}&base={branch}"), None)?;
+    let pr = match open.as_array().and_then(|a| a.first()) {
+        Some(pr) => github(reqwest::Method::PATCH, &format!("/repos/{slug}/pulls/{}", pr["number"]), Some(serde_json::json!({ "title": title, "body": body })))?,
+        None => github(reqwest::Method::POST, &format!("/repos/{slug}/pulls"), Some(serde_json::json!({ "title": title, "head": to, "base": branch, "body": body })))?,
+    };
+    Ok(Some(pr["html_url"].as_str().map(str::to_string).unwrap_or_else(|| format!("#{}", pr["number"]))))
 }
 
 /// "Name <email>" -> (name, email).
@@ -199,8 +282,15 @@ fn git_dir(dir: &Path) -> Result<PathBuf> {
 
 /// Writes every position after the last one with a commit as commits on top of it, checks the
 /// result against the head of the line, and pushes it to `branch` on `remote` (fast-forward only).
-pub fn mirror(client: &Client, dir: &Path, repo: &str, branch: &str, remote: Option<&str>, committer: &str) -> Result<Exported> {
+/// With `Deliver::PullRequest` the push goes to `avp/<branch>`, and a pull request carries it to
+/// `branch` (see `deliver_pr`).
+pub fn mirror(client: &Client, dir: &Path, repo: &str, branch: &str, remote: Option<&str>, committer: &str, deliver: Deliver) -> Result<Exported> {
     anyhow::ensure!(dir.join(".git").exists(), "{} is not a git checkout", dir.display());
+    anyhow::ensure!(deliver == Deliver::Push || remote.is_some(), "a pull request needs --remote: the repo on GitHub");
+    // What the pull request targets, and what this run writes.
+    let target = branch;
+    let to = if deliver == Deliver::PullRequest { delivery_branch(branch) } else { branch.to_string() };
+    let branch = to.as_str();
     let (cname, cemail) = parse_ident(committer)?;
     let r: Repo = client.get(&format!("/repos/{repo}"))?;
     let head: LineEntry = client.get(&format!("/repos/{}/head", r.id))?;
@@ -211,8 +301,9 @@ pub fn mirror(client: &Client, dir: &Path, repo: &str, branch: &str, remote: Opt
     // The commit to start from must be here; fetch it from the remote if it is not.
     if git(dir, &["cat-file", "-e", &format!("{base_sha}^{{commit}}")]).is_err() {
         let remote = remote.ok_or_else(|| anyhow!("commit {base_sha} (position {}) is not in this checkout: pass --remote to fetch it", base.position))?;
-        if git(dir, &["fetch", "-q", remote, &base_sha]).is_err() {
-            git(dir, &["fetch", "-q", remote, branch])?;
+        // The delivery branch is not on the remote before its first push: the target has the commit.
+        if git(dir, &["fetch", "-q", remote, &base_sha]).is_err() && git(dir, &["fetch", "-q", remote, branch]).is_err() {
+            git(dir, &["fetch", "-q", remote, target])?;
         }
         git(dir, &["cat-file", "-e", &format!("{base_sha}^{{commit}}")]).with_context(|| format!("commit {base_sha} is not on {remote} either"))?;
     }
@@ -312,7 +403,11 @@ pub fn mirror(client: &Client, dir: &Path, repo: &str, branch: &str, remote: Opt
         }
     }
     let tags = mirror_tags(client, dir, &r.id, remote)?;
-    Ok(Exported { written, head: head.position, sha, pushed, tags })
+    let pull_request = match (deliver, remote) {
+        (Deliver::PullRequest, Some(remote)) => deliver_pr(dir, remote, target, branch, &sha).with_context(|| format!("position {} is on {remote} {branch}, its pull request to {target} is not up to date", head.position))?,
+        _ => None,
+    };
+    Ok(Exported { written, head: head.position, sha, pushed, tags, pull_request })
 }
 
 /// Makes git's tags say what the line's say: each tag on its position's commit, here and on
@@ -410,18 +505,21 @@ fn git_tasks(client: &Client, repo: &str) -> Result<HashMap<String, Task>> {
     Ok(tasks.into_iter().filter(|t| t.actor.agent == GIT_AGENT).filter_map(|t| t.transcript.as_deref().and_then(commit_of).map(|sha| (sha, t))).collect())
 }
 
-/// HEAD of the worktree holds exactly the line's files: same paths, same bytes, same exec bit,
-/// and no other regular file (symlinks and submodules the line does not carry are left alone).
+/// HEAD of the worktree holds exactly the line's files: same paths, same bytes, same exec bit, a
+/// link where the line has a link, and no other regular file (submodules, and the links of a commit
+/// imported before the line carried them, are left alone).
 fn verify(wt: &Path, tree: &Tree) -> Result<()> {
     let committed = ls_tree(wt, "HEAD")?;
     let mut problems = Vec::new();
     for (path, e) in tree {
         match committed.get(path) {
-            Some((kind, mode, _)) if kind == "blob" && (*mode == 0o100644 || *mode == 0o100755) => {
-                if (*mode & 0o111 != 0) != (e.mode & 0o111 != 0) {
+            Some((kind, mode, _)) if kind == "blob" && (*mode == 0o100644 || *mode == 0o100755 || *mode == LINK) => {
+                if (*mode & 0o111 != 0) != (e.mode & 0o111 != 0) || (*mode == LINK) != is_link(e.mode) {
                     problems.push(format!("{path}: mode {mode:o}, the line says {:o}", e.mode));
                 }
-                match std::fs::read(wt.join(path)) {
+                // A link is compared by where it points, never by the file behind it.
+                let read = if *mode == LINK { view::read_project(&wt.join(path)) } else { std::fs::read(wt.join(path)) };
+                match read {
                     Ok(bytes) if hash_bytes(&bytes) == e.blob => {}
                     Ok(_) => problems.push(format!("{path}: content differs")),
                     Err(err) => problems.push(format!("{path}: {err}")),
@@ -453,11 +551,12 @@ pub struct ImportedPr {
     pub landed: Option<i64>,
 }
 
-/// GitHub's REST API with the token of GH_TOKEN or GITHUB_TOKEN, when there is one.
+/// GitHub's REST API (AVP_GITHUB_API for another one than github.com's) with the token of GH_TOKEN
+/// or GITHUB_TOKEN, when there is one.
 fn github(method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
     let token = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")).map_err(|_| anyhow!("set GH_TOKEN to read and close pull requests"))?;
     let http = reqwest::blocking::Client::new();
-    let mut req = http.request(method, format!("https://api.github.com{path}")).bearer_auth(token).header("accept", "application/vnd.github+json").header("user-agent", "avp");
+    let mut req = http.request(method, format!("{}{path}", std::env::var("AVP_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/'))).bearer_auth(token).header("accept", "application/vnd.github+json").header("user-agent", "avp");
     if let Some(b) = body {
         req = req.json(&b);
     }
@@ -559,9 +658,14 @@ pub fn import_pr(client: &Client, dir: &Path, repo: &str, number: u64, remote: &
             }
             let meta = std::fs::symlink_metadata(wt.join(path))?;
             if meta.file_type().is_symlink() {
-                continue; // the line does not carry symlinks; the mirror keeps git's own
+                view::write_link(&dest, LINK, &view::read_project(&wt.join(path))?)?;
+            } else {
+                // A file where the view had a link: the link goes, the file behind it is not written.
+                if std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+                    std::fs::remove_file(&dest)?;
+                }
+                std::fs::copy(wt.join(path), &dest)?;
             }
-            std::fs::copy(wt.join(path), &dest)?;
         }
         n += 1;
     }
@@ -724,6 +828,18 @@ pub fn follow_git(client: &Client, dir: &Path, repo: &str, rev: &str, views: Opt
             stop = Some(sha.to_string());
             break;
         }
+        // A delivery pull request merged on GitHub: the merge brings the line's own commits, never
+        // a change to take in. One whose tree is the line's ends the walk as a commit of the line
+        // does; one that also carries a person's commits is passed over, those commits come next.
+        match delivery_merge(client, dir, &r.id, sha, &mut known.line)? {
+            Some(true) => {
+                known.line.insert(sha.to_string());
+                stop = Some(sha.to_string());
+                break;
+            }
+            Some(false) => continue,
+            None => {}
+        }
         new.push(sha.to_string());
     }
     let stop = stop.ok_or_else(|| anyhow!("none of the last {} commits of {rev} is on the line of {} (was it rewritten, or imported from another repo?): nothing brought in", new.len(), r.name))?;
@@ -778,6 +894,21 @@ fn waiting(n: usize) -> String {
 
 fn subject_of(dir: &Path, sha: &str) -> String {
     git(dir, &["log", "-1", "--format=%s", sha]).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// Whether `sha` merges commits the mirror wrote into the branch (a delivery pull request, merged
+/// with a merge commit): none when it is no such merge, else whether its tree is exactly the tree
+/// of the mirror's commit it merged, the branch then holding what the line held there.
+fn delivery_merge(client: &Client, dir: &Path, repo: &str, sha: &str, line: &mut HashSet<String>) -> Result<Option<bool>> {
+    let parents = git(dir, &["log", "-1", "--format=%P", sha])?;
+    for p in parents.split_whitespace().skip(1) {
+        let trailer = git(dir, &["log", "-1", "--format=%(trailers:key=AVP-Position,valueonly,separator=%x2C)", p])?;
+        if line.contains(p) || mirrored(client, repo, p, trailer.trim(), line)? {
+            let tree = |c: &str| git(dir, &["rev-parse", &format!("{c}^{{tree}}")]).map(|t| t.trim().to_string());
+            return Ok(Some(tree(sha)? == tree(p)?));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether the mirror wrote `sha`: its message names a position (`AVP-Position`), and that position
@@ -879,7 +1010,7 @@ fn commit_writes(client: &Client, repo: &str, dir: &Path, parent: Option<&str>, 
     let out = git(dir, &args)?;
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
     // path -> (git blob of the parent, of the commit, and the commit's mode), regular files only.
-    let regular = |mode: &str, blob: &str| (mode == "100644" || mode == "100755").then(|| blob.to_string());
+    let regular = |mode: &str, blob: &str| (mode == "100644" || mode == "100755" || mode == "120000").then(|| blob.to_string());
     let mut changes = Vec::new();
     while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
         let m: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
@@ -1155,7 +1286,7 @@ pub fn sync_served(e: &crate::engine::Engine, repo: &str) -> Result<PathBuf> {
         }
         for (path, f) in tree.iter().filter(|(p, f)| carried(p) && prev.get(*p) != Some(*f)) {
             let bytes = e.objects.get(&f.blob)?;
-            let mode = if f.mode & 0o111 != 0 { "100755" } else { "100644" };
+            let mode = if is_link(f.mode) { "120000" } else if f.mode & 0o111 != 0 { "100755" } else { "100644" };
             write!(w, "M {mode} inline {}\ndata {}\n", quoted(path), bytes.len())?;
             w.write_all(&bytes)?;
             w.write_all(b"\n")?;
@@ -1288,5 +1419,18 @@ mod tests {
         assert_eq!(import_source("git@github.com:acme/web.git").unwrap().1, "web");
         assert_eq!(import_source("https://git.example.com/team/api.git/").unwrap().1, "api");
         assert!(import_source("not-a-checkout-nor-a-url").is_err());
+    }
+
+    #[test]
+    fn a_delivery_pull_request_names_its_positions_and_their_proofs() {
+        let d = |position: &str, goal: &str| Delivered { position: position.into(), proof: format!("proof_{position}"), author: "ada (codex)".into(), goal: goal.into() };
+        let (title, body) = delivery_text(&[d("7", "Fix the cart | total")], "main");
+        assert_eq!(title, "AVP: position 7, proven: Fix the cart | total");
+        assert!(body.contains("| 7 | Fix the cart \\| total | ada (codex) | proof_7 |"), "{body}");
+        let (title, body) = delivery_text(&[d("7", "one"), d("8", "two"), d("9", "three")], "main");
+        assert_eq!(title, "AVP: positions 7 to 9 (3 changes, each proven before it landed)");
+        // Newest first, as a person reads what is about to reach the branch.
+        assert!(body.find("| 9 |").unwrap() < body.find("| 7 |").unwrap());
+        assert_eq!(delivery_branch("main"), "avp/main");
     }
 }

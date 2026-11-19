@@ -26,6 +26,39 @@ Nothing to tell the agent: it finds AVP through the MCP server and one rule in `
 file it reads). A team shares one server, on a machine of its own or hosted by us: see
 [AVP and AVP Cloud](#avp-and-avp-cloud).
 
+### Or paste this to your agent
+
+To try AVP on a repository, without touching what others depend on:
+
+```text
+Try AVP on this repository without changing anything others depend on.
+1. Install it: curl -fsSL https://raw.githubusercontent.com/Mossab28/avp/main/install.sh | sh
+2. Run `avp up` here. Leave `main` and the CI as they are: AVP mirrors to the branch avp/line only.
+3. Read the avp.toml it landed. A proof should be the typecheck and the tests related to a change,
+   in seconds to a minute. Fix any check that is wrong or too slow, in a task.
+4. Do one small real change from this repo through avp_open and avp_land, then tell me what the
+   proof ran, how long it took, and what our CI would have run for the same change.
+If anything goes wrong, `avp down` stops it. Docs: https://github.com/Mossab28/avp
+```
+
+To measure what your CI costs and what AVP would cut, before anything shared changes:
+
+```text
+Measure what our CI costs and what AVP would cut. Show me before changing anything shared.
+1. Install AVP (curl -fsSL https://raw.githubusercontent.com/Mossab28/avp/main/install.sh | sh)
+   and run `avp up` in this repository.
+2. Run `avp import-ci` and turn our workflows into avp.toml checks: proof per task = typecheck and
+   related tests, full suite once per batch. List what it could not translate and the secrets the
+   tests need. Do not set any secret yourself.
+3. Land three small real changes through AVP (avp_open, avp_land) and compare their proof time
+   with the CI runs of similar commits.
+4. Run `avp stats --github <owner>/<repo> --before <from>..<to>` over our last two weeks of pull
+   requests (GH_TOKEN from `gh auth token`): CI machine time, median time to main, runs cancelled.
+5. Report a before / with-AVP table and the steps left in docs/MIGRATE.md
+   (https://github.com/Mossab28/avp/blob/main/docs/MIGRATE.md). Do not touch main, the workflows
+   or the deploys: those are my call.
+```
+
 New to AVP? [Your first 15 minutes](docs/QUICKSTART.md) goes from install to two agents on one
 file, with the output of each command. [The concepts](docs/CONCEPTS.md) say the words (line,
 position, task, proof, landing...) and what each replaces in Git and GitHub.
@@ -107,7 +140,7 @@ AVP Cloud is the same AVP, hosted: we run the server, its storage and the runner
 
 ## License
 
-Copyright (C) 2026 IntrudR. [Elastic License 2.0](LICENSE): free to use, change and run for any
+Copyright (C) 2026 Murmell Inc., a Delaware corporation. [Elastic License 2.0](LICENSE): free to use, change and run for any
 purpose, commercial included, on your machines, your team's server and your runners. The one thing
 it reserves: offering AVP to others as a hosted or managed service. Releases up to and including
 0.5.0 were published under the AGPL-3.0. Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).

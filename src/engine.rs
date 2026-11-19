@@ -839,17 +839,34 @@ impl Engine {
             Some(rule) if cfg.steps.iter().any(|s| s.run.contains("{skip_files}")) => crate::seam::left_out(self, &task.repo, &rule),
             _ => vec![],
         };
+        // Test files a red full suite of the last 14 days named, in the packages this task
+        // touches: they run in its proof (Murmell, week of 05/11: 9 of 13 reds after landing were
+        // one test that reads every file of its package, which no related test reached).
+        let also_files: Vec<String> = self
+            .db()
+            .red_full_blamed(&task.repo, now_ms() - 14 * 24 * 3_600_000)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| crate::check::is_test_file(p) && tree.contains_key(p) && crate::check::same_package(p, files))
+            .take(20)
+            .collect();
         let most = std::env::var("AVP_SPLIT_MAX").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(8);
-        let splits: Vec<(String, usize)> = if cfg.steps.iter().any(|s| s.split.is_some()) {
-            let related = crate::check::related_tests(&self.objects, tree, files);
-            cfg.steps.iter().filter_map(|s| s.split.map(|per| (s.name.clone(), related.div_ceil(per.max(1)).clamp(1, most)))).filter(|(_, n)| *n > 1).collect()
-        } else {
-            vec![]
-        };
+        // A step with `parts` is cut whatever the task touched; one with `split`, by its related tests.
+        let related = cfg.steps.iter().any(|s| s.split.is_some()).then(|| crate::check::related_tests(&self.objects, tree, files));
+        let splits: Vec<(String, usize)> = cfg
+            .steps
+            .iter()
+            .filter_map(|s| match (s.parts, s.split, related) {
+                (Some(n), _, _) => Some((s.name.clone(), n)),
+                (None, Some(per), Some(related)) => Some((s.name.clone(), related.div_ceil(per.max(1)).clamp(1, most))),
+                _ => None,
+            })
+            .filter(|(_, n)| *n > 1)
+            .collect();
         // Steps that run as their own job: one part each, skipped by the part of the others.
         let alone: Vec<String> = cfg.steps.iter().filter(|s| s.own_job && !splits.iter().any(|(n, _)| *n == s.name)).map(|s| s.name.clone()).collect();
         if splits.is_empty() && alone.is_empty() {
-            let part = (line_secrets.is_some() || !skip_files.is_empty()).then(|| Part { line_secrets, skip_files, ..Default::default() });
+            let part = (line_secrets.is_some() || !skip_files.is_empty() || !also_files.is_empty()).then(|| Part { line_secrets, skip_files, also_files, ..Default::default() });
             return self.prove(&task.repo, tree, tree_hash, &task.id, files, None, part.as_ref(), speculative);
         }
         let mut parts = vec![Part { skip: splits.iter().map(|(n, _)| n.clone()).chain(alone.iter().cloned()).collect(), line_secrets: line_secrets.clone(), ..Default::default() }];
@@ -864,6 +881,7 @@ impl Engine {
         }
         for p in &mut parts {
             p.skip_files = skip_files.clone();
+            p.also_files = also_files.clone();
         }
         let red = |steps: &[Step]| steps.iter().any(|s| s.exit != 0 && s.exit != crate::check::CANCELLED);
         let results: Vec<Vec<Step>> = std::thread::scope(|scope| {
@@ -896,7 +914,7 @@ impl Engine {
             }
             let failed = shares.iter().find(|(_, st)| st.exit != 0 && st.exit != crate::check::CANCELLED);
             let all_stopped = shares.iter().all(|(_, st)| st.exit == crate::check::CANCELLED);
-            let mut output = format!("{} jobs side by side ({n} shares of the related tests)\n", shares.len());
+            let mut output = format!("{} jobs side by side ({n} shares of {})\n", shares.len(), if s.parts.is_some() { "the step" } else { "the related tests" });
             // The failures first: they are what the agent reads.
             let mut shown: Vec<&(&str, &Step)> = shares.iter().filter(|(_, st)| st.exit != crate::check::CANCELLED).collect();
             shown.sort_by_key(|(_, st)| st.exit == 0);
@@ -1859,7 +1877,7 @@ impl Engine {
     /// webhook that does not answer never holds the line.
     fn notify(&self, repo: &str, kind: &str, task: Option<&str>, data: serde_json::Value) {
         let news = match kind {
-            "line.red" | "line.reverted" | "env.moved" | "env.failed" | "env.stalled" => true,
+            "line.red" | "line.reverted" | "line.reuse_missed" | "env.moved" | "env.failed" | "env.stalled" => true,
             // A person's revert lands as a task like another (`avp revert`): its goal says what it
             // takes back. AVP's own is told by its `line.reverted`, which says more.
             "task.landed" => data["goal"].as_str().is_some_and(|g| g.starts_with("Revert position ")),
@@ -1933,6 +1951,10 @@ fn notice(repo: &str, kind: &str, task: Option<&str>, goal: Option<&str>, d: &se
             let tests: Vec<&str> = d["tests"].as_array().map(|t| t.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
             let failing = if tests.is_empty() { String::new() } else { format!(" ({})", tests.join(" | ")) };
             format!("{repo}: AVP reverted position {position}{of} at position {}: it turned shard {} red twice{failing}. `avp show {position}` has the change.", d["by"], d["shard"].as_str().unwrap_or("?"))
+        }
+        "line.reuse_missed" => {
+            let files: Vec<&str> = d["changed_outside_inputs"].as_array().map(|f| f.iter().filter_map(|x| x.as_str()).take(8).collect()).unwrap_or_default();
+            format!("{repo}: shard {} is red on position {position}{of} with the inputs it was green on at position {}: it reads a file its `inputs` do not name, among what changed since ({}). Add it to the shard's inputs in avp.toml.", d["shard"].as_str().unwrap_or("?"), d["green_at"], files.join(", "))
         }
         "task.landed" => {
             let reverted = goal.and_then(|g| g.strip_prefix("Revert position ")).and_then(|g| g.split(':').next()).unwrap_or("?");

@@ -109,10 +109,38 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE TABLE IF NOT EXISTS repo_objects (
   repo TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (repo, hash)
 ) WITHOUT ROWID;
+-- The green runs of the full suite's shards that say what they read (`inputs`): one per shard and
+-- inputs, the newest. `what` and `reads` are check::shard_prints; `whole_at`, when the shard last
+-- ran on all its inputs (a run on `{changed}` keeps the one of the run it builds on).
+CREATE TABLE IF NOT EXISTS shard_results (
+  repo TEXT NOT NULL, shard TEXT NOT NULL, what TEXT NOT NULL, reads TEXT NOT NULL,
+  position INTEGER NOT NULL, tree TEXT NOT NULL, proof TEXT NOT NULL, ran_at INTEGER NOT NULL,
+  whole_at INTEGER NOT NULL, seconds REAL NOT NULL,
+  PRIMARY KEY (repo, shard, what, reads)
+);
 CREATE TABLE IF NOT EXISTS repo_trees (
   repo TEXT NOT NULL, tree TEXT NOT NULL, PRIMARY KEY (repo, tree)
 ) WITHOUT ROWID;
 "#;
+
+const SHARD_COLS: &str = "position, tree, proof, ran_at, whole_at, seconds";
+
+fn shard_row(r: &rusqlite::Row) -> rusqlite::Result<ShardResult> {
+    Ok(ShardResult { position: r.get(0)?, tree: r.get(1)?, proof: r.get(2)?, ran_at: r.get(3)?, whole_at: r.get(4)?, seconds: r.get(5)? })
+}
+
+/// A green run of a shard of the full suite that stands for the positions with the same inputs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShardResult {
+    /// Where it ran, on which tree, and the suite's proof that holds its output.
+    pub position: i64,
+    pub tree: String,
+    pub proof: String,
+    pub ran_at: i64,
+    /// When the shard last ran on all its inputs: this run, or the one its `{changed}` built on.
+    pub whole_at: i64,
+    pub seconds: f64,
+}
 
 /// A name for a position of the line (`v1.2`): what a release is called, shown by `avp log` and AVP
 /// Live, written as a git tag on the position's commit by the mirror, promoted by name.
@@ -666,6 +694,54 @@ impl Db {
         Ok(())
     }
 
+    // ---- the green runs of shards with inputs ----
+
+    /// The green run of `shard` on these prints, if it ran whole since `since` (ms).
+    pub fn shard_result(&self, repo: &str, shard: &str, what: &str, reads: &str, since: i64) -> Result<Option<ShardResult>> {
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT {SHARD_COLS} FROM shard_results WHERE repo = ?1 AND shard = ?2 AND what = ?3 AND reads = ?4 AND whole_at >= ?5"), params![repo, shard, what, reads, since], shard_row)
+            .optional()?)
+    }
+
+    /// The newest green run of the same shard (`what`) at or below `position` that ran whole since
+    /// `since`: what `{changed}` is counted from. Without `what`, of any shard of that name: the
+    /// newest position it is known green on, for a bisection.
+    pub fn shard_base(&self, repo: &str, shard: &str, what: Option<&str>, position: i64, since: i64) -> Result<Option<ShardResult>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {SHARD_COLS} FROM shard_results WHERE repo = ?1 AND shard = ?2 AND (?3 IS NULL OR what = ?3) AND position <= ?4 AND whole_at >= ?5 ORDER BY position DESC, ran_at DESC LIMIT 1"),
+                params![repo, shard, what, position, since],
+                shard_row,
+            )
+            .optional()?)
+    }
+
+    /// A shard ran green: its run stands for these prints. Runs older than a week, the longest one
+    /// may stand, go: the table holds a week of each shard at most.
+    pub fn put_shard_result(&self, repo: &str, shard: &str, what: &str, reads: &str, r: &ShardResult) -> Result<()> {
+        self.conn.execute("DELETE FROM shard_results WHERE repo = ?1 AND shard = ?2 AND whole_at < ?3", params![repo, shard, r.ran_at - 7 * 24 * 3_600_000])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO shard_results (repo, shard, what, reads, position, tree, proof, ran_at, whole_at, seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![repo, shard, what, reads, r.position, r.tree, r.proof, r.ran_at, r.whole_at, r.seconds],
+        )?;
+        Ok(())
+    }
+
+    /// What the newest suite of `position` that took `shard` says of it.
+    pub fn suite_step(&self, repo: &str, position: i64, shard: &str) -> Result<Option<Step>> {
+        let mut st = self.conn.prepare("SELECT steps FROM proofs WHERE repo = ?1 AND task IS NULL AND base_position = ?2 ORDER BY created_at DESC")?;
+        let suites = st.query_map(params![repo, position], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(suites.iter().find_map(|steps| serde_json::from_str::<Vec<Step>>(steps).ok()?.into_iter().find(|s| s.name == shard)))
+    }
+
+    /// A shard ran red on these prints: no green run stands for them any more.
+    pub fn drop_shard_result(&self, repo: &str, shard: &str, what: &str, reads: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM shard_results WHERE repo = ?1 AND shard = ?2 AND what = ?3 AND reads = ?4", params![repo, shard, what, reads])?;
+        Ok(())
+    }
+
     pub fn proof(&self, id: &str) -> Result<Option<Proof>> {
         Ok(self.conn.query_row(&format!("SELECT {PROOF_COLS} FROM proofs WHERE id = ?1"), params![id], proof_row).optional()?)
     }
@@ -710,6 +786,19 @@ impl Db {
     /// The proofs made in [since, until), for what they cost: each step's name, exit and seconds,
     /// read inside SQLite without its output (a full suite's weighs megabytes), save a split step's,
     /// The ids of the repo's proofs made in [since, until), oldest first: read one at a time after.
+    /// The files the red full suites of `repo` blamed since `since` (ms), each once.
+    pub fn red_full_blamed(&self, repo: &str, since: i64) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT blamed FROM proofs WHERE repo = ?1 AND task IS NULL AND verdict = 'red' AND created_at >= ?2")?;
+        let rows = st.query_map(params![repo, since], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::BTreeSet::new();
+        for b in rows {
+            for (path, _) in serde_json::from_str::<Vec<(String, serde_json::Value)>>(&b?).unwrap_or_default() {
+                out.insert(path);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     pub fn proof_ids_between(&self, repo: &str, since: i64, until: i64) -> Result<Vec<String>> {
         let mut st = self.conn.prepare("SELECT id FROM proofs WHERE repo = ?1 AND created_at >= ?2 AND created_at < ?3 ORDER BY created_at")?;
         let rows = st.query_map(params![repo, since, until], |r| r.get(0))?;

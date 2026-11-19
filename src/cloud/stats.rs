@@ -157,6 +157,9 @@ pub fn compute(repo: &str, since: i64, until: i64, r: &Records) -> Stats {
     s.full_suites = verdicts.iter().filter(in_window).filter_map(|e| e.data["proof"].as_str()).collect::<BTreeSet<_>>().len();
     s.full_red = events.iter().filter(kind("line.red")).filter(in_window).count();
     s.flaky = events.iter().filter(kind("line.flaky")).filter(in_window).count();
+    s.shards_reused = verdicts.iter().filter(in_window).filter_map(|e| e.data["reused"].as_array()).map(Vec::len).sum();
+    s.reuse_saved_minutes = tenth(verdicts.iter().filter(in_window).filter_map(|e| e.data["reused_seconds"].as_f64()).sum::<f64>() / 60.0);
+    s.reuse_missed = events.iter().filter(kind("line.reuse_missed")).filter(in_window).count();
     s
 }
 

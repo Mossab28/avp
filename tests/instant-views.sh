@@ -1,6 +1,6 @@
 #!/bin/bash
 # A new view is a clone of this machine's ready copy of the head, with the install of a view whose
-# lockfile is the same: nothing of it is shared, and a ready copy someone touched is laid again.
+# lockfile is the same (linked on Linux, cloned elsewhere), and a ready copy someone touched is laid again.
 # Usage: AVP=target/release/avp bash tests/instant-views.sh <scratch dir>
 set -u
 T=${AVP:-$HOME/Projects/avp/target/release/avp}
@@ -13,7 +13,7 @@ ok(){ if eval "$2" >/dev/null 2>&1; then echo "PASS $1"; else echo "FAIL $1"; fi
 mkdir -p repo/src/lib views/a views/b && cd repo || exit 1
 printf 'a\n' > src/a.txt && printf 'b\n' > src/lib/b.txt && printf 'node_modules\n' > .gitignore && printf 'lockfileVersion: 9\n' > pnpm-lock.yaml
 $T init iv >/dev/null && cd "$W" || exit 1
-# Where the filesystem cannot clone, a view takes no install at all: never a shared folder.
+# Where the filesystem cannot clone and cannot link, a view takes no install at all.
 if [ "$(uname)" = Darwin ]; then cp -c repo/src/a.txt probe; else cp --reflink=always repo/src/a.txt probe; fi 2>/dev/null && clones=1 || clones=0
 
 $T open -C views/a --repo iv --goal a >/dev/null
@@ -23,11 +23,15 @@ mkdir -p views/a/node_modules/dep && printf 'dep\n' > views/a/node_modules/dep/i
 printf 'touched\n' > $R/files/src/a.txt
 out=$($T open -C views/b --repo iv --goal b)
 ok "a file touched in the ready copy is laid again" '[ "$(cat views/b/src/a.txt)" = a ]'
-if [ $clones = 1 ]; then
-  ok "the install of a view with the same lockfile is cloned" '[ "$(cat views/b/node_modules/dep/index.js)" = dep ] && [[ "$out" == *"node_modules cloned from"* ]]'
+# Gabriel, 07/11/2026: on Linux a node_modules is linked file by file, wherever clones are missing
+# (a disk under a project quota charges a clone in full). A package manager replaces a file, it
+# never writes into one: what it puts in one view stays in it.
+if [ $clones = 1 ] || [ "$(uname)" = Linux ]; then
+  ok "the install of a view with the same lockfile is taken" '[ "$(cat views/b/node_modules/dep/index.js)" = dep ] && [[ "$out" == *"node_modules cloned from"* ]]'
 else
   ok "no clones here: no install taken" '[ ! -e views/b/node_modules ]'
 fi
-printf 'mine\n' > views/b/src/lib/b.txt && printf 'mine\n' > views/b/node_modules/dep/index.js 2>/dev/null
+printf 'mine\n' > views/b/src/lib/b.txt
+if [ -e views/b/node_modules/dep/index.js ]; then rm views/b/node_modules/dep/index.js; printf 'mine\n' > views/b/node_modules/dep/index.js; fi
 ok "a write in one view stays in it" '[ "$(cat views/a/src/lib/b.txt)" = b ] && [ "$(cat $R/files/src/lib/b.txt)" = b ] && [ "$(cat views/a/node_modules/dep/index.js)" = dep ]'
 ok "and is its task's change" '[[ "$($T -C views/b sync)" == *"src/lib/b.txt"* ]]'

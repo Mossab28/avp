@@ -18,6 +18,7 @@ printf 'gen/\n' > .gitignore; mkdir -p bin gen lib
 printf 'echo hi\n' > bin/run.sh; chmod +x bin/run.sh
 printf 'a\n' > lib/a.txt; printf 'old\n' > lib/old.txt; printf 'kept\n' > gen/tracked.d.ts
 ln -s lib/a.txt link-to-a
+printf '[[check.steps]]\nname = "links"\nrun = "test -L link-to-a && grep -q a link-to-a"\n' > avp.toml
 g add -A; g add -f gen/tracked.d.ts
 g update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,vendor/sub
 g commit -qm "first"; printf 'b\n' > lib/b.txt; g add lib/b.txt; g commit -qm "second"
@@ -26,6 +27,8 @@ git clone -q origin.git imp
 $T -C imp import-git demo --history 5 >/dev/null 2>&1
 ok "import: position 1 remembers its commit" "curl -s $AVP_SERVER/repos/demo/line/1/last-git | grep -q $BASE"
 mkdir v && cd v && $T open --repo demo --goal "agent: change things" >/dev/null 2>&1
+ok "a view holds the link as a link" "[ -L link-to-a ] && [ \$(readlink link-to-a) = lib/a.txt ]"
+ln -s lib/new.txt link-new
 printf 'a2\n' > lib/a.txt; printf 'new\n' > lib/new.txt; rm lib/old.txt; chmod +x lib/b.txt
 mkdir -p gen && printf 'generated\n' > gen/new.d.ts
 $T sync >/dev/null 2>&1; $T add gen/new.d.ts >/dev/null 2>&1; $T land >"$W/land.log" 2>&1; cd ..
@@ -36,6 +39,8 @@ ok "main fast-forwarded from the imported commit" "git merge-base --is-ancestor 
 ok "one commit per landed position" "[ \$(git rev-list --count $BASE..HEAD) = 1 ]"
 ok "trailers name position, task, proof" "git log -1 --format=%B | grep -q '^AVP-Position: 2' && git log -1 --format=%B | grep -q '^AVP-Task: task_' && git log -1 --format=%B | grep -q '^AVP-Proof: proof_'"
 ok "symlink kept as a symlink" "git ls-tree HEAD link-to-a | grep -q '^120000'"
+ok "the proof ran with the link in its folder" "grep -q 'landed at position 2' $W/land.log"
+ok "a link an agent made is exported as a link" "git ls-tree HEAD link-new | grep -q '^120000' && [ \$(readlink link-new) = lib/new.txt ]"
 ok "submodule kept" "git ls-tree HEAD vendor/sub | grep -q '^160000'"
 ok "exec bit carried" "git ls-tree HEAD lib/b.txt | grep -q '^100755'"
 ok "edit carried" "grep -q a2 lib/a.txt"

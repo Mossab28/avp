@@ -150,6 +150,12 @@ pub fn split_host(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 /// A project file as AVP sees it: without the host's blocks.
 pub fn read_project(full: &Path) -> std::io::Result<Vec<u8>> {
+    // A symbolic link's content is the path it points to, never the file behind it.
+    #[cfg(unix)]
+    if fs::symlink_metadata(full)?.file_type().is_symlink() {
+        use std::os::unix::ffi::OsStringExt;
+        return Ok(fs::read_link(full)?.into_os_string().into_vec());
+    }
     let bytes = fs::read(full)?;
     Ok(if host_blocks().is_empty() { bytes } else { split_host(&bytes).0 })
 }
@@ -178,6 +184,9 @@ pub fn mode_of(meta: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        if meta.file_type().is_symlink() {
+            return LINK;
+        }
         if meta.permissions().mode() & 0o111 != 0 { 0o100755 } else { 0o100644 }
     }
     #[cfg(not(unix))]
@@ -185,6 +194,54 @@ pub fn mode_of(meta: &fs::Metadata) -> u32 {
         let _ = meta;
         0o100644
     }
+}
+
+/// A file or a symbolic link: what the line carries. Read from `symlink_metadata`, a link is never followed.
+pub fn carried(meta: &fs::Metadata) -> bool {
+    meta.is_file() || (cfg!(unix) && meta.file_type().is_symlink())
+}
+
+/// Puts the symbolic link `mode` says `bytes` is at `dest`, in place of whatever was there. False
+/// when the entry is not a link (or the system has none): the caller writes a file.
+pub fn write_link(dest: &Path, mode: u32, bytes: &[u8]) -> Result<bool> {
+    if !is_link(mode) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        match fs::symlink_metadata(dest) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(dest)?,
+            Ok(_) => fs::remove_file(dest)?,
+            Err(_) => {}
+        }
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), dest)?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dest, bytes);
+        Ok(false)
+    }
+}
+
+/// A path of `tree` that goes through one of its symbolic links, if any: writing it would follow the
+/// link out of the folder.
+pub fn through_link(tree: &Tree) -> Option<&String> {
+    let links: HashSet<&str> = tree.iter().filter(|(_, e)| is_link(e.mode)).map(|(p, _)| p.as_str()).collect();
+    if links.is_empty() {
+        return None;
+    }
+    tree.keys().find(|p| {
+        let mut s = p.as_str();
+        while let Some((parent, _)) = s.rsplit_once('/') {
+            if links.contains(parent) {
+                return true;
+            }
+            s = parent;
+        }
+        false
+    })
 }
 
 /// Every file under `dir` the project would version: respects `.gitignore`, skips the host's
@@ -197,8 +254,8 @@ pub fn scan(dir: &Path, known: &BTreeMap<String, (String, u32)>, stamps: &mut BT
             continue;
         }
         let full = dir.join(path);
-        if let Ok(meta) = fs::metadata(&full) {
-            if meta.is_file() {
+        if let Ok(meta) = fs::symlink_metadata(&full) {
+            if carried(&meta) {
                 out.insert(path.clone(), (hash_of(&full, path, &meta, stamps)?, mode_of(&meta)));
             }
         }
@@ -249,7 +306,7 @@ fn scan_unignored(dir: &Path, stamps: &mut BTreeMap<String, (Stamp, String)>) ->
     for entry in walker {
         let entry = entry?;
         let meta = entry.metadata()?;
-        if !meta.is_file() {
+        if !carried(&meta) {
             continue;
         }
         let rel = entry.path().strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
@@ -335,11 +392,21 @@ fn lay(tree: &Tree, dir: &Path, state: &mut ViewState, fill: &Fill) -> Result<us
     if let Some(bad) = tree.keys().find(|p| !safe_path(p)) {
         anyhow::bail!("the server sent a path outside the view: {bad:?}");
     }
-    let need: Vec<(&String, &Entry)> = tree.iter().filter(|(path, entry)| !(state.known.get(*path).is_some_and(|(b, m)| b == &entry.blob && *m == entry.mode) && dir.join(path).exists())).collect();
+    if let Some(bad) = through_link(tree) {
+        anyhow::bail!("the server sent a path that goes through a symbolic link: {bad:?}");
+    }
+    let need: Vec<(&String, &Entry)> = tree.iter().filter(|(path, entry)| !(state.known.get(*path).is_some_and(|(b, m)| b == &entry.blob && *m == entry.mode) && fs::symlink_metadata(dir.join(path)).is_ok())).collect();
     let write = |path: &str, entry: &Entry, bytes: &[u8]| -> Result<()> {
         let dest = dir.join(path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if write_link(&dest, entry.mode, bytes)? {
+            return Ok(());
+        }
+        // A file where a link was: the link goes, what it points to is not written through.
+        if fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::remove_file(&dest)?;
         }
         let kept = if host_blocks().is_empty() { Vec::new() } else { fs::read(&dest).map(|b| split_host(&b).1).unwrap_or_default() };
         if kept.is_empty() {
@@ -436,6 +503,9 @@ fn from_ready(client: &Client, tree: &Tree, dir: &Path, state: &mut ViewState, s
     if let Some(bad) = tree.keys().find(|p| !safe_path(p)) {
         anyhow::bail!("the server sent a path outside the view: {bad:?}");
     }
+    if let Some(bad) = through_link(tree) {
+        anyhow::bail!("the server sent a path that goes through a symbolic link: {bad:?}");
+    }
     let all = crate::up::home().join("ready");
     let root = all.join(&state.repo);
     fs::create_dir_all(&root)?;
@@ -492,7 +562,7 @@ fn ready(client: &Client, repo: &str, tree: &Tree, root: &Path, seeds: &[PathBuf
         }
     }
     prune(&files, "", tree, &dirs)?;
-    let stamp = |p: &str| fs::symlink_metadata(files.join(p)).ok().filter(|m| m.is_file()).map(|m| stamp_of(&m));
+    let stamp = |p: &str| fs::symlink_metadata(files.join(p)).ok().filter(carried).map(|m| stamp_of(&m));
     let need: Vec<(&String, &Entry)> = tree.iter().filter(|(p, e)| !laid.get(*p).is_some_and(|l| l.blob == e.blob && l.mode == e.mode && stamp(p) == Some(l.stamp))).collect();
     if need.is_empty() {
         return Ok(());
@@ -502,6 +572,9 @@ fn ready(client: &Client, repo: &str, tree: &Tree, root: &Path, seeds: &[PathBuf
         let dest = files.join(path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if write_link(&dest, entry.mode, bytes)? {
+            return Ok(());
         }
         // A new file, never the old one written over: its blocks may be a view's too.
         let _ = fs::remove_file(&dest);
@@ -532,7 +605,7 @@ fn prune(files: &Path, rel: &str, tree: &Tree, dirs: &HashSet<&str>) -> Result<(
             prune(files, &path, tree, dirs)?;
         } else if kind.is_dir() {
             fs::remove_dir_all(entry.path())?;
-        } else if !(kind.is_file() && tree.contains_key(&path)) {
+        } else if !tree.get(&path).is_some_and(|e| if is_link(e.mode) { kind.is_symlink() } else { kind.is_file() }) {
             fs::remove_file(entry.path())?;
         }
     }
@@ -548,12 +621,16 @@ fn clone_files(src: &Path, dst: &Path, tree: &Tree) -> Result<()> {
     let _ = fs::remove_dir_all(dst);
     let mut made = HashSet::new();
     let mut clones = true;
-    for path in tree.keys() {
+    for (path, entry) in tree {
         let (from, to) = (src.join(path), dst.join(path));
         if let Some(parent) = to.parent() {
             if made.insert(parent.to_path_buf()) {
                 fs::create_dir_all(parent)?;
             }
+        }
+        // A link is made again: a clone or a copy would take the file behind it.
+        if is_link(entry.mode) && write_link(&to, entry.mode, &read_project(&from)?)? {
+            continue;
         }
         // The first clone refused says the filesystem has none: the rest are copies.
         clones = clones && clone_path(&from, &to).is_ok();
@@ -576,6 +653,10 @@ fn dated_now(dir: &Path, tree: &Tree) -> Result<()> {
 
 /// A file dated now, as if just written.
 pub fn date_now(path: &Path) -> Result<()> {
+    // A symbolic link has no date a build reads, and the file behind it is not ours to touch.
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         let p = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
@@ -648,7 +729,12 @@ fn clone_path(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Clones the folder `src` to `dst`, a path that does not exist yet: whole on macOS, on Linux
 /// folder by folder, links made again and each file a reflink. Any file that cannot be cloned
 /// fails it all: the caller removes what was made.
-fn clone_folder(src: &Path, dst: &Path) -> std::io::Result<()> {
+///
+/// `hard`: on Linux each file is a hard link, a reflink only where a link cannot be made. A
+/// `node_modules`: package managers replace its files and never write them in place (pnpm links
+/// its own store the same way), and a disk under a project quota (XFS) charges a reflink in full,
+/// 3.2 GB per install of Murmell against 37 MB linked (Gabriel, 07/11/2026).
+fn clone_folder(src: &Path, dst: &Path, hard: bool) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         fs::create_dir(dst)?;
@@ -658,17 +744,20 @@ fn clone_folder(src: &Path, dst: &Path) -> std::io::Result<()> {
             let (from, to) = (e.path(), dst.join(e.file_name()));
             let kind = e.file_type()?;
             if kind.is_dir() {
-                clone_folder(&from, &to)?;
+                clone_folder(&from, &to, hard)?;
             } else if kind.is_symlink() {
                 std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
-            } else {
+            } else if !(hard && fs::hard_link(&from, &to).is_ok()) {
                 clone_path(&from, &to)?;
             }
         }
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
-    clone_path(src, dst)
+    {
+        let _ = hard;
+        clone_path(src, dst)
+    }
 }
 
 /// Lockfiles, and the folder an install fills beside each.
@@ -722,14 +811,16 @@ pub fn reuse_deps(tree: &Tree, dir: &Path, sources: &[PathBuf]) -> Vec<Reused> {
         let same = |src: &Path| read_project(&src.join(lock)).is_ok_and(|b| hash_bytes(&b) == entry.blob);
         // A folder, not a link: a link would share the other view's install.
         let real = |p: PathBuf| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
-        let Some(src) = sources.iter().find(|s| s.as_path() != dir && same(s) && folders.iter().any(|f| real(s.join(f)))) else { continue };
+        // An install stopped halfway, or made for part of the workspace, is no install to take.
+        let whole = |src: &Path| folder != "node_modules" || node_install_complete(dir, src, base, &folders);
+        let Some(src) = sources.iter().find(|s| s.as_path() != dir && same(s) && folders.iter().any(|f| real(s.join(f))) && whole(s)) else { continue };
         let mut cloned = Vec::new();
         for f in folders.iter().filter(|f| real(src.join(f))) {
             let to = dir.join(f);
             if !to.parent().is_some_and(|p| p.is_dir()) {
                 continue;
             }
-            if clone_folder(&src.join(f), &to).is_err() {
+            if clone_folder(&src.join(f), &to, folder == "node_modules").is_err() {
                 let _ = fs::remove_dir_all(&to);
                 break;
             }
@@ -741,6 +832,34 @@ pub fn reuse_deps(tree: &Tree, dir: &Path, sources: &[PathBuf]) -> Vec<Reused> {
         }
     }
     out
+}
+
+/// Whether `src` holds every package the workspace under `base` declares, as `dir` (laid out from
+/// the tree) declares them: each dependency of the root and of each package beneath it is in that
+/// package's `node_modules` or hoisted to the root's. Optional and peer dependencies may be absent.
+/// A folder whose install is missing a package would pass it on to every view cloned from it.
+fn node_install_complete(dir: &Path, src: &Path, base: &str, folders: &[String]) -> bool {
+    let at = |p: &str| if base.is_empty() { PathBuf::from(p) } else { Path::new(base).join(p) };
+    let root_modules = src.join(at("node_modules"));
+    if !fs::symlink_metadata(&root_modules).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    // The root, and each package whose node_modules is cloned (`web/node_modules` -> `web`).
+    let packages = std::iter::once(at("")).chain(folders.iter().filter_map(|f| f.strip_suffix("/node_modules").map(PathBuf::from)));
+    for pkg in packages {
+        let Ok(bytes) = fs::read(dir.join(&pkg).join("package.json")) else { continue };
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+        for field in ["dependencies", "devDependencies"] {
+            let Some(deps) = manifest.get(field).and_then(|d| d.as_object()) else { continue };
+            for name in deps.keys() {
+                let present = |modules: PathBuf| fs::symlink_metadata(modules.join(name)).is_ok();
+                if !present(src.join(&pkg).join("node_modules")) && !present(root_modules.clone()) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// A cloned install still names the folder it was made in, in the small files tools write their
@@ -767,7 +886,15 @@ fn relocate(folder: &Path, from: &Path, to: &Path) {
         }
         let now = pairs.iter().fold(bytes.clone(), |b, (a, z)| replace_path(&b, a, z));
         if now != bytes {
-            let _ = fs::write(&f, now);
+            // A new file in its place, never a write into it: a hard-linked file is the other
+            // folder's too.
+            let new = f.with_file_name(format!(".{}.avp-relocate", f.file_name().unwrap_or_default().to_string_lossy()));
+            let done = fs::write(&new, now)
+                .and_then(|()| fs::metadata(&f).and_then(|m| fs::set_permissions(&new, m.permissions())))
+                .and_then(|()| fs::rename(&new, &f));
+            if done.is_err() {
+                let _ = fs::remove_file(&new);
+            }
         }
     }
 }
@@ -984,15 +1111,57 @@ mod tests {
         let _ = fs::remove_dir_all(&w);
     }
 
-    /// A new view takes the install of a view whose lockfile is the same: a clone of its own, whose
-    /// shims name the new folder. A view whose lockfile differs gives nothing, a view that has an
-    /// install keeps it, and where the filesystem cannot clone, nothing is taken at all.
+    /// Gabriel, 07/11/2026: a view took the install of a folder where pnpm had stopped halfway (no
+    /// package at the top, no workspace package's node_modules), and its typecheck failed. A folder
+    /// missing a declared package is passed over for one that has them all, hoisted or not.
+    #[test]
+    fn a_view_takes_only_a_complete_install() {
+        let w = std::env::temp_dir().join(format!("avp-deps-whole-{}", ulid::Ulid::new()));
+        let (half, hoisted, whole, new) = (w.join("half"), w.join("hoisted"), w.join("whole"), w.join("new"));
+        let mut tree = Tree::new();
+        let files = [("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"), ("package.json", r#"{"dependencies":{"dep":"1"},"optionalDependencies":{"opt":"1"}}"#), ("web/package.json", r#"{"devDependencies":{"tool":"1"}}"#)];
+        for (path, body) in files {
+            tree.insert(path.into(), Entry { blob: hash_bytes(body.as_bytes()), mode: 0o100644 });
+            for v in [&half, &hoisted, &whole, &new] {
+                fs::create_dir_all(v.join(path).parent().unwrap()).unwrap();
+                fs::write(v.join(path), body).unwrap();
+            }
+        }
+        // Stopped halfway: pnpm's state is there, the packages are not.
+        fs::create_dir_all(half.join("node_modules/.pnpm")).unwrap();
+        fs::write(half.join("node_modules/.modules.yaml"), "{}").unwrap();
+        // npm's way: everything at the root.
+        fs::create_dir_all(hoisted.join("node_modules/dep")).unwrap();
+        fs::create_dir_all(hoisted.join("node_modules/tool")).unwrap();
+        // pnpm's way: each package its own.
+        fs::create_dir_all(whole.join("node_modules/dep")).unwrap();
+        fs::create_dir_all(whole.join("web/node_modules/tool")).unwrap();
+
+        let folders = vec!["node_modules".to_string(), "web/node_modules".to_string()];
+        assert!(!node_install_complete(&new, &half, "", &folders), "halfway");
+        assert!(node_install_complete(&new, &hoisted, "", &folders), "hoisted");
+        assert!(node_install_complete(&new, &whole, "", &folders), "per package");
+
+        let got = reuse_deps(&tree, &new, &[half.clone(), whole.clone()]);
+        if !got.is_empty() {
+            assert_eq!(got[0].from, whole, "the complete install, not the first one");
+            assert!(new.join("web/node_modules/tool").is_dir());
+        }
+        assert!(reuse_deps(&tree, &w.join("none"), &[half.clone()]).is_empty(), "only a halfway install: nothing");
+        let _ = fs::remove_dir_all(&w);
+    }
+
+    /// A new view takes the install of a view whose lockfile is the same, whose shims name the new
+    /// folder. On Linux a `node_modules` is linked file by file (Gabriel, 07/11/2026: a reflink is
+    /// charged in full by a project quota); a build folder (`target`) is a clone of its own, or,
+    /// where the filesystem cannot clone, nothing. A view whose lockfile differs gives nothing, a
+    /// view that has an install keeps it.
     #[test]
     fn a_view_takes_the_install_of_one_with_the_same_lockfile() {
         let w = std::env::temp_dir().join(format!("avp-deps-{}", ulid::Ulid::new()));
         let (a, b, c) = (w.join("a"), w.join("b"), w.join("c"));
         let mut tree = Tree::new();
-        for (path, body) in [("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"), ("package.json", "{}"), ("web/package.json", "{}")] {
+        for (path, body) in [("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"), ("package.json", "{}"), ("web/package.json", "{}"), ("Cargo.lock", "version = 4\n")] {
             tree.insert(path.into(), Entry { blob: hash_bytes(body.as_bytes()), mode: 0o100644 });
             for v in [&a, &b, &c] {
                 fs::create_dir_all(v.join(path).parent().unwrap()).unwrap();
@@ -1007,28 +1176,51 @@ mod tests {
             fs::write(v.join("node_modules/.bin/dep"), format!("#!/bin/sh\nexec node {}/node_modules/dep/index.js\n", v.display())).unwrap();
             fs::write(v.join("web/node_modules/x"), "x").unwrap();
         }
+        fs::create_dir_all(a.join("target")).unwrap();
+        fs::write(a.join("target/build"), "b").unwrap();
         fs::write(w.join("probe"), "p").unwrap();
         let clones = clone_path(&w.join("probe"), &w.join("probe-clone")).is_ok();
 
         let got = reuse_deps(&tree, &b, &[c.clone(), a.clone()]);
-        if !clones {
-            assert!(got.is_empty() && !b.join("node_modules").exists(), "a clone, or nothing");
-            let _ = fs::remove_dir_all(&w);
-            return;
+        let node = got.iter().find(|r| r.lockfile == "pnpm-lock.yaml");
+        if cfg!(target_os = "linux") || clones {
+            let node = node.expect("node_modules taken");
+            assert_eq!((&node.from, node.folders.clone()), (&a, vec!["node_modules".to_string(), "web/node_modules".to_string()]));
+            assert_eq!(fs::read_to_string(b.join("web/node_modules/x")).unwrap(), "x");
+            let shim = fs::read_to_string(b.join("node_modules/.bin/dep")).unwrap();
+            assert!(shim.contains(&format!("{}/node_modules", b.display())) && !shim.contains(&a.display().to_string()), "{shim}");
+            // The shim was rewritten for the new view, not in the other's.
+            let theirs = fs::read_to_string(a.join("node_modules/.bin/dep")).unwrap();
+            assert!(theirs.contains(&format!("{}/node_modules", a.display())), "{theirs}");
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let ino = |v: &Path| fs::metadata(v.join("node_modules/dep/index.js")).unwrap().ino();
+                assert_eq!(ino(&a), ino(&b), "a node_modules is linked, not copied");
+            }
+            // A package manager replaces a file: the other view keeps its own.
+            fs::remove_file(b.join("node_modules/dep/index.js")).unwrap();
+            fs::write(b.join("node_modules/dep/index.js"), "changed\n").unwrap();
+            assert_eq!(fs::read_to_string(a.join("node_modules/dep/index.js")).unwrap(), format!("from {}\n", a.display()));
+        } else {
+            assert!(node.is_none() && !b.join("node_modules").exists(), "a clone, or nothing");
         }
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!((got[0].lockfile.as_str(), &got[0].from, got[0].folders.clone()), ("pnpm-lock.yaml", &a, vec!["node_modules".to_string(), "web/node_modules".to_string()]));
-        assert_eq!(fs::read_to_string(b.join("web/node_modules/x")).unwrap(), "x");
-        let shim = fs::read_to_string(b.join("node_modules/.bin/dep")).unwrap();
-        assert!(shim.contains(&format!("{}/node_modules", b.display())) && !shim.contains(&a.display().to_string()), "{shim}");
-        // A clone, not a shared folder: what the new view writes, the other never sees.
-        fs::write(b.join("node_modules/dep/index.js"), "changed\n").unwrap();
-        assert_eq!(fs::read_to_string(a.join("node_modules/dep/index.js")).unwrap(), format!("from {}\n", a.display()));
+        // A build folder is never linked: a clone of its own, or nothing.
+        let target = got.iter().find(|r| r.lockfile == "Cargo.lock");
+        if clones {
+            assert!(target.is_some());
+            fs::write(b.join("target/build"), "changed").unwrap();
+            assert_eq!(fs::read_to_string(a.join("target/build")).unwrap(), "b");
+        } else {
+            assert!(target.is_none() && !b.join("target").exists(), "a clone, or nothing");
+        }
 
-        assert!(reuse_deps(&tree, &b, &[a.clone()]).is_empty(), "a view with an install keeps it");
-        fs::remove_dir_all(b.join("node_modules")).unwrap();
-        fs::remove_dir_all(b.join("web/node_modules")).unwrap();
-        assert!(reuse_deps(&tree, &b, &[c.clone()]).is_empty() && !b.join("node_modules").exists(), "another lockfile gives nothing");
+        if b.join("node_modules").exists() {
+            assert!(reuse_deps(&tree, &b, &[a.clone()]).iter().all(|r| r.lockfile != "pnpm-lock.yaml"), "a view with an install keeps it");
+            fs::remove_dir_all(b.join("node_modules")).unwrap();
+            fs::remove_dir_all(b.join("web/node_modules")).unwrap();
+        }
+        assert!(reuse_deps(&tree, &b, &[c.clone()]).iter().all(|r| r.lockfile != "pnpm-lock.yaml") && !b.join("node_modules").exists(), "another lockfile gives nothing");
         let _ = fs::remove_dir_all(&w);
     }
 }

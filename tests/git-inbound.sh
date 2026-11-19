@@ -2,7 +2,8 @@
 # Git keeps coming in while a team moves over: commits pushed to main by a person become tasks,
 # replayed on the head, proven and landed as their author; the mirror's own commits are never taken
 # back in; a red one stays open and the commits after it wait; `avp serve` does the same by itself
-# from avp.toml's [git]. A local bare remote, no network.
+# from avp.toml's [git]; and the way out by pull request (`avp mirror --deliver pull_request`). A
+# local bare remote, no network.
 # Usage: AVP=target/release/avp bash tests/git-inbound.sh <scratch dir>. Prints PASS/FAIL per check.
 set -u
 T=${AVP:-$HOME/Projects/avp/target/release/avp}
@@ -79,4 +80,34 @@ ok "each commit came in once" "[ \$(curl -s \"$AVP_SERVER/repos/demo/tasks?agent
 person "printf 'served\n' > served.txt" "hand: while the server follows"
 upto "[ \$(head_pos) = 6 ]" 80
 ok "avp serve brings main's commits in by itself, as their author" "[ \$(head_pos) = 6 ] && $T -C imp show 6 | grep -q 'h@x' && grep -q 'while the server follows: landed at 6' server.log"
+
+# Git at the end by pull request: the mirror writes avp/main, and one pull request, green from the
+# start, carries it to main. A fake GitHub on a port of its own.
+python3 - 7474 "$W/gh.log" <<'PY' &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def answer(self):
+        body = self.rfile.read(int(self.headers.get("content-length") or 0)).decode()
+        open(sys.argv[2], "a").write(f"{self.command} {self.path} {body}\n")
+        out = b"[]" if self.command == "GET" else b'{"number":1,"html_url":"https://github.test/acme/shop/pull/1"}'
+        self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(out))); self.end_headers(); self.wfile.write(out)
+    do_GET = do_POST = do_PATCH = answer
+    def log_message(self, *a): pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+GP=$!
+trap 'kill $SP $FP $GP 2>/dev/null' EXIT
+upto "curl -sf http://127.0.0.1:7474/"
+agent "agent: delivered by pull request" "printf 'pr\n' > pr.txt"
+M0=$(git -C origin.git rev-parse main); P=$(head_pos)
+GH_TOKEN=t AVP_GITHUB_API=http://127.0.0.1:7474 $T -C exp mirror --repo demo --branch main --remote origin --deliver pull_request > deliver.log 2>&1
+ok "deliver pull_request: the commits go to avp/main, main is not written" "git -C origin.git log -1 --format=%B avp/main | grep -q \"^AVP-Position: $P\" && [ \$(git -C origin.git rev-parse main) = $M0 ]"
+ok "one pull request to main is opened, its commit marked proven" "grep -q 'delivered to main by pull request https://github.test/acme/shop/pull/1' deliver.log && grep -q 'POST /repos/.*/pulls .*\"head\":\"avp/main\"' gh.log && grep -q \"POST /repos/.*/statuses/\$(git -C origin.git rev-parse avp/main) .*avp/proof\" gh.log"
+# Merged on GitHub with a merge commit: main holds what the line holds, and nothing comes back in.
+(cd src && g fetch -q origin && g reset -q --hard origin/main && g merge -q --no-ff origin/avp/main -m "Merge pull request #1" && g push -q origin main)
+sleep 4
+ok "the merge of a delivery is never taken back in" "[ \$(head_pos) = $P ] && ! grep -q 'Merge pull request' server.log && [ \$(git -C origin.git rev-parse 'main^{tree}') = \$(git -C origin.git rev-parse 'avp/main^{tree}') ]"
+GH_TOKEN=t AVP_GITHUB_API=http://127.0.0.1:7474 $T -C exp mirror --repo demo --branch main --remote origin --deliver pull_request > deliver2.log 2>&1
+ok "merged, the branch has every position: no pull request" "grep -q 'main has every position' deliver2.log && [ \$(grep -c 'POST /repos/.*/pulls ' gh.log) = 1 ]"
 echo "workdir $W"

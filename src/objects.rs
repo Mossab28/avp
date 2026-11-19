@@ -76,6 +76,9 @@ impl Objects {
             Ok(_) => fs::remove_file(dest)?,
             Err(_) => {}
         }
+        if crate::model::is_link(mode) && crate::view::write_link(dest, mode, &self.get(hash)?)? {
+            return Ok(());
+        }
         let src = self.path_of(hash);
         fs::copy(&src, dest).with_context(|| format!("copy {hash} to {}", dest.display()))?;
         #[cfg(unix)]

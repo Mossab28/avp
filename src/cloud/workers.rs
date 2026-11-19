@@ -115,6 +115,9 @@ fn secs(var: &str, default: u64) -> Duration {
     Duration::from_secs(std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default))
 }
 
+/// How long a shard of the full suite gives way to tasks' proofs before it is served in its turn.
+const BACKGROUND_WAIT: Duration = Duration::from_secs(300);
+
 impl Dispatcher {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.q.lock().unwrap_or_else(|e| e.into_inner())
@@ -209,7 +212,14 @@ impl Dispatcher {
         let deadline = Instant::now() + wait;
         let mut q = self.lock();
         loop {
-            if let Some(i) = q.waiting.iter().position(|j| parts || j.part.is_none()) {
+            // A task's proof first: an agent waits on it, while the full suite is the net under
+            // what already landed (Murmell, 05/11: its 14 shards took the 8 workers after each
+            // landing, 64 % of the machine time). A shard waiting past BACKGROUND_WAIT is served
+            // in its turn again, so a line busy with proofs still gets its verdict.
+            let eligible = |j: &Job| parts || j.part.is_none();
+            let background = |j: &Job| j.name.starts_with("line-") && q.queued_at.get(&j.id).is_none_or(|t| t.elapsed() < BACKGROUND_WAIT);
+            let pick = q.waiting.iter().position(|j| eligible(j) && !background(j)).or_else(|| q.waiting.iter().position(eligible));
+            if let Some(i) = pick {
                 let job = q.waiting.remove(i).unwrap();
                 q.claimed_at.entry(job.id.clone()).or_insert_with(Instant::now);
                 q.claimed.insert(job.id.clone(), (Instant::now(), job.clone()));

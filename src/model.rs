@@ -16,8 +16,17 @@ pub struct Actor {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub blob: Hash,
-    /// Unix mode bits that matter: 0o100644 or 0o100755.
+    /// Unix mode bits that matter: 0o100644, 0o100755, or 0o120000 for a symbolic link, whose blob
+    /// is the path it points to (as Git stores one).
     pub mode: u32,
+}
+
+/// The mode of a symbolic link.
+pub const LINK: u32 = 0o120000;
+
+/// Whether `mode` is a symbolic link's.
+pub fn is_link(mode: u32) -> bool {
+    mode & 0o170000 == LINK
 }
 
 /// A tree is the whole repository at one instant: path -> entry. Stored as an object, named by
@@ -533,32 +542,54 @@ pub fn new_id(prefix: &str) -> String {
 /// A guarded path pattern against a repo path. `dir/` or a plain path covers everything under
 /// it; `*` stays inside one segment, `**` crosses segments, `?` is one character.
 pub fn path_matches(pattern: &str, path: &str) -> bool {
-    let p = pattern.trim_start_matches('/');
-    if !p.contains(['*', '?']) {
-        let dir = p.trim_end_matches('/');
-        return path == dir || path.starts_with(&format!("{dir}/"));
-    }
-    let chars: Vec<char> = p.chars().collect();
-    let mut re = String::from("^");
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '*' if chars.get(i + 1) == Some(&'*') => {
-                re.push_str(".*");
-                i += 2;
-                if chars.get(i) == Some(&'/') {
-                    i += 1;
-                }
-                continue;
-            }
-            '*' => re.push_str("[^/]*"),
-            '?' => re.push_str("[^/]"),
-            c => re.push_str(&regex::escape(&c.to_string())),
+    PathPattern::new(pattern).matches(path)
+}
+
+/// A path pattern read once, for whoever matches it against every path of a tree (a shard's
+/// `inputs`): `path_matches` reads it again at each call.
+pub struct PathPattern(PathPatternKind);
+
+enum PathPatternKind {
+    /// `dir/` or a plain path: itself and what is under it.
+    Under(String),
+    Glob(Option<regex::Regex>),
+}
+
+impl PathPattern {
+    pub fn new(pattern: &str) -> Self {
+        let p = pattern.trim_start_matches('/');
+        if !p.contains(['*', '?']) {
+            return Self(PathPatternKind::Under(p.trim_end_matches('/').to_string()));
         }
-        i += 1;
+        let chars: Vec<char> = p.chars().collect();
+        let mut re = String::from("^");
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '*' if chars.get(i + 1) == Some(&'*') => {
+                    re.push_str(".*");
+                    i += 2;
+                    if chars.get(i) == Some(&'/') {
+                        i += 1;
+                    }
+                    continue;
+                }
+                '*' => re.push_str("[^/]*"),
+                '?' => re.push_str("[^/]"),
+                c => re.push_str(&regex::escape(&c.to_string())),
+            }
+            i += 1;
+        }
+        re.push('$');
+        Self(PathPatternKind::Glob(regex::Regex::new(&re).ok()))
     }
-    re.push('$');
-    regex::Regex::new(&re).map(|r| r.is_match(path)).unwrap_or(false)
+
+    pub fn matches(&self, path: &str) -> bool {
+        match &self.0 {
+            PathPatternKind::Under(dir) => path == dir || path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/')),
+            PathPatternKind::Glob(re) => re.as_ref().is_some_and(|r| r.is_match(path)),
+        }
+    }
 }
 
 // ---- accounts, as the CLI reads them (AVP Cloud keeps them) ----

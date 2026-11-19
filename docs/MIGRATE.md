@@ -177,6 +177,22 @@ a commit AVP did not write, the mirror refuses to push, overwrites nothing, reco
 `main` now run on every mirrored commit: at Murmell the CI of `main` stopped catching up until it ran
 one run at a time ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-ci-of-main-never-catches-up)).
 
+**Keep pull requests on `main`.** When `main` may only move through a pull request (a rule of the
+team, an audit, a person's review), the mirror delivers by one instead of pushing:
+
+```sh
+avp mirror --repo shop --branch main --remote origin --follow 15 --deliver pull_request
+```
+
+It writes the line's commits to `avp/main`, marks its tip proven (the commit status `avp/proof`),
+and keeps one pull request from `avp/main` to `main` open, with the positions it carries, who
+landed each and its proof (`GH_TOKEN` in the mirror's environment). The pull request is green from
+the start: each of its commits was proven before it landed, so the status check to require on
+`main` is `avp/proof`, not a second run of the CI. A person, or GitHub's auto-merge, merges it
+**with a merge commit**; the next landing opens the next one. With `[git] follow = "main"`, the
+merge is recognized and never taken back in. `--deliver push` (the default) is the shorter way, for
+when `main` only needs the history: nothing waits between a landing and `main`.
+
 **Go back.** Stop the mirror of `main` and lift the protection: `main` holds every landed position
 as an ordinary commit, and people merge pull requests again on top of it.
 
