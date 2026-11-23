@@ -59,6 +59,14 @@ Measure what our CI costs and what AVP would cut. Show me before changing anythi
    or the deploys: those are my call.
 ```
 
+To move the whole CI over, GitHub Actions or GitLab CI, in one session. The agent stops at each
+step that is yours (a secret, a setting on GitHub or GitLab, a yes) and waits for you:
+
+```text
+Move this repository's CI to AVP. Follow these steps in order, and stop where they say I act:
+https://raw.githubusercontent.com/Mossab28/avp/main/docs/agents/migrate.md
+```
+
 New to AVP? [Your first 15 minutes](docs/QUICKSTART.md) goes from install to two agents on one
 file, with the output of each command. [The concepts](docs/CONCEPTS.md) say the words (line,
 position, task, proof, landing...) and what each replaces in Git and GitHub.

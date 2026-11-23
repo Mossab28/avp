@@ -7,6 +7,9 @@ below in one command, then what is left.
 avp migrate          # --json for an agent; --yes lands the checks it proved, on your word
 ```
 
+A coding agent can do the whole move, GitHub Actions or GitLab CI, and stop at the steps that are
+a person's: [agents/migrate.md](agents/migrate.md) is written for it.
+
 - It reads the repo: its CI (as `avp import-ci` does), its coding agents (`avp agents`), its server.
 - It puts AVP beside `main` as `avp up` does: the server (started here when none answers), the line
   imported from the last 50 commits, the mirror on `avp/line` (never `main`), the agents wired. It
